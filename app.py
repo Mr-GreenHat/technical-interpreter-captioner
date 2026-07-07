@@ -9,6 +9,7 @@ import time
 import av
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
@@ -701,7 +702,9 @@ while not result_queue.empty():
                 or st.session_state.caption_history[-1] != translation
             ):
                 st.session_state.caption_history.append(translation)
-                st.session_state.caption_history = st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
+                st.session_state.caption_history = (
+                    st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
+                )
 
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
 
@@ -718,13 +721,17 @@ while not result_queue.empty():
         raw_message = item.get("message", {})
 
         st.session_state.soniox_raw_messages.append(raw_message)
-        st.session_state.soniox_raw_messages = st.session_state.soniox_raw_messages[-MAX_RAW_MESSAGES:]
+        st.session_state.soniox_raw_messages = (
+            st.session_state.soniox_raw_messages[-MAX_RAW_MESSAGES:]
+        )
 
     elif item_type == "debug":
         message = item.get("message", "")
         if message:
             st.session_state.debug_messages.append(message)
-            st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            st.session_state.debug_messages = (
+                st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            )
 
     elif item_type == "error":
         st.session_state.soniox_error = item.get("message", "")
@@ -734,7 +741,9 @@ while not result_queue.empty():
         message = item.get("message", "")
         if message:
             st.session_state.debug_messages.append(message)
-            st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            st.session_state.debug_messages = (
+                st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            )
 
 
 # ============================================================
@@ -816,93 +825,105 @@ else:
 safe_caption_text = html.escape(caption_text)
 safe_original = html.escape(st.session_state.live_original)
 
-st.markdown(
-    f"""
-    <style>
-        .caption-wrapper {{
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            margin-top: 8px;
-        }}
+caption_html = f"""
+<style>
+html, body {{
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
 
-        .caption-label {{
-            font-size: 14px;
-            opacity: 0.75;
-            margin-bottom: 6px;
-            font-weight: 700;
-        }}
+.caption-wrapper {{
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}}
 
-        .jp-caption-box {{
-            font-size: {jp_font_size}px;
-            line-height: 1.45;
-            padding: 16px;
-            border-radius: 14px;
-            background-color: #F3F4F6;
-            color: #111827;
-            min-height: 70px;
-            max-height: 150px;
-            overflow-y: auto;
-            white-space: pre-wrap;
-            border: 1px solid #D1D5DB;
-        }}
+.caption-label {{
+    font-size: 14px;
+    opacity: 0.75;
+    margin-bottom: 6px;
+    font-weight: 700;
+    color: #D1D5DB;
+}}
 
-        .en-caption-box {{
-            font-size: {font_size}px;
-            line-height: 1.3;
-            font-weight: 700;
-            padding: 22px;
-            border-radius: 18px;
-            background-color: #111827;
-            color: white;
-            min-height: 150px;
-            max-height: 280px;
-            overflow-y: auto;
-            white-space: pre-wrap;
-            border: 1px solid #374151;
-        }}
+.jp-caption-box {{
+    font-size: {jp_font_size}px;
+    line-height: 1.45;
+    padding: 16px;
+    border-radius: 14px;
+    background-color: #F3F4F6;
+    color: #111827;
+    min-height: 70px;
+    max-height: 150px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    border: 1px solid #D1D5DB;
+    box-sizing: border-box;
+}}
 
-        @media screen and (max-width: 768px) {{
-            .caption-wrapper {{
-                gap: 10px;
-            }}
+.en-caption-box {{
+    font-size: {font_size}px;
+    line-height: 1.3;
+    font-weight: 700;
+    padding: 22px;
+    border-radius: 18px;
+    background-color: #111827;
+    color: white;
+    min-height: 150px;
+    max-height: 280px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    border: 1px solid #374151;
+    box-sizing: border-box;
+}}
 
-            .caption-label {{
-                font-size: 13px;
-                margin-bottom: 4px;
-            }}
+@media screen and (max-width: 768px) {{
+    .caption-wrapper {{
+        gap: 10px;
+    }}
 
-            .jp-caption-box {{
-                font-size: 18px;
-                line-height: 1.4;
-                padding: 12px;
-                min-height: 55px;
-                max-height: 105px;
-            }}
+    .caption-label {{
+        font-size: 13px;
+        margin-bottom: 4px;
+    }}
 
-            .en-caption-box {{
-                font-size: 24px;
-                line-height: 1.28;
-                padding: 16px;
-                min-height: 115px;
-                max-height: 210px;
-            }}
-        }}
-    </style>
+    .jp-caption-box {{
+        font-size: 18px;
+        line-height: 1.4;
+        padding: 12px;
+        min-height: 55px;
+        max-height: 105px;
+    }}
 
-    <div class="caption-wrapper">
-        <div>
-            <div class="caption-label">Japanese Original</div>
-            <div class="jp-caption-box">{safe_original}</div>
-        </div>
+    .en-caption-box {{
+        font-size: 24px;
+        line-height: 1.28;
+        padding: 16px;
+        min-height: 115px;
+        max-height: 210px;
+    }}
+}}
+</style>
 
-        <div>
-            <div class="caption-label">English Caption</div>
-            <div class="en-caption-box">{safe_caption_text}</div>
-        </div>
+<div class="caption-wrapper">
+    <div>
+        <div class="caption-label">Japanese Original</div>
+        <div class="jp-caption-box">{safe_original}</div>
     </div>
-    """,
-    unsafe_allow_html=True,
+
+    <div>
+        <div class="caption-label">English Caption</div>
+        <div class="en-caption-box">{safe_caption_text}</div>
+    </div>
+</div>
+"""
+
+components.html(
+    caption_html,
+    height=430,
+    scrolling=False,
 )
 
 
