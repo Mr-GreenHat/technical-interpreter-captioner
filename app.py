@@ -117,10 +117,11 @@ def light_caption_cleanup(text):
     return cleaned.strip()
 
 
-def get_recent_text(text, max_chars):
+def make_caption_page(text, max_chars):
     """
-    Keep only the recent part of accumulated live text.
-    This prevents caption boxes from becoming too long.
+    Subtitle-page behavior:
+    If text becomes too long, clear the old part and keep the latest phrase.
+    This makes the display feel like changing subtitle pages, not a transcript.
     """
     if not text:
         return ""
@@ -130,7 +131,31 @@ def get_recent_text(text, max_chars):
     if len(text) <= max_chars:
         return text
 
-    return "…" + text[-max_chars:]
+    recent = text[-max_chars:]
+
+    # Try to start from a readable phrase boundary.
+    separators = [
+        ". ",
+        "? ",
+        "! ",
+        "。",
+        "、",
+        ", ",
+        " ",
+    ]
+
+    best_index = -1
+
+    for sep in separators:
+        index = recent.find(sep)
+
+        if index > best_index:
+            best_index = index + len(sep)
+
+    if best_index > 0 and best_index < len(recent) - 5:
+        recent = recent[best_index:]
+
+    return recent.strip()
 
 
 # ============================================================
@@ -836,15 +861,14 @@ if subtitle_display == "History":
 else:
     caption_text = st.session_state.live_translation
 
-# Soniox text accumulates. For interpreter display, show recent text only.
-display_japanese = get_recent_text(
+display_japanese = make_caption_page(
     st.session_state.live_original,
-    max_chars=90,
+    max_chars=80,
 )
 
-display_english = get_recent_text(
+display_english = make_caption_page(
     caption_text,
-    max_chars=180,
+    max_chars=150,
 )
 
 safe_original = html.escape(display_japanese)
