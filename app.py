@@ -33,12 +33,6 @@ MAX_DEBUG_MESSAGES = 20
 # ============================================================
 
 def load_soniox_context_terms(terms_file):
-    """
-    Load technical_terms.csv and convert it into Soniox context hints.
-
-    Expected CSV columns:
-    domain,jp,reading,en,common_wrong,notes
-    """
     terms = []
     translation_terms = []
 
@@ -93,10 +87,6 @@ def load_soniox_context_terms(terms_file):
 
 
 def light_caption_cleanup(text):
-    """
-    Small cleanup for readable interpreter captions.
-    Keep this conservative.
-    """
     if not text:
         return ""
 
@@ -151,8 +141,6 @@ class AudioProcessor:
 
             for resampled_frame in resampled_frames:
                 audio = resampled_frame.to_ndarray()
-
-                # Shape can be (1, samples), so flatten it.
                 audio = audio.reshape(-1)
 
                 if audio.size == 0:
@@ -162,7 +150,6 @@ class AudioProcessor:
                 self.audio_queue.put(pcm16.tobytes())
 
         except Exception:
-            # Do not crash Streamlit WebRTC thread.
             pass
 
         return frame
@@ -176,16 +163,11 @@ def soniox_live_worker(
     audio_queue,
     result_queue,
     stop_event,
+    control_queue,
     api_key,
     terms_file,
     domain_mode,
 ):
-    """
-    Connect to Soniox real-time WebSocket.
-    Send microphone PCM audio.
-    Receive original Japanese + English translation.
-    """
-
     ws = None
 
     try:
@@ -205,16 +187,10 @@ def soniox_live_worker(
             "audio_format": "s16le",
             "sample_rate": 48000,
             "num_channels": 1,
-
-            # Japanese input
             "language_hints": ["ja"],
             "enable_language_identification": False,
-
-            # Better subtitle behavior
             "enable_endpoint_detection": True,
             "max_endpoint_delay_ms": 800,
-
-            # Context / glossary
             "context": {
                 "general": [
                     {
@@ -239,8 +215,6 @@ def soniox_live_worker(
                 "terms": context_terms,
                 "translation_terms": translation_terms,
             },
-
-            # Japanese -> English translation
             "translation": {
                 "type": "one_way",
                 "target_language": "en",
@@ -332,7 +306,6 @@ def soniox_live_worker(
                 })
                 continue
 
-            # Save raw Soniox message for visible debug.
             result_queue.put({
                 "type": "raw",
                 "message": data,
@@ -351,6 +324,22 @@ def soniox_live_worker(
                     "message": "Soniox stream finished.",
                 })
                 break
+
+            # Handle UI control commands while live translation is running.
+            while control_queue is not None and not control_queue.empty():
+                try:
+                    command = control_queue.get_nowait()
+
+                    if command == "clear":
+                        final_original = ""
+                        final_translation = ""
+
+                        result_queue.put({
+                            "type": "cleared",
+                        })
+
+                except queue.Empty:
+                    break
 
             tokens = data.get("tokens", [])
 
@@ -372,8 +361,6 @@ def soniox_live_worker(
                 status = token.get("translation_status")
                 is_final = token.get("is_final", False)
 
-                # Soniox translation tokens should normally use "translation".
-                # Keep fallback for possible schema variants.
                 is_translation_token = status in ["translation", "translated"]
 
                 if is_translation_token:
@@ -539,6 +526,9 @@ if "soniox_error" not in st.session_state:
 if "soniox_result_queue" not in st.session_state:
     st.session_state.soniox_result_queue = queue.Queue()
 
+if "soniox_control_queue" not in st.session_state:
+    st.session_state.soniox_control_queue = queue.Queue()
+
 if "soniox_stop_event" not in st.session_state:
     st.session_state.soniox_stop_event = threading.Event()
 
@@ -638,6 +628,9 @@ if clear_clicked:
     st.session_state.soniox_raw_messages = []
     st.session_state.last_update_time = ""
 
+    if st.session_state.soniox_running:
+        st.session_state.soniox_control_queue.put("clear")
+
 if stop_clicked:
     st.session_state.soniox_running = False
     st.session_state.soniox_stop_event.set()
@@ -649,6 +642,7 @@ if start_clicked:
     else:
         st.session_state.soniox_stop_event = threading.Event()
         st.session_state.soniox_result_queue = queue.Queue()
+        st.session_state.soniox_control_queue = queue.Queue()
         st.session_state.soniox_error = ""
         st.session_state.debug_messages = []
         st.session_state.audio_bytes_sent = 0
@@ -667,6 +661,7 @@ if start_clicked:
                 processor.audio_queue,
                 st.session_state.soniox_result_queue,
                 st.session_state.soniox_stop_event,
+                st.session_state.soniox_control_queue,
                 api_key,
                 terms_file,
                 domain_mode,
@@ -706,6 +701,12 @@ while not result_queue.empty():
                 st.session_state.caption_history = st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
 
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
+
+    elif item_type == "cleared":
+        st.session_state.live_original = ""
+        st.session_state.live_translation = ""
+        st.session_state.caption_history = []
+        st.session_state.last_update_time = ""
 
     elif item_type == "audio":
         st.session_state.audio_bytes_sent += item.get("bytes", 0)
