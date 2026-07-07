@@ -11,7 +11,6 @@ import numpy as np
 import streamlit as st
 import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-from streamlit_autorefresh import st_autorefresh
 
 
 # ============================================================
@@ -135,7 +134,7 @@ def light_caption_cleanup(text):
 class AudioProcessor:
     """
     Receives browser microphone audio continuously.
-    Resamples WebRTC audio to mono 48kHz signed 16-bit PCM for Soniox.
+    Resamples WebRTC audio to mono 48 kHz signed 16-bit PCM for Soniox.
     """
 
     def __init__(self):
@@ -153,7 +152,7 @@ class AudioProcessor:
             for resampled_frame in resampled_frames:
                 audio = resampled_frame.to_ndarray()
 
-                # Shape can be (1, samples), so flatten it
+                # Shape can be (1, samples), so flatten it.
                 audio = audio.reshape(-1)
 
                 if audio.size == 0:
@@ -163,10 +162,12 @@ class AudioProcessor:
                 self.audio_queue.put(pcm16.tobytes())
 
         except Exception:
-            # Do not crash Streamlit WebRTC thread
+            # Do not crash Streamlit WebRTC thread.
             pass
 
         return frame
+
+
 # ============================================================
 # Soniox live worker
 # ============================================================
@@ -331,7 +332,7 @@ def soniox_live_worker(
                 })
                 continue
 
-            # Save raw Soniox message for visible debug
+            # Save raw Soniox message for visible debug.
             result_queue.put({
                 "type": "raw",
                 "message": data,
@@ -469,7 +470,7 @@ with st.sidebar:
 
     show_debug = st.checkbox(
         "Show debug panel",
-        value=True,
+        value=False,
     )
 
     font_size = st.slider(
@@ -555,17 +556,6 @@ if "soniox_raw_messages" not in st.session_state:
 
 if "last_update_time" not in st.session_state:
     st.session_state.last_update_time = ""
-
-
-# ============================================================
-# Auto refresh while running
-# ============================================================
-
-if st.session_state.soniox_running:
-    st_autorefresh(
-        interval=500,
-        key="soniox_live_refresh",
-    )
 
 
 # ============================================================
@@ -701,7 +691,6 @@ while not result_queue.empty():
     if item_type == "tokens":
         original = item.get("original", "")
         translation = item.get("translation", "")
-        endpoint = item.get("endpoint", False)
 
         if original:
             st.session_state.live_original = original
@@ -767,16 +756,32 @@ if show_debug:
         st.code(str(st.session_state.audio_bytes_sent))
 
         st.write("**Last UI update time:**")
-        st.code(st.session_state.last_update_time if st.session_state.last_update_time else "No token update yet")
+        st.code(
+            st.session_state.last_update_time
+            if st.session_state.last_update_time
+            else "No token update yet"
+        )
 
         st.write("**Current Japanese original:**")
-        st.code(st.session_state.live_original if st.session_state.live_original else "Empty")
+        st.code(
+            st.session_state.live_original
+            if st.session_state.live_original
+            else "Empty"
+        )
 
         st.write("**Current English translation:**")
-        st.code(st.session_state.live_translation if st.session_state.live_translation else "Empty")
+        st.code(
+            st.session_state.live_translation
+            if st.session_state.live_translation
+            else "Empty"
+        )
 
         st.write("**Soniox error:**")
-        st.code(st.session_state.soniox_error if st.session_state.soniox_error else "No error")
+        st.code(
+            st.session_state.soniox_error
+            if st.session_state.soniox_error
+            else "No error"
+        )
 
         st.write("**Recent debug messages:**")
         if st.session_state.debug_messages:
@@ -850,3 +855,12 @@ if show_original:
         """,
         unsafe_allow_html=True,
     )
+
+
+# ============================================================
+# Force live UI refresh
+# ============================================================
+
+if st.session_state.soniox_running:
+    time.sleep(0.3)
+    st.rerun()
