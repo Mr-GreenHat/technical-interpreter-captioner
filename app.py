@@ -24,6 +24,14 @@ MAX_HISTORY_ITEMS = 5
 MAX_RAW_MESSAGES = 5
 MAX_DEBUG_MESSAGES = 20
 
+# Caption behavior:
+# If the speaker pauses for this many seconds, the next speech starts a new page.
+CAPTION_RESET_AFTER_SECONDS = 3.0
+
+# These are only emergency limits. Timer does most of the reset work.
+MAX_ORIGINAL_CHARS = 160
+MAX_TRANSLATION_CHARS = 260
+
 
 # ============================================================
 # Glossary / technical terms
@@ -114,10 +122,10 @@ def light_caption_cleanup(text):
     return cleaned.strip()
 
 
-def make_caption_page(text, max_chars):
+def trim_caption_soft(text, max_chars):
     """
-    Subtitle-page behavior:
-    If text becomes too long, clear the old part and keep the latest phrase.
+    Soft trim only when text becomes extremely long.
+    Normal reset is handled by the pause timer.
     """
     if not text:
         return ""
@@ -275,6 +283,7 @@ def soniox_live_worker(
 
         final_original = ""
         final_translation = ""
+        last_token_time = time.time()
 
         def send_audio():
             while not stop_event.is_set():
@@ -371,6 +380,28 @@ def soniox_live_worker(
                     break
 
             tokens = data.get("tokens", [])
+
+            has_real_token = False
+
+            for token in tokens:
+                text = token.get("text", "")
+                if text and text != "<end>":
+                    has_real_token = True
+                    break
+
+            if has_real_token:
+                now = time.time()
+
+                # If speaker paused, clear old caption when new speech starts.
+                if now - last_token_time > CAPTION_RESET_AFTER_SECONDS:
+                    final_original = ""
+                    final_translation = ""
+
+                    result_queue.put({
+                        "type": "cleared",
+                    })
+
+                last_token_time = now
 
             non_final_original = ""
             non_final_translation = ""
@@ -552,6 +583,14 @@ with st.sidebar:
         max_value=34,
         value=19,
         step=1,
+    )
+
+    reset_seconds = st.slider(
+        "Reset caption after pause",
+        min_value=1.5,
+        max_value=6.0,
+        value=CAPTION_RESET_AFTER_SECONDS,
+        step=0.5,
     )
 
     st.divider()
@@ -736,6 +775,7 @@ if stop_clicked:
 if start_clicked:
     if not webrtc_ctx.audio_processor:
         st.warning("Start the microphone first, then click Start Translation.")
+
     else:
         st.session_state.soniox_stop_event = threading.Event()
         st.session_state.soniox_result_queue = queue.Queue()
@@ -751,6 +791,10 @@ if start_clicked:
         st.session_state.soniox_running = True
 
         processor = webrtc_ctx.audio_processor
+
+        # Use selected timer value by updating global constant through closure-like args.
+        # The worker uses CAPTION_RESET_AFTER_SECONDS from settings above.
+        globals()["CAPTION_RESET_AFTER_SECONDS"] = float(reset_seconds)
 
         st.session_state.soniox_thread = threading.Thread(
             target=soniox_live_worker,
@@ -913,14 +957,14 @@ if subtitle_display == "History":
 else:
     caption_text = st.session_state.live_translation
 
-display_japanese = make_caption_page(
+display_japanese = trim_caption_soft(
     st.session_state.live_original,
-    max_chars=45,
+    max_chars=MAX_ORIGINAL_CHARS,
 )
 
-display_english = make_caption_page(
+display_english = trim_caption_soft(
     caption_text,
-    max_chars=95,
+    max_chars=MAX_TRANSLATION_CHARS,
 )
 
 safe_original = html.escape(display_japanese)
@@ -949,8 +993,8 @@ caption_html = f"""
     border-radius: 14px;
     background-color: #F3F4F6;
     color: #111827;
-    min-height: 55px;
-    max-height: 80px;
+    min-height: 70px;
+    max-height: 110px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
@@ -965,8 +1009,8 @@ caption_html = f"""
     border-radius: 18px;
     background-color: #111827;
     color: white;
-    min-height: 105px;
-    max-height: 150px;
+    min-height: 125px;
+    max-height: 185px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #374151;
@@ -987,16 +1031,16 @@ caption_html = f"""
         font-size: 16px;
         line-height: 1.35;
         padding: 9px;
-        min-height: 45px;
-        max-height: 70px;
+        min-height: 55px;
+        max-height: 90px;
     }}
 
     .en-caption-box {{
         font-size: 20px;
         line-height: 1.25;
         padding: 12px;
-        min-height: 95px;
-        max-height: 135px;
+        min-height: 115px;
+        max-height: 165px;
     }}
 }}
 </style>
