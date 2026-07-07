@@ -20,9 +20,6 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
-SOURCE_LANGUAGE = "Japanese"
-TARGET_LANGUAGE = "English"
-
 MAX_HISTORY_ITEMS = 5
 MAX_RAW_MESSAGES = 5
 MAX_DEBUG_MESSAGES = 20
@@ -121,7 +118,6 @@ def make_caption_page(text, max_chars):
     """
     Subtitle-page behavior:
     If text becomes too long, clear the old part and keep the latest phrase.
-    This makes the display feel like changing subtitle pages, not a transcript.
     """
     if not text:
         return ""
@@ -133,7 +129,6 @@ def make_caption_page(text, max_chars):
 
     recent = text[-max_chars:]
 
-    # Try to start from a readable phrase boundary.
     separators = [
         ". ",
         "? ",
@@ -148,7 +143,6 @@ def make_caption_page(text, max_chars):
 
     for sep in separators:
         index = recent.find(sep)
-
         if index > best_index:
             best_index = index + len(sep)
 
@@ -163,11 +157,6 @@ def make_caption_page(text, max_chars):
 # ============================================================
 
 class AudioProcessor:
-    """
-    Receives browser microphone audio continuously.
-    Resamples WebRTC audio to mono 48 kHz signed 16-bit PCM for Soniox.
-    """
-
     def __init__(self):
         self.audio_queue = queue.Queue()
         self.resampler = av.AudioResampler(
@@ -366,7 +355,6 @@ def soniox_live_worker(
                 })
                 break
 
-            # Handle UI control commands while live translation is running.
             while control_queue is not None and not control_queue.empty():
                 try:
                     command = control_queue.get_nowait()
@@ -455,6 +443,60 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 1rem;
+        }
+
+        h1 {
+            font-size: 42px !important;
+            line-height: 1.1 !important;
+        }
+
+        h2, h3 {
+            margin-top: 0.8rem !important;
+        }
+
+        div[data-testid="stAlert"] {
+            padding: 0.75rem 1rem;
+        }
+
+        @media screen and (max-width: 768px) {
+            .block-container {
+                padding-top: 1rem;
+                padding-left: 1rem;
+                padding-right: 1rem;
+            }
+
+            h1 {
+                font-size: 30px !important;
+                line-height: 1.05 !important;
+            }
+
+            h2 {
+                font-size: 25px !important;
+            }
+
+            h3 {
+                font-size: 22px !important;
+            }
+
+            p {
+                font-size: 14px !important;
+            }
+
+            div[data-testid="stVerticalBlock"] {
+                gap: 0.6rem;
+            }
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Technical Interpreter Captioner")
 
 st.caption(
@@ -498,18 +540,18 @@ with st.sidebar:
 
     font_size = st.slider(
         "English caption font size",
-        min_value=20,
-        max_value=56,
-        value=30,
+        min_value=18,
+        max_value=44,
+        value=26,
         step=2,
     )
 
     jp_font_size = st.slider(
         "Japanese original font size",
-        min_value=16,
-        max_value=40,
-        value=22,
-        step=2,
+        min_value=14,
+        max_value=34,
+        value=19,
+        step=1,
     )
 
     st.divider()
@@ -617,7 +659,15 @@ if not api_key:
 rtc_configuration = RTCConfiguration(
     {
         "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
+            {
+                "urls": [
+                    "stun:stun.l.google.com:19302",
+                    "stun:stun1.l.google.com:19302",
+                    "stun:stun2.l.google.com:19302",
+                    "stun:stun3.l.google.com:19302",
+                    "stun:stun4.l.google.com:19302",
+                ]
+            }
         ]
     }
 )
@@ -630,7 +680,11 @@ webrtc_ctx = webrtc_streamer(
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
         "video": False,
-        "audio": True,
+        "audio": {
+            "echoCancellation": True,
+            "noiseSuppression": True,
+            "autoGainControl": True,
+        },
     },
     audio_processor_factory=AudioProcessor,
     async_processing=True,
@@ -682,7 +736,6 @@ if stop_clicked:
 if start_clicked:
     if not webrtc_ctx.audio_processor:
         st.warning("Start the microphone first, then click Start Translation.")
-
     else:
         st.session_state.soniox_stop_event = threading.Event()
         st.session_state.soniox_result_queue = queue.Queue()
@@ -724,7 +777,6 @@ result_queue = st.session_state.soniox_result_queue
 
 while not result_queue.empty():
     item = result_queue.get()
-
     item_type = item.get("type")
 
     if item_type == "tokens":
@@ -863,12 +915,12 @@ else:
 
 display_japanese = make_caption_page(
     st.session_state.live_original,
-    max_chars=80,
+    max_chars=45,
 )
 
 display_english = make_caption_page(
     caption_text,
-    max_chars=150,
+    max_chars=95,
 )
 
 safe_original = html.escape(display_japanese)
@@ -892,13 +944,13 @@ caption_html = f"""
 
 .jp-caption-box {{
     font-size: {jp_font_size}px;
-    line-height: 1.45;
-    padding: 14px;
+    line-height: 1.35;
+    padding: 12px;
     border-radius: 14px;
     background-color: #F3F4F6;
     color: #111827;
-    min-height: 70px;
-    max-height: 115px;
+    min-height: 55px;
+    max-height: 80px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
@@ -907,14 +959,14 @@ caption_html = f"""
 
 .en-caption-box {{
     font-size: {font_size}px;
-    line-height: 1.3;
+    line-height: 1.25;
     font-weight: 700;
-    padding: 20px;
+    padding: 16px;
     border-radius: 18px;
     background-color: #111827;
     color: white;
-    min-height: 145px;
-    max-height: 230px;
+    min-height: 105px;
+    max-height: 150px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #374151;
@@ -932,19 +984,19 @@ caption_html = f"""
     }}
 
     .jp-caption-box {{
-        font-size: 17px;
-        line-height: 1.4;
-        padding: 10px;
-        min-height: 55px;
-        max-height: 85px;
+        font-size: 16px;
+        line-height: 1.35;
+        padding: 9px;
+        min-height: 45px;
+        max-height: 70px;
     }}
 
     .en-caption-box {{
-        font-size: 22px;
+        font-size: 20px;
         line-height: 1.25;
-        padding: 14px;
-        min-height: 115px;
-        max-height: 175px;
+        padding: 12px;
+        min-height: 95px;
+        max-height: 135px;
     }}
 }}
 </style>
