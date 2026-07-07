@@ -25,6 +25,8 @@ SOURCE_LANGUAGE = "Japanese"
 TARGET_LANGUAGE = "English"
 
 MAX_HISTORY_ITEMS = 5
+MAX_RAW_MESSAGES = 5
+MAX_DEBUG_MESSAGES = 20
 
 
 # ============================================================
@@ -71,8 +73,8 @@ def load_soniox_context_terms(terms_file):
                         "target": en,
                     })
 
-        # Remove duplicates while preserving order
         terms = list(dict.fromkeys(terms))
+
         translation_terms_unique = []
         seen_pairs = set()
 
@@ -82,40 +84,18 @@ def load_soniox_context_terms(terms_file):
                 translation_terms_unique.append(item)
                 seen_pairs.add(key)
 
-        # Keep compact enough for API context
         return terms[:300], translation_terms_unique[:300]
 
     except FileNotFoundError:
         return [], []
+
     except Exception:
         return [], []
 
 
-def load_english_terms(terms_file):
-    """
-    Load official English terms for light post-processing display.
-    This does not replace Soniox; it only helps keep known terms visible.
-    """
-    english_terms = []
-
-    try:
-        with open(terms_file, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-
-            for row in reader:
-                en = row.get("en", "").strip()
-                if en:
-                    english_terms.append(en)
-
-        return list(dict.fromkeys(english_terms))
-
-    except Exception:
-        return []
-
-
 def light_caption_cleanup(text):
     """
-    Small cleanup for readability.
+    Small cleanup for readable interpreter captions.
     Keep this conservative.
     """
     if not text:
@@ -259,12 +239,27 @@ def soniox_live_worker(
             },
         }
 
+        result_queue.put({
+            "type": "debug",
+            "message": "Connecting to Soniox WebSocket...",
+        })
+
         ws = websocket.create_connection(
             SONIOX_WS_URL,
             timeout=10,
         )
 
+        result_queue.put({
+            "type": "debug",
+            "message": "Connected to Soniox WebSocket.",
+        })
+
         ws.send(json.dumps(config))
+
+        result_queue.put({
+            "type": "debug",
+            "message": "Sent Soniox config.",
+        })
 
         final_original = ""
         final_translation = ""
@@ -276,6 +271,11 @@ def soniox_live_worker(
 
                     if audio_bytes:
                         ws.send_binary(audio_bytes)
+
+                        result_queue.put({
+                            "type": "audio",
+                            "bytes": len(audio_bytes),
+                        })
 
                 except queue.Empty:
                     continue
@@ -318,7 +318,17 @@ def soniox_live_worker(
             try:
                 data = json.loads(msg)
             except json.JSONDecodeError:
+                result_queue.put({
+                    "type": "debug",
+                    "message": "Received non-JSON message from Soniox.",
+                })
                 continue
+
+            # Save raw Soniox message for visible debug
+            result_queue.put({
+                "type": "raw",
+                "message": data,
+            })
 
             if data.get("error_code"):
                 result_queue.put({
@@ -354,8 +364,8 @@ def soniox_live_worker(
                 status = token.get("translation_status")
                 is_final = token.get("is_final", False)
 
-                # Soniox translation tokens should use "translation".
-                # Keep fallback for possible SDK/schema variants.
+                # Soniox translation tokens should normally use "translation".
+                # Keep fallback for possible schema variants.
                 is_translation_token = status in ["translation", "translated"]
 
                 if is_translation_token:
@@ -450,6 +460,11 @@ with st.sidebar:
         value=True,
     )
 
+    show_debug = st.checkbox(
+        "Show debug panel",
+        value=True,
+    )
+
     font_size = st.slider(
         "Caption font size",
         min_value=28,
@@ -522,6 +537,18 @@ if "soniox_stop_event" not in st.session_state:
 if "soniox_thread" not in st.session_state:
     st.session_state.soniox_thread = None
 
+if "debug_messages" not in st.session_state:
+    st.session_state.debug_messages = []
+
+if "audio_bytes_sent" not in st.session_state:
+    st.session_state.audio_bytes_sent = 0
+
+if "soniox_raw_messages" not in st.session_state:
+    st.session_state.soniox_raw_messages = []
+
+if "last_update_time" not in st.session_state:
+    st.session_state.last_update_time = ""
+
 
 # ============================================================
 # Auto refresh while running
@@ -538,11 +565,14 @@ if st.session_state.soniox_running:
 # API key
 # ============================================================
 
-api_key = os.getenv("SONIOX_API_KEY")
+api_key = st.secrets.get("SONIOX_API_KEY", os.getenv("SONIOX_API_KEY"))
 
 if not api_key:
     st.error(
-        "SONIOX_API_KEY is not set. In PowerShell, run:\n\n"
+        "SONIOX_API_KEY is not set.\n\n"
+        "For Streamlit Cloud, add this in Secrets:\n\n"
+        'SONIOX_API_KEY = "your_api_key_here"\n\n'
+        "For local PowerShell, run:\n\n"
         'setx SONIOX_API_KEY "your_api_key_here"\n\n'
         "Then close PowerShell and open it again."
     )
@@ -606,6 +636,10 @@ if clear_clicked:
     st.session_state.live_translation = ""
     st.session_state.caption_history = []
     st.session_state.soniox_error = ""
+    st.session_state.debug_messages = []
+    st.session_state.audio_bytes_sent = 0
+    st.session_state.soniox_raw_messages = []
+    st.session_state.last_update_time = ""
 
 if stop_clicked:
     st.session_state.soniox_running = False
@@ -619,6 +653,13 @@ if start_clicked:
         st.session_state.soniox_stop_event = threading.Event()
         st.session_state.soniox_result_queue = queue.Queue()
         st.session_state.soniox_error = ""
+        st.session_state.debug_messages = []
+        st.session_state.audio_bytes_sent = 0
+        st.session_state.soniox_raw_messages = []
+        st.session_state.live_original = ""
+        st.session_state.live_translation = ""
+        st.session_state.caption_history = []
+        st.session_state.last_update_time = ""
         st.session_state.soniox_running = True
 
         processor = webrtc_ctx.audio_processor
@@ -661,7 +702,6 @@ while not result_queue.empty():
         if translation:
             st.session_state.live_translation = translation
 
-            # Add to history only when the text changes enough
             if (
                 not st.session_state.caption_history
                 or st.session_state.caption_history[-1] != translation
@@ -669,15 +709,32 @@ while not result_queue.empty():
                 st.session_state.caption_history.append(translation)
                 st.session_state.caption_history = st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
 
-        if endpoint:
-            pass
+        st.session_state.last_update_time = time.strftime("%H:%M:%S")
+
+    elif item_type == "audio":
+        st.session_state.audio_bytes_sent += item.get("bytes", 0)
+
+    elif item_type == "raw":
+        raw_message = item.get("message", {})
+
+        st.session_state.soniox_raw_messages.append(raw_message)
+        st.session_state.soniox_raw_messages = st.session_state.soniox_raw_messages[-MAX_RAW_MESSAGES:]
+
+    elif item_type == "debug":
+        message = item.get("message", "")
+        if message:
+            st.session_state.debug_messages.append(message)
+            st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
 
     elif item_type == "error":
         st.session_state.soniox_error = item.get("message", "")
         st.session_state.soniox_running = False
 
     elif item_type == "status":
-        pass
+        message = item.get("message", "")
+        if message:
+            st.session_state.debug_messages.append(message)
+            st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
 
 
 # ============================================================
@@ -691,6 +748,42 @@ else:
 
 if st.session_state.soniox_error:
     st.error(st.session_state.soniox_error)
+
+
+# ============================================================
+# Debug panel
+# ============================================================
+
+if show_debug:
+    with st.expander("Debug / Error Info", expanded=True):
+        st.write("**Audio bytes sent to Soniox:**")
+        st.code(str(st.session_state.audio_bytes_sent))
+
+        st.write("**Last UI update time:**")
+        st.code(st.session_state.last_update_time if st.session_state.last_update_time else "No token update yet")
+
+        st.write("**Current Japanese original:**")
+        st.code(st.session_state.live_original if st.session_state.live_original else "Empty")
+
+        st.write("**Current English translation:**")
+        st.code(st.session_state.live_translation if st.session_state.live_translation else "Empty")
+
+        st.write("**Soniox error:**")
+        st.code(st.session_state.soniox_error if st.session_state.soniox_error else "No error")
+
+        st.write("**Recent debug messages:**")
+        if st.session_state.debug_messages:
+            for message in st.session_state.debug_messages:
+                st.write("- " + str(message))
+        else:
+            st.write("No debug messages yet.")
+
+        st.write("**Recent raw Soniox messages:**")
+        if st.session_state.soniox_raw_messages:
+            for msg in st.session_state.soniox_raw_messages:
+                st.json(msg)
+        else:
+            st.write("No raw Soniox messages yet.")
 
 
 # ============================================================
