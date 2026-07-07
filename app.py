@@ -135,30 +135,35 @@ def light_caption_cleanup(text):
 class AudioProcessor:
     """
     Receives browser microphone audio continuously.
-    Puts int16 PCM bytes into a queue for the Soniox worker.
+    Converts WebRTC audio to clean mono int16 PCM bytes.
     """
 
     def __init__(self):
         self.audio_queue = queue.Queue()
 
     def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
-        audio = frame.to_ndarray()
+        try:
+            # Force WebRTC frame to signed 16-bit PCM
+            audio = frame.to_ndarray(format="s16")
 
-        # Usually shape is (channels, samples)
-        if audio.ndim == 2:
-            audio = audio.mean(axis=0)
+            # Shape is usually (channels, samples)
+            if audio.ndim == 2:
+                # Convert safely before averaging, then back to int16
+                audio = audio.astype(np.int32).mean(axis=0)
+                audio = np.clip(audio, -32768, 32767).astype(np.int16)
 
-        # Convert to int16 PCM
-        if audio.dtype != np.int16:
-            audio = np.clip(audio, -1.0, 1.0)
-            audio = (audio * 32767).astype(np.int16)
-        else:
-            audio = audio.astype(np.int16)
+            elif audio.ndim == 1:
+                audio = audio.astype(np.int16)
 
-        self.audio_queue.put(audio.tobytes())
+            else:
+                return frame
+
+            self.audio_queue.put(audio.tobytes())
+
+        except Exception:
+            pass
 
         return frame
-
 
 # ============================================================
 # Soniox live worker
