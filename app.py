@@ -135,36 +135,38 @@ def light_caption_cleanup(text):
 class AudioProcessor:
     """
     Receives browser microphone audio continuously.
-    Converts WebRTC audio to clean mono int16 PCM bytes.
+    Resamples WebRTC audio to mono 48kHz signed 16-bit PCM for Soniox.
     """
 
     def __init__(self):
         self.audio_queue = queue.Queue()
+        self.resampler = av.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=48000,
+        )
 
     def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
         try:
-            # Force WebRTC frame to signed 16-bit PCM
-            audio = frame.to_ndarray(format="s16")
+            resampled_frames = self.resampler.resample(frame)
 
-            # Shape is usually (channels, samples)
-            if audio.ndim == 2:
-                # Convert safely before averaging, then back to int16
-                audio = audio.astype(np.int32).mean(axis=0)
-                audio = np.clip(audio, -32768, 32767).astype(np.int16)
+            for resampled_frame in resampled_frames:
+                audio = resampled_frame.to_ndarray()
 
-            elif audio.ndim == 1:
-                audio = audio.astype(np.int16)
+                # Shape can be (1, samples), so flatten it
+                audio = audio.reshape(-1)
 
-            else:
-                return frame
+                if audio.size == 0:
+                    continue
 
-            self.audio_queue.put(audio.tobytes())
+                pcm16 = audio.astype(np.int16)
+                self.audio_queue.put(pcm16.tobytes())
 
         except Exception:
+            # Do not crash Streamlit WebRTC thread
             pass
 
         return frame
-
 # ============================================================
 # Soniox live worker
 # ============================================================
