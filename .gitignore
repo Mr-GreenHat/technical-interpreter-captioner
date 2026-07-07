@@ -1,0 +1,12 @@
+__pycache__/
+uploads/
+browser_audio/
+*.wav
+*.m4a
+*.mp4
+subtitle.txt
+webrtc_live_chunk.wav
+live_chunk.wav
+test_glossary.py
+test_sentences.txt
+translator_core.py
