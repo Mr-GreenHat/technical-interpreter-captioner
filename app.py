@@ -450,21 +450,24 @@ with st.sidebar:
         index=0,
     )
 
-    show_original = st.checkbox(
-        "Show Japanese original",
-        value=True,
-    )
-
     show_debug = st.checkbox(
         "Show debug panel",
         value=False,
     )
 
     font_size = st.slider(
-        "Caption font size",
-        min_value=28,
-        max_value=72,
-        value=46,
+        "English caption font size",
+        min_value=20,
+        max_value=56,
+        value=30,
+        step=2,
+    )
+
+    jp_font_size = st.slider(
+        "Japanese original font size",
+        min_value=16,
+        max_value=40,
+        value=22,
         step=2,
     )
 
@@ -803,7 +806,7 @@ if show_debug:
 # Caption display
 # ============================================================
 
-st.subheader("Caption")
+st.subheader("Live Captions")
 
 if subtitle_display == "History":
     caption_text = "\n".join(st.session_state.caption_history)
@@ -811,51 +814,96 @@ else:
     caption_text = st.session_state.live_translation
 
 safe_caption_text = html.escape(caption_text)
+safe_original = html.escape(st.session_state.live_original)
 
 st.markdown(
     f"""
-    <div style="
-        font-size: {font_size}px;
-        line-height: 1.35;
-        font-weight: 700;
-        padding: 34px;
-        border-radius: 18px;
-        background-color: #111827;
-        color: white;
-        min-height: 250px;
-        white-space: pre-wrap;
-        border: 1px solid #374151;
-    ">
-        {safe_caption_text}
+    <style>
+        .caption-wrapper {{
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 8px;
+        }}
+
+        .caption-label {{
+            font-size: 14px;
+            opacity: 0.75;
+            margin-bottom: 6px;
+            font-weight: 700;
+        }}
+
+        .jp-caption-box {{
+            font-size: {jp_font_size}px;
+            line-height: 1.45;
+            padding: 16px;
+            border-radius: 14px;
+            background-color: #F3F4F6;
+            color: #111827;
+            min-height: 70px;
+            max-height: 150px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border: 1px solid #D1D5DB;
+        }}
+
+        .en-caption-box {{
+            font-size: {font_size}px;
+            line-height: 1.3;
+            font-weight: 700;
+            padding: 22px;
+            border-radius: 18px;
+            background-color: #111827;
+            color: white;
+            min-height: 150px;
+            max-height: 280px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border: 1px solid #374151;
+        }}
+
+        @media screen and (max-width: 768px) {{
+            .caption-wrapper {{
+                gap: 10px;
+            }}
+
+            .caption-label {{
+                font-size: 13px;
+                margin-bottom: 4px;
+            }}
+
+            .jp-caption-box {{
+                font-size: 18px;
+                line-height: 1.4;
+                padding: 12px;
+                min-height: 55px;
+                max-height: 105px;
+            }}
+
+            .en-caption-box {{
+                font-size: 24px;
+                line-height: 1.28;
+                padding: 16px;
+                min-height: 115px;
+                max-height: 210px;
+            }}
+        }}
+    </style>
+
+    <div class="caption-wrapper">
+        <div>
+            <div class="caption-label">Japanese Original</div>
+            <div class="jp-caption-box">{safe_original}</div>
+        </div>
+
+        <div>
+            <div class="caption-label">English Caption</div>
+            <div class="en-caption-box">{safe_caption_text}</div>
+        </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
-
-
-if show_original:
-    st.subheader("Japanese Original")
-
-    safe_original = html.escape(st.session_state.live_original)
-
-    st.markdown(
-        f"""
-        <div style="
-            font-size: 24px;
-            line-height: 1.5;
-            padding: 20px;
-            border-radius: 14px;
-            background-color: #F3F4F6;
-            color: #111827;
-            min-height: 100px;
-            white-space: pre-wrap;
-            border: 1px solid #D1D5DB;
-        ">
-            {safe_original}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 # ============================================================
