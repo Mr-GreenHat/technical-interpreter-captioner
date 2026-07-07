@@ -9,7 +9,6 @@ import time
 import av
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
@@ -116,6 +115,22 @@ def light_caption_cleanup(text):
     cleaned = cleaned.replace("a inertia compensation", "inertia compensation")
 
     return cleaned.strip()
+
+
+def get_recent_text(text, max_chars):
+    """
+    Keep only the recent part of accumulated live text.
+    This prevents caption boxes from becoming too long.
+    """
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    if len(text) <= max_chars:
+        return text
+
+    return "…" + text[-max_chars:]
 
 
 # ============================================================
@@ -719,7 +734,6 @@ while not result_queue.empty():
 
     elif item_type == "raw":
         raw_message = item.get("message", {})
-
         st.session_state.soniox_raw_messages.append(raw_message)
         st.session_state.soniox_raw_messages = (
             st.session_state.soniox_raw_messages[-MAX_RAW_MESSAGES:]
@@ -818,46 +832,50 @@ if show_debug:
 st.subheader("Live Captions")
 
 if subtitle_display == "History":
-    caption_text = "\n".join(st.session_state.caption_history)
+    caption_text = "\n".join(st.session_state.caption_history[-2:])
 else:
     caption_text = st.session_state.live_translation
 
-safe_caption_text = html.escape(caption_text)
-safe_original = html.escape(st.session_state.live_original)
+# Soniox text accumulates. For interpreter display, show recent text only.
+display_japanese = get_recent_text(
+    st.session_state.live_original,
+    max_chars=90,
+)
+
+display_english = get_recent_text(
+    caption_text,
+    max_chars=180,
+)
+
+safe_original = html.escape(display_japanese)
+safe_caption_text = html.escape(display_english)
 
 caption_html = f"""
 <style>
-html, body {{
-    margin: 0;
-    padding: 0;
-    background: transparent;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}}
-
 .caption-wrapper {{
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 10px;
+    margin-top: 8px;
 }}
 
 .caption-label {{
     font-size: 14px;
     opacity: 0.75;
-    margin-bottom: 6px;
+    margin-bottom: 5px;
     font-weight: 700;
-    color: #D1D5DB;
 }}
 
 .jp-caption-box {{
     font-size: {jp_font_size}px;
     line-height: 1.45;
-    padding: 16px;
+    padding: 14px;
     border-radius: 14px;
     background-color: #F3F4F6;
     color: #111827;
     min-height: 70px;
-    max-height: 150px;
-    overflow-y: auto;
+    max-height: 115px;
+    overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
     box-sizing: border-box;
@@ -867,13 +885,13 @@ html, body {{
     font-size: {font_size}px;
     line-height: 1.3;
     font-weight: 700;
-    padding: 22px;
+    padding: 20px;
     border-radius: 18px;
     background-color: #111827;
     color: white;
-    min-height: 150px;
-    max-height: 280px;
-    overflow-y: auto;
+    min-height: 145px;
+    max-height: 230px;
+    overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #374151;
     box-sizing: border-box;
@@ -881,28 +899,28 @@ html, body {{
 
 @media screen and (max-width: 768px) {{
     .caption-wrapper {{
-        gap: 10px;
+        gap: 8px;
     }}
 
     .caption-label {{
-        font-size: 13px;
+        font-size: 12px;
         margin-bottom: 4px;
     }}
 
     .jp-caption-box {{
-        font-size: 18px;
+        font-size: 17px;
         line-height: 1.4;
-        padding: 12px;
+        padding: 10px;
         min-height: 55px;
-        max-height: 105px;
+        max-height: 85px;
     }}
 
     .en-caption-box {{
-        font-size: 24px;
-        line-height: 1.28;
-        padding: 16px;
+        font-size: 22px;
+        line-height: 1.25;
+        padding: 14px;
         min-height: 115px;
-        max-height: 210px;
+        max-height: 175px;
     }}
 }}
 </style>
@@ -920,11 +938,7 @@ html, body {{
 </div>
 """
 
-components.html(
-    caption_html,
-    height=430,
-    scrolling=False,
-)
+st.html(caption_html)
 
 
 # ============================================================
@@ -932,5 +946,5 @@ components.html(
 # ============================================================
 
 if st.session_state.soniox_running:
-    time.sleep(0.3)
+    time.sleep(0.7)
     st.rerun()
