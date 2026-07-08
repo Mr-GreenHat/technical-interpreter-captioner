@@ -25,7 +25,6 @@ MAX_ORIGINAL_CHARS = 160
 MAX_TRANSLATION_CHARS = 260
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
-MAX_KEY_TERMS = 6
 
 
 # ============================================================
@@ -82,157 +81,6 @@ def load_soniox_context_terms(terms_file):
         return [], []
 
 
-def load_glossary_entries(terms_file, domain_mode):
-    entries = []
-
-    if domain_mode == "auto":
-        allowed_domains = None
-
-    elif domain_mode == "automotive":
-        allowed_domains = {"automotive", "control"}
-
-    elif domain_mode == "cad":
-        allowed_domains = {"cad"}
-
-    elif domain_mode == "product design":
-        allowed_domains = {
-            "product design",
-            "product_design",
-            "cad",
-            "manufacturing",
-            "automotive",
-        }
-
-    else:
-        allowed_domains = None
-
-    try:
-        with open(terms_file, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-
-            for row in reader:
-                row_domain = row.get("domain", "").strip().lower()
-
-                if allowed_domains is not None and row_domain not in allowed_domains:
-                    continue
-
-                jp = row.get("jp", "").strip()
-                en = row.get("en", "").strip()
-                reading = row.get("reading", "").strip()
-                common_wrong = row.get("common_wrong", "").strip()
-                notes = row.get("notes", "").strip()
-
-                if not jp or not en:
-                    continue
-
-                entries.append({
-                    "domain": row_domain,
-                    "jp": jp,
-                    "en": en,
-                    "reading": reading,
-                    "common_wrong": common_wrong,
-                    "notes": notes,
-                })
-
-    except Exception:
-        pass
-
-    return entries
-
-
-def extract_key_terms(original_text, translation_text, terms_file, domain_mode):
-    original_text = original_text or ""
-    translation_text = translation_text or ""
-    translation_lower = translation_text.lower()
-
-    entries = load_glossary_entries(terms_file, domain_mode)
-    matched_terms = []
-
-    for row in entries:
-        jp = row["jp"]
-        en = row["en"]
-        reading = row.get("reading", "")
-        common_wrong = row.get("common_wrong", "")
-
-        candidates = [jp, en, reading]
-
-        if common_wrong:
-            candidates.extend([
-                item.strip()
-                for item in common_wrong.split(";")
-                if item.strip()
-            ])
-
-        found = False
-
-        for candidate in candidates:
-            if not candidate:
-                continue
-
-            if candidate in original_text:
-                found = True
-                break
-
-            if candidate.lower() in translation_lower:
-                found = True
-                break
-
-        if found:
-            matched_terms.append((jp, en))
-
-    unique_terms = []
-    seen = set()
-
-    for jp, en in matched_terms:
-        key = (jp, en)
-        if key not in seen:
-            unique_terms.append((jp, en))
-            seen.add(key)
-
-    return unique_terms[:MAX_KEY_TERMS]
-
-
-def make_interpreter_hint(key_terms):
-    if not key_terms:
-        return ""
-
-    english_terms = [en.lower() for _, en in key_terms]
-
-    def has_any(*keywords):
-        for term in english_terms:
-            for keyword in keywords:
-                if keyword in term:
-                    return True
-        return False
-
-    if has_any("inertia compensation") and has_any("braking force", "braking distance", "brake", "emergency braking"):
-        return "The speaker is explaining how inertia compensation relates to vehicle braking."
-
-    if has_any("inertia compensation"):
-        return "The speaker is explaining inertia compensation in a vehicle or control system."
-
-    if has_any("braking force", "braking distance", "hydraulic brake", "emergency braking", "brake pedal"):
-        return "The speaker is explaining vehicle braking behavior or braking components."
-
-    if has_any("lane keeping", "obstacle", "threshold", "control cycle", "warning light", "rear-end collision"):
-        return "The speaker is explaining an ADAS or vehicle safety system."
-
-    if has_any("constraint condition", "dimension", "extrusion", "chamfering", "fillet", "technical drawing", "projection drawing"):
-        return "The speaker is explaining CAD modeling or drawing conditions."
-
-    if has_any("jig", "quality control", "inspection", "defective product", "process", "assembly", "machining"):
-        return "The speaker is explaining a manufacturing, inspection, or production process."
-
-    if has_any("transmission", "engine", "suspension", "steering", "airbag", "seat belt", "tire pressure"):
-        return "The speaker is explaining a vehicle component or vehicle system."
-
-    return "Focus on the key technical terms below and explain the idea simply."
-
-
-# ============================================================
-# Text cleanup
-# ============================================================
-
 def light_caption_cleanup(text):
     if not text:
         return ""
@@ -240,7 +88,9 @@ def light_caption_cleanup(text):
     cleaned = text.strip()
 
     replacements = {
+        # ====================================================
         # Strong correction for 慣性補償
+        # ====================================================
         "sensory compensation control": "inertia compensation control",
         "sensitivity compensation control": "inertia compensation control",
         "sensibility compensation control": "inertia compensation control",
@@ -263,7 +113,9 @@ def light_caption_cleanup(text):
         "Today is inertia compensation": "Today, I will explain inertia compensation",
         "About control": "control",
 
+        # ====================================================
         # General technical cleanup
+        # ====================================================
         "servo-motor": "servo motor",
         "servomotor": "servo motor",
         "brake force": "braking force",
@@ -278,9 +130,11 @@ def light_caption_cleanup(text):
         "bad product": "defective product",
     }
 
+    # Case-sensitive first
     for wrong, correct in replacements.items():
         cleaned = cleaned.replace(wrong, correct)
 
+    # Lowercase-safe correction
     lower_replacements = {
         "sensory compensation control": "inertia compensation control",
         "sensitivity compensation control": "inertia compensation control",
@@ -302,7 +156,6 @@ def light_caption_cleanup(text):
     cleaned = cleaned.replace("a inertia compensation", "inertia compensation")
 
     return cleaned.strip()
-
 
 def light_original_cleanup(text):
     if not text:
@@ -410,31 +263,12 @@ def soniox_live_worker(
 
         if domain_mode == "auto":
             domain_text = (
-                "Japanese automotive engineering, CAD, product design, vehicle systems, "
-                "braking systems, vehicle control, inertia compensation, classroom interpretation, "
-                "technical terms"
+                "Japanese automotive engineering, vehicle control, control engineering, "
+                "inertia compensation, braking control, CAD, manufacturing, "
+                "classroom interpretation, technical terms"
             )
-
-        elif domain_mode == "automotive":
-            domain_text = (
-                "Japanese automotive engineering class, vehicle systems, braking systems, "
-                "drivetrain, suspension, steering, ADAS, vehicle control, inertia compensation"
-            )
-
-        elif domain_mode == "cad":
-            domain_text = (
-                "Japanese CAD class, sketch constraints, dimensions, extrusion, chamfering, "
-                "fillet, technical drawing, projection drawing, product modeling"
-            )
-
-        elif domain_mode == "product design":
-            domain_text = (
-                "Japanese product design class, design process, CAD modeling, dimensions, "
-                "materials, usability, product development, prototyping"
-            )
-
         else:
-            domain_text = "Japanese technical classroom interpretation"
+            domain_text = f"Japanese {domain_mode} technical class interpretation"
 
         config = {
             "api_key": api_key,
@@ -463,14 +297,15 @@ def soniox_live_worker(
                     {
                         "key": "task",
                         "value": (
-                            "Translate Japanese technical classroom speech into clear English subtitles. "
-                            "The user is an interpreter, so keep the meaning easy to understand."
+                            "Translate Japanese technical classroom speech "
+                            "into clear English subtitles for an interpreter."
                         ),
                     },
                     {
                         "key": "style",
                         "value": (
-                            "Use short, readable English captions. Preserve technical terms accurately."
+                            "Use short, readable English captions. "
+                            "Preserve technical terms accurately."
                         ),
                     },
                 ],
@@ -591,6 +426,9 @@ def soniox_live_worker(
                 if now - last_token_time > current_reset_seconds:
                     final_original = ""
                     final_translation = ""
+
+                    # Timer reset: clear current subtitle page only.
+                    # History should stay.
                     result_queue.put({"type": "page_reset"})
 
                 last_token_time = now
@@ -723,8 +561,8 @@ st.markdown(
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English live captions using Soniox real-time translation, "
-    "technical glossary, interpreter hints, and key-term support."
+    "Japanese → English live captions using Soniox real-time translation "
+    "and a technical glossary."
 )
 
 
@@ -737,7 +575,7 @@ with st.sidebar:
 
     domain_mode = st.selectbox(
         "Technical domain",
-        ["auto", "automotive", "cad", "product design"],
+        ["auto", "automotive", "control", "cad", "manufacturing"],
         index=0,
     )
 
@@ -819,6 +657,9 @@ with st.sidebar:
 defaults = {
     "app_active": False,
     "pending_start_translation": False,
+
+    # Important for phone mic release:
+    # Changing this destroys and recreates the WebRTC component.
     "mic_instance_id": 0,
 
     "live_original": "",
@@ -840,6 +681,7 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
+# Update reset seconds while running.
 if float(reset_seconds) != float(st.session_state.last_reset_seconds):
     st.session_state.last_reset_seconds = float(reset_seconds)
 
@@ -937,6 +779,9 @@ if toggle_clicked:
         st.session_state.pending_start_translation = False
         st.session_state.soniox_running = False
         st.session_state.soniox_stop_event.set()
+
+        # Force WebRTC component to be destroyed and recreated.
+        # This helps phone browsers release the microphone.
         st.session_state.mic_instance_id += 1
 
         st.rerun()
@@ -1032,11 +877,14 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
 
     elif item_type == "page_reset":
+        # Timer reset: clear current page only.
+        # Do NOT clear caption_history.
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
         st.session_state.last_update_time = ""
 
     elif item_type == "cleared":
+        # Manual clear: clear everything.
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
         st.session_state.caption_history = []
@@ -1077,52 +925,6 @@ if st.session_state.soniox_error:
 
 
 # ============================================================
-# Caption display data
-# ============================================================
-
-if subtitle_display == "History":
-    caption_text = "\n\n".join(st.session_state.caption_history[-MAX_HISTORY_ITEMS:])
-else:
-    caption_text = st.session_state.live_translation
-
-display_japanese = trim_caption_soft(
-    st.session_state.live_original,
-    max_chars=MAX_ORIGINAL_CHARS,
-)
-
-english_max_chars = (
-    MAX_TRANSLATION_CHARS * 2
-    if subtitle_display == "History"
-    else MAX_TRANSLATION_CHARS
-)
-
-display_english = trim_caption_soft(
-    caption_text,
-    max_chars=english_max_chars,
-)
-
-key_terms = extract_key_terms(
-    st.session_state.live_original,
-    caption_text,
-    terms_file,
-    domain_mode,
-)
-
-interpreter_hint = make_interpreter_hint(key_terms)
-
-if not interpreter_hint:
-    interpreter_hint = "Waiting for technical context..."
-
-if key_terms:
-    key_terms_text = "\n".join([
-        f"{jp} = {en}"
-        for jp, en in key_terms
-    ])
-else:
-    key_terms_text = "No key terms detected yet."
-
-
-# ============================================================
 # Debug panel
 # ============================================================
 
@@ -1152,12 +954,6 @@ if show_debug:
         st.write("History:")
         st.write(st.session_state.caption_history)
 
-        st.write("Interpreter hint:")
-        st.code(interpreter_hint)
-
-        st.write("Key terms:")
-        st.write(key_terms)
-
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
 
@@ -1180,10 +976,29 @@ if show_debug:
 
 st.subheader("Live Captions")
 
+if subtitle_display == "History":
+    caption_text = "\n\n".join(st.session_state.caption_history[-MAX_HISTORY_ITEMS:])
+else:
+    caption_text = st.session_state.live_translation
+
+display_japanese = trim_caption_soft(
+    st.session_state.live_original,
+    max_chars=MAX_ORIGINAL_CHARS,
+)
+
+english_max_chars = (
+    MAX_TRANSLATION_CHARS * 2
+    if subtitle_display == "History"
+    else MAX_TRANSLATION_CHARS
+)
+
+display_english = trim_caption_soft(
+    caption_text,
+    max_chars=english_max_chars,
+)
+
 safe_original = html.escape(display_japanese)
 safe_caption_text = html.escape(display_english)
-safe_hint = html.escape(interpreter_hint)
-safe_key_terms = html.escape(key_terms_text)
 
 caption_html = f"""
 <style>
@@ -1208,43 +1023,11 @@ caption_html = f"""
     border-radius: 14px;
     background-color: #F3F4F6;
     color: #111827;
-    min-height: 65px;
-    max-height: 105px;
+    min-height: 70px;
+    max-height: 110px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
-    box-sizing: border-box;
-}}
-
-.hint-box {{
-    font-size: 20px;
-    line-height: 1.3;
-    font-weight: 700;
-    padding: 14px;
-    border-radius: 16px;
-    background-color: #FEF3C7;
-    color: #111827;
-    min-height: 65px;
-    max-height: 120px;
-    overflow: hidden;
-    white-space: pre-wrap;
-    border: 1px solid #F59E0B;
-    box-sizing: border-box;
-}}
-
-.terms-box {{
-    font-size: 17px;
-    line-height: 1.35;
-    font-weight: 600;
-    padding: 12px;
-    border-radius: 14px;
-    background-color: #ECFDF5;
-    color: #064E3B;
-    min-height: 55px;
-    max-height: 130px;
-    overflow: hidden;
-    white-space: pre-wrap;
-    border: 1px solid #10B981;
     box-sizing: border-box;
 }}
 
@@ -1278,32 +1061,16 @@ caption_html = f"""
         font-size: {jp_font_size}px;
         line-height: 1.35;
         padding: 9px;
-        min-height: 50px;
-        max-height: 85px;
-    }}
-
-    .hint-box {{
-        font-size: 18px;
-        line-height: 1.25;
-        padding: 11px;
-        min-height: 60px;
-        max-height: 110px;
-    }}
-
-    .terms-box {{
-        font-size: 15px;
-        line-height: 1.3;
-        padding: 10px;
-        min-height: 50px;
-        max-height: 115px;
+        min-height: 55px;
+        max-height: 90px;
     }}
 
     .en-caption-box {{
         font-size: {font_size}px;
         line-height: 1.25;
         padding: 12px;
-        min-height: 110px;
-        max-height: 190px;
+        min-height: 115px;
+        max-height: 210px;
     }}
 }}
 </style>
@@ -1312,16 +1079,6 @@ caption_html = f"""
     <div>
         <div class="caption-label">Japanese Original</div>
         <div class="jp-caption-box">{safe_original}</div>
-    </div>
-
-    <div>
-        <div class="caption-label">Interpreter Hint</div>
-        <div class="hint-box">{safe_hint}</div>
-    </div>
-
-    <div>
-        <div class="caption-label">Key Terms</div>
-        <div class="terms-box">{safe_key_terms}</div>
     </div>
 
     <div>
