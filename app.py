@@ -88,6 +88,34 @@ def light_caption_cleanup(text):
     cleaned = text.strip()
 
     replacements = {
+        # ====================================================
+        # Strong correction for 慣性補償
+        # ====================================================
+        "sensory compensation control": "inertia compensation control",
+        "sensitivity compensation control": "inertia compensation control",
+        "sensibility compensation control": "inertia compensation control",
+        "sensory compensation": "inertia compensation",
+        "sensitivity compensation": "inertia compensation",
+        "sensibility compensation": "inertia compensation",
+
+        "completion assurance control": "inertia compensation control",
+        "completion compensation control": "inertia compensation control",
+        "complete assurance control": "inertia compensation control",
+        "complete compensation control": "inertia compensation control",
+        "control for the completion assurance": "inertia compensation control",
+        "the control for the completion assurance": "inertia compensation control",
+        "completion assurance": "inertia compensation",
+        "completion compensation": "inertia compensation",
+        "complete assurance": "inertia compensation",
+        "complete compensation": "inertia compensation",
+
+        "Today is sensory compensation": "Today, I will explain inertia compensation",
+        "Today is inertia compensation": "Today, I will explain inertia compensation",
+        "About control": "control",
+
+        # ====================================================
+        # General technical cleanup
+        # ====================================================
         "servo-motor": "servo motor",
         "servomotor": "servo motor",
         "brake force": "braking force",
@@ -102,7 +130,25 @@ def light_caption_cleanup(text):
         "bad product": "defective product",
     }
 
+    # Case-sensitive first
     for wrong, correct in replacements.items():
+        cleaned = cleaned.replace(wrong, correct)
+
+    # Lowercase-safe correction
+    lower_replacements = {
+        "sensory compensation control": "inertia compensation control",
+        "sensitivity compensation control": "inertia compensation control",
+        "sensibility compensation control": "inertia compensation control",
+        "sensory compensation": "inertia compensation",
+        "sensitivity compensation": "inertia compensation",
+        "sensibility compensation": "inertia compensation",
+        "completion assurance control": "inertia compensation control",
+        "completion compensation control": "inertia compensation control",
+        "completion assurance": "inertia compensation",
+        "completion compensation": "inertia compensation",
+    }
+
+    for wrong, correct in lower_replacements.items():
         cleaned = cleaned.replace(wrong, correct)
 
     cleaned = cleaned.replace("a obstacle", "an obstacle")
@@ -190,8 +236,9 @@ def soniox_live_worker(
 
         if domain_mode == "auto":
             domain_text = (
-                "Japanese automotive engineering, control engineering, CAD, "
-                "manufacturing, classroom interpretation, technical terms"
+                "Japanese automotive engineering, vehicle control, control engineering, "
+                "inertia compensation, braking control, CAD, manufacturing, "
+                "classroom interpretation, technical terms"
             )
         else:
             domain_text = f"Japanese {domain_mode} technical class interpretation"
@@ -211,6 +258,14 @@ def soniox_live_worker(
                     {
                         "key": "domain",
                         "value": domain_text,
+                    },
+                    {
+                        "key": "important_term",
+                        "value": (
+                            "慣性補償 means inertia compensation. "
+                            "Do not translate 慣性補償 as sensory compensation, completion assurance, "
+                            "or completion compensation."
+                        ),
                     },
                     {
                         "key": "task",
