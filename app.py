@@ -20,21 +20,15 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
-MAX_HISTORY_ITEMS = 5
-MAX_RAW_MESSAGES = 5
-MAX_DEBUG_MESSAGES = 20
-
-# Caption behavior:
-# If the speaker pauses for this many seconds, the next speech starts a new page.
 CAPTION_RESET_AFTER_SECONDS = 3.0
-
-# These are only emergency limits. Timer does most of the reset work.
 MAX_ORIGINAL_CHARS = 160
 MAX_TRANSLATION_CHARS = 260
+MAX_HISTORY_ITEMS = 3
+MAX_DEBUG_MESSAGES = 10
 
 
 # ============================================================
-# Glossary / technical terms
+# Glossary
 # ============================================================
 
 def load_soniox_context_terms(terms_file):
@@ -73,19 +67,16 @@ def load_soniox_context_terms(terms_file):
 
         terms = list(dict.fromkeys(terms))
 
-        translation_terms_unique = []
-        seen_pairs = set()
+        unique_translation_terms = []
+        seen = set()
 
         for item in translation_terms:
             key = (item["source"], item["target"])
-            if key not in seen_pairs:
-                translation_terms_unique.append(item)
-                seen_pairs.add(key)
+            if key not in seen:
+                unique_translation_terms.append(item)
+                seen.add(key)
 
-        return terms[:300], translation_terms_unique[:300]
-
-    except FileNotFoundError:
-        return [], []
+        return terms[:300], unique_translation_terms[:300]
 
     except Exception:
         return [], []
@@ -123,10 +114,6 @@ def light_caption_cleanup(text):
 
 
 def trim_caption_soft(text, max_chars):
-    """
-    Soft trim only when text becomes extremely long.
-    Normal reset is handled by the pause timer.
-    """
     if not text:
         return ""
 
@@ -137,16 +124,7 @@ def trim_caption_soft(text, max_chars):
 
     recent = text[-max_chars:]
 
-    separators = [
-        ". ",
-        "? ",
-        "! ",
-        "。",
-        "、",
-        ", ",
-        " ",
-    ]
-
+    separators = [". ", "? ", "! ", "。", "、", ", ", " "]
     best_index = -1
 
     for sep in separators:
@@ -161,7 +139,7 @@ def trim_caption_soft(text, max_chars):
 
 
 # ============================================================
-# WebRTC audio processor
+# Audio processor
 # ============================================================
 
 class AudioProcessor:
@@ -178,8 +156,7 @@ class AudioProcessor:
             resampled_frames = self.resampler.resample(frame)
 
             for resampled_frame in resampled_frames:
-                audio = resampled_frame.to_ndarray()
-                audio = audio.reshape(-1)
+                audio = resampled_frame.to_ndarray().reshape(-1)
 
                 if audio.size == 0:
                     continue
@@ -194,7 +171,7 @@ class AudioProcessor:
 
 
 # ============================================================
-# Soniox live worker
+# Soniox worker
 # ============================================================
 
 def soniox_live_worker(
@@ -205,6 +182,7 @@ def soniox_live_worker(
     api_key,
     terms_file,
     domain_mode,
+    caption_reset_seconds,
 ):
     ws = None
 
@@ -259,26 +237,12 @@ def soniox_live_worker(
             },
         }
 
-        result_queue.put({
-            "type": "debug",
-            "message": "Connecting to Soniox WebSocket...",
-        })
-
-        ws = websocket.create_connection(
-            SONIOX_WS_URL,
-            timeout=10,
-        )
-
-        result_queue.put({
-            "type": "debug",
-            "message": "Connected to Soniox WebSocket.",
-        })
-
+        ws = websocket.create_connection(SONIOX_WS_URL, timeout=10)
         ws.send(json.dumps(config))
 
         result_queue.put({
             "type": "debug",
-            "message": "Sent Soniox config.",
+            "message": "Connected to Soniox.",
         })
 
         final_original = ""
@@ -292,11 +256,6 @@ def soniox_live_worker(
 
                     if audio_bytes:
                         ws.send_binary(audio_bytes)
-
-                        result_queue.put({
-                            "type": "audio",
-                            "bytes": len(audio_bytes),
-                        })
 
                 except queue.Empty:
                     continue
@@ -313,10 +272,7 @@ def soniox_live_worker(
             except Exception:
                 pass
 
-        sender_thread = threading.Thread(
-            target=send_audio,
-            daemon=True,
-        )
+        sender_thread = threading.Thread(target=send_audio, daemon=True)
         sender_thread.start()
 
         while not stop_event.is_set():
@@ -327,10 +283,11 @@ def soniox_live_worker(
                 continue
 
             except Exception as e:
-                result_queue.put({
-                    "type": "error",
-                    "message": f"WebSocket receive error: {e}",
-                })
+                if not stop_event.is_set():
+                    result_queue.put({
+                        "type": "error",
+                        "message": f"WebSocket receive error: {e}",
+                    })
                 break
 
             if not msg:
@@ -339,16 +296,7 @@ def soniox_live_worker(
             try:
                 data = json.loads(msg)
             except json.JSONDecodeError:
-                result_queue.put({
-                    "type": "debug",
-                    "message": "Received non-JSON message from Soniox.",
-                })
                 continue
-
-            result_queue.put({
-                "type": "raw",
-                "message": data,
-            })
 
             if data.get("error_code"):
                 result_queue.put({
@@ -358,10 +306,6 @@ def soniox_live_worker(
                 break
 
             if data.get("finished"):
-                result_queue.put({
-                    "type": "status",
-                    "message": "Soniox stream finished.",
-                })
                 break
 
             while control_queue is not None and not control_queue.empty():
@@ -371,41 +315,30 @@ def soniox_live_worker(
                     if command == "clear":
                         final_original = ""
                         final_translation = ""
-
-                        result_queue.put({
-                            "type": "cleared",
-                        })
+                        result_queue.put({"type": "cleared"})
 
                 except queue.Empty:
                     break
 
             tokens = data.get("tokens", [])
 
-            has_real_token = False
-
-            for token in tokens:
-                text = token.get("text", "")
-                if text and text != "<end>":
-                    has_real_token = True
-                    break
+            has_real_token = any(
+                token.get("text", "") and token.get("text", "") != "<end>"
+                for token in tokens
+            )
 
             if has_real_token:
                 now = time.time()
 
-                # If speaker paused, clear old caption when new speech starts.
-                if now - last_token_time > CAPTION_RESET_AFTER_SECONDS:
+                if now - last_token_time > caption_reset_seconds:
                     final_original = ""
                     final_translation = ""
-
-                    result_queue.put({
-                        "type": "cleared",
-                    })
+                    result_queue.put({"type": "cleared"})
 
                 last_token_time = now
 
             non_final_original = ""
             non_final_translation = ""
-
             endpoint_detected = False
 
             for token in tokens:
@@ -420,7 +353,6 @@ def soniox_live_worker(
 
                 status = token.get("translation_status")
                 is_final = token.get("is_final", False)
-
                 is_translation_token = status in ["translation", "translated"]
 
                 if is_translation_token:
@@ -447,10 +379,11 @@ def soniox_live_worker(
                 })
 
     except Exception as e:
-        result_queue.put({
-            "type": "error",
-            "message": str(e),
-        })
+        if not stop_event.is_set():
+            result_queue.put({
+                "type": "error",
+                "message": str(e),
+            })
 
     finally:
         try:
@@ -460,8 +393,7 @@ def soniox_live_worker(
             pass
 
         result_queue.put({
-            "type": "status",
-            "message": "Stopped.",
+            "type": "stopped",
         })
 
 
@@ -520,7 +452,7 @@ st.markdown(
             }
 
             div[data-testid="stVerticalBlock"] {
-                gap: 0.6rem;
+                gap: 0.55rem;
             }
         }
     </style>
@@ -537,7 +469,7 @@ st.caption(
 
 
 # ============================================================
-# Sidebar settings
+# Sidebar
 # ============================================================
 
 with st.sidebar:
@@ -545,28 +477,14 @@ with st.sidebar:
 
     domain_mode = st.selectbox(
         "Technical domain",
-        [
-            "auto",
-            "automotive",
-            "control",
-            "cad",
-            "manufacturing",
-        ],
+        ["auto", "automotive", "control", "cad", "manufacturing"],
         index=0,
     )
 
     subtitle_display = st.radio(
         "Caption display",
-        [
-            "Latest only",
-            "History",
-        ],
+        ["Latest only", "History"],
         index=0,
-    )
-
-    show_debug = st.checkbox(
-        "Show debug panel",
-        value=False,
     )
 
     font_size = st.slider(
@@ -593,6 +511,11 @@ with st.sidebar:
         step=0.5,
     )
 
+    show_debug = st.checkbox(
+        "Show debug panel",
+        value=False,
+    )
+
     st.divider()
 
     st.write("Glossary")
@@ -607,17 +530,13 @@ with st.sidebar:
     if uploaded_glossary is not None:
         os.makedirs("glossaries", exist_ok=True)
 
-        glossary_path = os.path.join(
-            "glossaries",
-            uploaded_glossary.name,
-        )
+        glossary_path = os.path.join("glossaries", uploaded_glossary.name)
 
         with open(glossary_path, "wb") as f:
             f.write(uploaded_glossary.getbuffer())
 
         terms_file = glossary_path
         st.success(f"Using: {uploaded_glossary.name}")
-
     else:
         st.info("Using default technical_terms.csv")
 
@@ -633,44 +552,27 @@ with st.sidebar:
 # Session state
 # ============================================================
 
-if "live_original" not in st.session_state:
-    st.session_state.live_original = ""
+defaults = {
+    "app_active": False,
+    "pending_start_translation": False,
+    "live_original": "",
+    "live_translation": "",
+    "caption_history": [],
+    "soniox_running": False,
+    "soniox_error": "",
+    "soniox_result_queue": queue.Queue(),
+    "soniox_control_queue": queue.Queue(),
+    "soniox_stop_event": threading.Event(),
+    "soniox_thread": None,
+    "debug_messages": [],
+    "last_update_time": "",
+}
 
-if "live_translation" not in st.session_state:
-    st.session_state.live_translation = ""
+for_key_values = defaults.items()
 
-if "caption_history" not in st.session_state:
-    st.session_state.caption_history = []
-
-if "soniox_running" not in st.session_state:
-    st.session_state.soniox_running = False
-
-if "soniox_error" not in st.session_state:
-    st.session_state.soniox_error = ""
-
-if "soniox_result_queue" not in st.session_state:
-    st.session_state.soniox_result_queue = queue.Queue()
-
-if "soniox_control_queue" not in st.session_state:
-    st.session_state.soniox_control_queue = queue.Queue()
-
-if "soniox_stop_event" not in st.session_state:
-    st.session_state.soniox_stop_event = threading.Event()
-
-if "soniox_thread" not in st.session_state:
-    st.session_state.soniox_thread = None
-
-if "debug_messages" not in st.session_state:
-    st.session_state.debug_messages = []
-
-if "audio_bytes_sent" not in st.session_state:
-    st.session_state.audio_bytes_sent = 0
-
-if "soniox_raw_messages" not in st.session_state:
-    st.session_state.soniox_raw_messages = []
-
-if "last_update_time" not in st.session_state:
-    st.session_state.last_update_time = ""
+for key, value in for_key_values:
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ============================================================
@@ -683,16 +585,13 @@ if not api_key:
     st.error(
         "SONIOX_API_KEY is not set.\n\n"
         "For Streamlit Cloud, add this in Secrets:\n\n"
-        'SONIOX_API_KEY = "your_api_key_here"\n\n'
-        "For local PowerShell, run:\n\n"
-        'setx SONIOX_API_KEY "your_api_key_here"\n\n'
-        "Then close PowerShell and open it again."
+        'SONIOX_API_KEY = "your_api_key_here"'
     )
     st.stop()
 
 
 # ============================================================
-# WebRTC microphone
+# Microphone / WebRTC
 # ============================================================
 
 rtc_configuration = RTCConfiguration(
@@ -713,6 +612,11 @@ rtc_configuration = RTCConfiguration(
 
 st.subheader("Microphone")
 
+st.info(
+    "Press Start Translation to start the microphone and translation. "
+    "If microphone access is denied, allow microphone permission in browser site settings."
+)
+
 webrtc_ctx = webrtc_streamer(
     key="soniox-live-caption-mic",
     mode=WebRtcMode.SENDONLY,
@@ -727,6 +631,7 @@ webrtc_ctx = webrtc_streamer(
     },
     audio_processor_factory=AudioProcessor,
     async_processing=True,
+    desired_playing_state=st.session_state.app_active,
 )
 
 
@@ -734,93 +639,95 @@ webrtc_ctx = webrtc_streamer(
 # Controls
 # ============================================================
 
-col1, col2, col3 = st.columns(3)
+toggle_label = (
+    "Stop Translation"
+    if st.session_state.app_active
+    else "Start Translation"
+)
 
-with col1:
-    start_clicked = st.button(
-        "Start Translation",
-        type="primary",
-        use_container_width=True,
-    )
+toggle_clicked = st.button(
+    toggle_label,
+    type="primary",
+    use_container_width=True,
+)
 
-with col2:
-    stop_clicked = st.button(
-        "Stop",
-        use_container_width=True,
-    )
+clear_clicked = st.button(
+    "Clear Captions",
+    use_container_width=True,
+)
 
-with col3:
-    clear_clicked = st.button(
-        "Clear Captions",
-        use_container_width=True,
-    )
+if toggle_clicked:
+    if st.session_state.app_active:
+        st.session_state.app_active = False
+        st.session_state.pending_start_translation = False
+        st.session_state.soniox_running = False
+        st.session_state.soniox_stop_event.set()
+
+    else:
+        st.session_state.app_active = True
+        st.session_state.pending_start_translation = True
+        st.session_state.soniox_error = ""
 
 if clear_clicked:
     st.session_state.live_original = ""
     st.session_state.live_translation = ""
     st.session_state.caption_history = []
-    st.session_state.soniox_error = ""
-    st.session_state.debug_messages = []
-    st.session_state.audio_bytes_sent = 0
-    st.session_state.soniox_raw_messages = []
     st.session_state.last_update_time = ""
+    st.session_state.soniox_error = ""
 
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
 
-if stop_clicked:
-    st.session_state.soniox_running = False
-    st.session_state.soniox_stop_event.set()
 
-if start_clicked:
-    if not webrtc_ctx.audio_processor:
-        st.warning("Start the microphone first, then click Start Translation.")
+# ============================================================
+# Auto-start Soniox after WebRTC mic is ready
+# ============================================================
 
-    else:
-        st.session_state.soniox_stop_event = threading.Event()
-        st.session_state.soniox_result_queue = queue.Queue()
-        st.session_state.soniox_control_queue = queue.Queue()
-        st.session_state.soniox_error = ""
-        st.session_state.debug_messages = []
-        st.session_state.audio_bytes_sent = 0
-        st.session_state.soniox_raw_messages = []
-        st.session_state.live_original = ""
-        st.session_state.live_translation = ""
-        st.session_state.caption_history = []
-        st.session_state.last_update_time = ""
-        st.session_state.soniox_running = True
+if (
+    st.session_state.pending_start_translation
+    and st.session_state.app_active
+    and not st.session_state.soniox_running
+    and webrtc_ctx.audio_processor
+):
+    st.session_state.soniox_stop_event = threading.Event()
+    st.session_state.soniox_result_queue = queue.Queue()
+    st.session_state.soniox_control_queue = queue.Queue()
+    st.session_state.soniox_error = ""
+    st.session_state.debug_messages = []
+    st.session_state.live_original = ""
+    st.session_state.live_translation = ""
+    st.session_state.caption_history = []
+    st.session_state.last_update_time = ""
 
-        processor = webrtc_ctx.audio_processor
+    processor = webrtc_ctx.audio_processor
 
-        # Use selected timer value by updating global constant through closure-like args.
-        # The worker uses CAPTION_RESET_AFTER_SECONDS from settings above.
-        globals()["CAPTION_RESET_AFTER_SECONDS"] = float(reset_seconds)
+    st.session_state.soniox_running = True
+    st.session_state.pending_start_translation = False
 
-        st.session_state.soniox_thread = threading.Thread(
-            target=soniox_live_worker,
-            args=(
-                processor.audio_queue,
-                st.session_state.soniox_result_queue,
-                st.session_state.soniox_stop_event,
-                st.session_state.soniox_control_queue,
-                api_key,
-                terms_file,
-                domain_mode,
-            ),
-            daemon=True,
-        )
+    st.session_state.soniox_thread = threading.Thread(
+        target=soniox_live_worker,
+        args=(
+            processor.audio_queue,
+            st.session_state.soniox_result_queue,
+            st.session_state.soniox_stop_event,
+            st.session_state.soniox_control_queue,
+            api_key,
+            terms_file,
+            domain_mode,
+            float(reset_seconds),
+        ),
+        daemon=True,
+    )
 
-        st.session_state.soniox_thread.start()
+    st.session_state.soniox_thread.start()
 
 
 # ============================================================
 # Pull Soniox results into UI state
 # ============================================================
 
-result_queue = st.session_state.soniox_result_queue
-
-while not result_queue.empty():
-    item = result_queue.get()
+while not st.session_state.soniox_result_queue.empty():
+    item = st.session_state.soniox_result_queue.get()
     item_type = item.get("type")
 
     if item_type == "tokens":
@@ -850,16 +757,6 @@ while not result_queue.empty():
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
 
-    elif item_type == "audio":
-        st.session_state.audio_bytes_sent += item.get("bytes", 0)
-
-    elif item_type == "raw":
-        raw_message = item.get("message", {})
-        st.session_state.soniox_raw_messages.append(raw_message)
-        st.session_state.soniox_raw_messages = (
-            st.session_state.soniox_raw_messages[-MAX_RAW_MESSAGES:]
-        )
-
     elif item_type == "debug":
         message = item.get("message", "")
         if message:
@@ -871,14 +768,11 @@ while not result_queue.empty():
     elif item_type == "error":
         st.session_state.soniox_error = item.get("message", "")
         st.session_state.soniox_running = False
+        st.session_state.app_active = False
+        st.session_state.pending_start_translation = False
 
-    elif item_type == "status":
-        message = item.get("message", "")
-        if message:
-            st.session_state.debug_messages.append(message)
-            st.session_state.debug_messages = (
-                st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
-            )
+    elif item_type == "stopped":
+        st.session_state.soniox_running = False
 
 
 # ============================================================
@@ -887,6 +781,8 @@ while not result_queue.empty():
 
 if st.session_state.soniox_running:
     st.success("Live translation running.")
+elif st.session_state.app_active:
+    st.info("Starting microphone...")
 else:
     st.info("Live translation stopped.")
 
@@ -899,51 +795,39 @@ if st.session_state.soniox_error:
 # ============================================================
 
 if show_debug:
-    with st.expander("Debug / Error Info", expanded=True):
-        st.write("**Audio bytes sent to Soniox:**")
-        st.code(str(st.session_state.audio_bytes_sent))
-
-        st.write("**Last UI update time:**")
+    with st.expander("Debug", expanded=True):
+        st.write("Last update:")
         st.code(
             st.session_state.last_update_time
             if st.session_state.last_update_time
             else "No token update yet"
         )
 
-        st.write("**Current Japanese original:**")
+        st.write("Japanese:")
         st.code(
             st.session_state.live_original
             if st.session_state.live_original
             else "Empty"
         )
 
-        st.write("**Current English translation:**")
+        st.write("English:")
         st.code(
             st.session_state.live_translation
             if st.session_state.live_translation
             else "Empty"
         )
 
-        st.write("**Soniox error:**")
+        st.write("Error:")
         st.code(
             st.session_state.soniox_error
             if st.session_state.soniox_error
             else "No error"
         )
 
-        st.write("**Recent debug messages:**")
         if st.session_state.debug_messages:
+            st.write("Messages:")
             for message in st.session_state.debug_messages:
                 st.write("- " + str(message))
-        else:
-            st.write("No debug messages yet.")
-
-        st.write("**Recent raw Soniox messages:**")
-        if st.session_state.soniox_raw_messages:
-            for msg in st.session_state.soniox_raw_messages:
-                st.json(msg)
-        else:
-            st.write("No raw Soniox messages yet.")
 
 
 # ============================================================
@@ -1062,9 +946,9 @@ st.html(caption_html)
 
 
 # ============================================================
-# Force live UI refresh
+# Live refresh
 # ============================================================
 
-if st.session_state.soniox_running:
+if st.session_state.app_active or st.session_state.soniox_running:
     time.sleep(0.7)
     st.rerun()
