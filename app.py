@@ -157,6 +157,33 @@ def light_caption_cleanup(text):
 
     return cleaned.strip()
 
+def light_original_cleanup(text):
+    if not text:
+        return ""
+
+    cleaned = text.strip()
+
+    replacements = {
+        "感性補償": "慣性補償",
+        "感性保証": "慣性補償",
+        "感性保障": "慣性補償",
+        "完成保証": "慣性補償",
+        "完成補償": "慣性補償",
+        "完成保障": "慣性補償",
+        "慣性保障": "慣性補償",
+
+        "感性補償制御": "慣性補償制御",
+        "感性保証制御": "慣性補償制御",
+        "完成保証制御": "慣性補償制御",
+        "完成補償制御": "慣性補償制御",
+        "慣性保障制御": "慣性補償制御",
+    }
+
+    for wrong, correct in replacements.items():
+        cleaned = cleaned.replace(wrong, correct)
+
+    return cleaned.strip()
+
 
 def trim_caption_soft(text, max_chars):
     if not text:
@@ -436,6 +463,8 @@ def soniox_live_worker(
                         non_final_original += text
 
             current_original = (final_original + non_final_original).strip()
+            current_original = light_original_cleanup(current_original)
+
             current_translation = (final_translation + non_final_translation).strip()
             current_translation = light_caption_cleanup(current_translation)
 
