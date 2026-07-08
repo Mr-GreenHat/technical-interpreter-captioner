@@ -261,10 +261,11 @@ def soniox_live_worker(
                     continue
 
                 except Exception as e:
-                    result_queue.put({
-                        "type": "error",
-                        "message": f"Audio send error: {e}",
-                    })
+                    if not stop_event.is_set():
+                        result_queue.put({
+                            "type": "error",
+                            "message": f"Audio send error: {e}",
+                        })
                     break
 
             try:
@@ -568,9 +569,7 @@ defaults = {
     "last_update_time": "",
 }
 
-for_key_values = defaults.items()
-
-for key, value in for_key_values:
+for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
@@ -663,10 +662,16 @@ if toggle_clicked:
         st.session_state.soniox_running = False
         st.session_state.soniox_stop_event.set()
 
+        # Important: rerun immediately so WebRTC receives desired_playing_state=False.
+        st.rerun()
+
     else:
         st.session_state.app_active = True
         st.session_state.pending_start_translation = True
         st.session_state.soniox_error = ""
+
+        # Important: rerun immediately so WebRTC receives desired_playing_state=True.
+        st.rerun()
 
 if clear_clicked:
     st.session_state.live_original = ""
