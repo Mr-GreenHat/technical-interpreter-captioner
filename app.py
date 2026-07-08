@@ -288,7 +288,9 @@ def soniox_live_worker(
 
                     elif isinstance(command, dict):
                         if command.get("type") == "set_reset_seconds":
-                            current_reset_seconds = float(command.get("value", current_reset_seconds))
+                            current_reset_seconds = float(
+                                command.get("value", current_reset_seconds)
+                            )
                             result_queue.put({
                                 "type": "debug",
                                 "message": f"Reset seconds changed to {current_reset_seconds}",
@@ -343,8 +345,8 @@ def soniox_live_worker(
                     final_original = ""
                     final_translation = ""
 
-                    # This resets only current subtitle page.
-                    # It should NOT clear history.
+                    # Timer reset: clear current subtitle page only.
+                    # History should stay.
                     result_queue.put({"type": "page_reset"})
 
                 last_token_time = now
@@ -571,6 +573,11 @@ with st.sidebar:
 defaults = {
     "app_active": False,
     "pending_start_translation": False,
+
+    # Important for phone mic release:
+    # Changing this destroys and recreates the WebRTC component.
+    "mic_instance_id": 0,
+
     "live_original": "",
     "live_translation": "",
     "caption_history": [],
@@ -644,7 +651,7 @@ st.info(
 )
 
 webrtc_ctx = webrtc_streamer(
-    key="soniox-live-caption-mic",
+    key=f"soniox-live-caption-mic-{st.session_state.mic_instance_id}",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -688,6 +695,10 @@ if toggle_clicked:
         st.session_state.pending_start_translation = False
         st.session_state.soniox_running = False
         st.session_state.soniox_stop_event.set()
+
+        # Force WebRTC component to be destroyed and recreated.
+        # This helps phone browsers release the microphone.
+        st.session_state.mic_instance_id += 1
 
         st.rerun()
 
@@ -808,6 +819,7 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.soniox_running = False
         st.session_state.app_active = False
         st.session_state.pending_start_translation = False
+        st.session_state.mic_instance_id += 1
 
     elif item_type == "stopped":
         st.session_state.soniox_running = False
@@ -858,6 +870,9 @@ if show_debug:
         st.write("History:")
         st.write(st.session_state.caption_history)
 
+        st.write("Mic instance:")
+        st.code(str(st.session_state.mic_instance_id))
+
         st.write("Error:")
         st.code(
             st.session_state.soniox_error
@@ -887,7 +902,6 @@ display_japanese = trim_caption_soft(
     max_chars=MAX_ORIGINAL_CHARS,
 )
 
-# In History mode, allow longer display because it is supposed to show more.
 english_max_chars = (
     MAX_TRANSLATION_CHARS * 2
     if subtitle_display == "History"
