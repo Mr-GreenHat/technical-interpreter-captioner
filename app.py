@@ -20,10 +20,10 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
-CAPTION_RESET_AFTER_SECONDS = 3.0
+DEFAULT_RESET_SECONDS = 3.0
 MAX_ORIGINAL_CHARS = 160
 MAX_TRANSLATION_CHARS = 260
-MAX_HISTORY_ITEMS = 3
+MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
 
@@ -52,12 +52,11 @@ def load_soniox_context_terms(terms_file):
                     terms.append(reading)
 
                 if common_wrong:
-                    wrong_items = [
+                    terms.extend([
                         item.strip()
                         for item in common_wrong.split(";")
                         if item.strip()
-                    ]
-                    terms.extend(wrong_items)
+                    ])
 
                 if jp and en:
                     translation_terms.append({
@@ -248,6 +247,7 @@ def soniox_live_worker(
         final_original = ""
         final_translation = ""
         last_token_time = time.time()
+        current_reset_seconds = float(caption_reset_seconds)
 
         def send_audio():
             while not stop_event.is_set():
@@ -277,6 +277,26 @@ def soniox_live_worker(
         sender_thread.start()
 
         while not stop_event.is_set():
+            while control_queue is not None and not control_queue.empty():
+                try:
+                    command = control_queue.get_nowait()
+
+                    if command == "clear":
+                        final_original = ""
+                        final_translation = ""
+                        result_queue.put({"type": "cleared"})
+
+                    elif isinstance(command, dict):
+                        if command.get("type") == "set_reset_seconds":
+                            current_reset_seconds = float(command.get("value", current_reset_seconds))
+                            result_queue.put({
+                                "type": "debug",
+                                "message": f"Reset seconds changed to {current_reset_seconds}",
+                            })
+
+                except queue.Empty:
+                    break
+
             try:
                 msg = ws.recv()
 
@@ -309,18 +329,6 @@ def soniox_live_worker(
             if data.get("finished"):
                 break
 
-            while control_queue is not None and not control_queue.empty():
-                try:
-                    command = control_queue.get_nowait()
-
-                    if command == "clear":
-                        final_original = ""
-                        final_translation = ""
-                        result_queue.put({"type": "cleared"})
-
-                except queue.Empty:
-                    break
-
             tokens = data.get("tokens", [])
 
             has_real_token = any(
@@ -331,10 +339,13 @@ def soniox_live_worker(
             if has_real_token:
                 now = time.time()
 
-                if now - last_token_time > caption_reset_seconds:
+                if now - last_token_time > current_reset_seconds:
                     final_original = ""
                     final_translation = ""
-                    result_queue.put({"type": "cleared"})
+
+                    # This resets only current subtitle page.
+                    # It should NOT clear history.
+                    result_queue.put({"type": "page_reset"})
 
                 last_token_time = now
 
@@ -507,14 +518,18 @@ with st.sidebar:
     reset_seconds = st.slider(
         "Reset caption after pause",
         min_value=1.5,
-        max_value=6.0,
-        value=CAPTION_RESET_AFTER_SECONDS,
+        max_value=8.0,
+        value=DEFAULT_RESET_SECONDS,
         step=0.5,
     )
 
     show_debug = st.checkbox(
         "Show debug panel",
         value=False,
+    )
+
+    st.caption(
+        "Font size changes immediately. Reset seconds also updates while running."
     )
 
     st.divider()
@@ -567,11 +582,23 @@ defaults = {
     "soniox_thread": None,
     "debug_messages": [],
     "last_update_time": "",
+    "last_reset_seconds": DEFAULT_RESET_SECONDS,
 }
 
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
+
+
+# Update reset seconds while running.
+if float(reset_seconds) != float(st.session_state.last_reset_seconds):
+    st.session_state.last_reset_seconds = float(reset_seconds)
+
+    if st.session_state.soniox_running:
+        st.session_state.soniox_control_queue.put({
+            "type": "set_reset_seconds",
+            "value": float(reset_seconds),
+        })
 
 
 # ============================================================
@@ -662,7 +689,6 @@ if toggle_clicked:
         st.session_state.soniox_running = False
         st.session_state.soniox_stop_event.set()
 
-        # Important: rerun immediately so WebRTC receives desired_playing_state=False.
         st.rerun()
 
     else:
@@ -670,7 +696,6 @@ if toggle_clicked:
         st.session_state.pending_start_translation = True
         st.session_state.soniox_error = ""
 
-        # Important: rerun immediately so WebRTC receives desired_playing_state=True.
         st.rerun()
 
 if clear_clicked:
@@ -756,7 +781,15 @@ while not st.session_state.soniox_result_queue.empty():
 
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
 
+    elif item_type == "page_reset":
+        # Timer reset: clear current page only.
+        # Do NOT clear caption_history.
+        st.session_state.live_original = ""
+        st.session_state.live_translation = ""
+        st.session_state.last_update_time = ""
+
     elif item_type == "cleared":
+        # Manual clear: clear everything.
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
         st.session_state.caption_history = []
@@ -822,6 +855,9 @@ if show_debug:
             else "Empty"
         )
 
+        st.write("History:")
+        st.write(st.session_state.caption_history)
+
         st.write("Error:")
         st.code(
             st.session_state.soniox_error
@@ -842,7 +878,7 @@ if show_debug:
 st.subheader("Live Captions")
 
 if subtitle_display == "History":
-    caption_text = "\n".join(st.session_state.caption_history[-2:])
+    caption_text = "\n\n".join(st.session_state.caption_history[-MAX_HISTORY_ITEMS:])
 else:
     caption_text = st.session_state.live_translation
 
@@ -851,9 +887,16 @@ display_japanese = trim_caption_soft(
     max_chars=MAX_ORIGINAL_CHARS,
 )
 
+# In History mode, allow longer display because it is supposed to show more.
+english_max_chars = (
+    MAX_TRANSLATION_CHARS * 2
+    if subtitle_display == "History"
+    else MAX_TRANSLATION_CHARS
+)
+
 display_english = trim_caption_soft(
     caption_text,
-    max_chars=MAX_TRANSLATION_CHARS,
+    max_chars=english_max_chars,
 )
 
 safe_original = html.escape(display_japanese)
@@ -899,7 +942,7 @@ caption_html = f"""
     background-color: #111827;
     color: white;
     min-height: 125px;
-    max-height: 185px;
+    max-height: 230px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #374151;
@@ -917,7 +960,7 @@ caption_html = f"""
     }}
 
     .jp-caption-box {{
-        font-size: 16px;
+        font-size: {jp_font_size}px;
         line-height: 1.35;
         padding: 9px;
         min-height: 55px;
@@ -925,11 +968,11 @@ caption_html = f"""
     }}
 
     .en-caption-box {{
-        font-size: 20px;
+        font-size: {font_size}px;
         line-height: 1.25;
         padding: 12px;
         min-height: 115px;
-        max-height: 165px;
+        max-height: 210px;
     }}
 }}
 </style>
