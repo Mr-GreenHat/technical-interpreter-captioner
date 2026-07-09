@@ -30,7 +30,7 @@ MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
 LLM_MODEL_DEFAULT = "gemini-2.5-flash-lite"
-LLM_MODEL_BACKUP = "gemini-2.5-flash-lite"
+LLM_MODEL_BACKUP = "gemini-2.5-flash"
 
 DEFAULT_LLM_HINT_INTERVAL = 30.0
 MIN_LLM_CONTEXT_CHARS = 160
@@ -419,6 +419,7 @@ def parse_llm_json(text):
         return {
             "main_idea": "",
             "say_it_simply": "",
+            "corrected_english_caption": "",
             "key_terms": [],
             "corrections": [],
         }
@@ -440,6 +441,7 @@ def parse_llm_json(text):
         return {
             "main_idea": str(data.get("main_idea", "")).strip(),
             "say_it_simply": str(data.get("say_it_simply", "")).strip(),
+            "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
             "key_terms": data.get("key_terms", []),
             "corrections": data.get("corrections", []),
         }
@@ -448,6 +450,7 @@ def parse_llm_json(text):
         return {
             "main_idea": cleaned[:220],
             "say_it_simply": "",
+            "corrected_english_caption": "",
             "key_terms": [],
             "corrections": [],
         }
@@ -493,12 +496,15 @@ Use the recent context below. The latest part is at the bottom.
 Rules:
 - Output JSON only.
 - Do not add new facts.
-- Keep it short.
-- Focus on the speaker's current main point, not every detail.
-- Use previous context to understand what the speaker is talking about.
-- Make the simple sentence useful for a human interpreter.
+- Do not summarize the speaker.
+- Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
+- Do not rewrite "I" as "the speaker" unless the original meaning is third-person.
+- Use previous context only to repair unclear wording and technical terms.
+- Repair obvious STT/translation mistakes in technical terms.
+- Repair awkward English sentence structure so the caption sounds natural.
+- Keep the corrected English caption close to the current English translation.
 - Preserve technical terms from the glossary.
-- If the transcript is unclear, give the safest interpretation.
+- If the transcript is unclear, make the safest minimal correction.
 - If STT or translation uses a wrong technical term, add it to corrections.
 - If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
 - Prefer corrected technical terms in key_terms.
@@ -518,6 +524,7 @@ Return JSON in this exact format:
 {{
   "main_idea": "one short sentence explaining the current main point",
   "say_it_simply": "one natural sentence the interpreter can say",
+  "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
   "key_terms": [
     {{"term": "Japanese or English term", "meaning": "short meaning"}}
   ],
@@ -536,7 +543,7 @@ Return JSON in this exact format:
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=340,
+                max_output_tokens=420,
             ),
         )
 
@@ -546,6 +553,8 @@ Return JSON in this exact format:
             "type": "llm_hint",
             "main_idea": parsed.get("main_idea", ""),
             "say_it_simply": parsed.get("say_it_simply", ""),
+            "corrected_english_caption": parsed.get("corrected_english_caption", ""),
+            "source_text": context_text,
             "key_terms": parsed.get("key_terms", []),
             "corrections": parsed.get("corrections", []),
         })
@@ -953,7 +962,7 @@ with st.sidebar:
     )
 
     st.caption(
-        "Soniox handles live translation. The LLM is ON by default and repairs obvious technical terms in the final caption."
+        "Soniox handles live translation. The LLM is ON by default and repairs technical terms plus awkward English in the final caption."
     )
 
     st.divider()
@@ -1016,6 +1025,8 @@ defaults = {
     "llm_error": "",
     "llm_main_idea": "",
     "llm_say_it_simply": "",
+    "llm_corrected_english_caption": "",
+    "llm_corrected_source_text": "",
     "llm_key_terms": [],
     "llm_corrections": [],
     "llm_last_call_time": 0.0,
@@ -1148,6 +1159,8 @@ if clear_clicked:
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
     st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_corrected_english_caption = ""
+    st.session_state.llm_corrected_source_text = ""
     st.session_state.llm_key_terms = []
     st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
@@ -1180,6 +1193,8 @@ if (
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
     st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_corrected_english_caption = ""
+    st.session_state.llm_corrected_source_text = ""
     st.session_state.llm_key_terms = []
     st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
@@ -1296,6 +1311,8 @@ while not st.session_state.llm_result_queue.empty():
     if item_type == "llm_hint":
         st.session_state.llm_main_idea = item.get("main_idea", "")
         st.session_state.llm_say_it_simply = item.get("say_it_simply", "")
+        st.session_state.llm_corrected_english_caption = item.get("corrected_english_caption", "")
+        st.session_state.llm_corrected_source_text = item.get("source_text", "")
         st.session_state.llm_key_terms = item.get("key_terms", [])
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
@@ -1396,6 +1413,22 @@ corrected_translation = apply_llm_corrections(
     caption_text,
     st.session_state.llm_corrections,
 )
+
+current_source_for_display = build_llm_context(
+    st.session_state.llm_context_chunks,
+    st.session_state.live_original,
+    st.session_state.live_translation,
+)
+
+if (
+    use_llm_hints
+    and st.session_state.llm_corrected_english_caption
+    and current_source_for_display == st.session_state.llm_corrected_source_text
+):
+    corrected_translation = apply_llm_corrections(
+        st.session_state.llm_corrected_english_caption,
+        st.session_state.llm_corrections,
+    )
 
 corrected_original = light_original_cleanup(corrected_original)
 corrected_translation = light_caption_cleanup(corrected_translation)
@@ -1520,6 +1553,7 @@ if show_debug:
             f"running={st.session_state.llm_running}\n"
             f"main_idea={st.session_state.llm_main_idea}\n"
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
+            f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
             f"corrections={st.session_state.llm_corrections}\n"
             f"error={st.session_state.llm_error}"
         )
