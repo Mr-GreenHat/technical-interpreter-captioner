@@ -29,8 +29,8 @@ MAX_TRANSLATION_CHARS = 260
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
-LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
-LLM_MODEL_BACKUP = "gemini-2.5-flash-lite"
+LLM_MODEL_DEFAULT = "gemini-2.5-flash-lite"
+LLM_MODEL_BACKUP = "gemini-2.5-flash"
 
 DEFAULT_LLM_HINT_INTERVAL = 30.0
 MIN_LLM_CONTEXT_CHARS = 160
@@ -801,7 +801,7 @@ st.title("Technical Interpreter Captioner")
 
 st.caption(
     "Japanese → English live captions using Soniox real-time translation, "
-    "technical glossary, and optional LLM interpreter hints."
+    "technical glossary, and optional LLM interpreter support."
 )
 
 
@@ -826,9 +826,9 @@ with st.sidebar:
 
     font_size = st.slider(
         "English caption font size",
-        min_value=18,
-        max_value=44,
-        value=26,
+        min_value=16,
+        max_value=38,
+        value=22,
         step=2,
     )
 
@@ -855,10 +855,10 @@ with st.sidebar:
 
     st.divider()
 
-    st.write("LLM Interpreter Hint")
+    st.write("LLM Interpreter Support")
 
     use_llm_hints = st.checkbox(
-        "Use LLM for interpreter hints",
+        "Use LLM support",
         value=False,
     )
 
@@ -872,7 +872,7 @@ with st.sidebar:
     )
 
     llm_hint_interval = st.slider(
-        "LLM hint interval",
+        "LLM update interval",
         min_value=15.0,
         max_value=90.0,
         value=DEFAULT_LLM_HINT_INTERVAL,
@@ -880,7 +880,7 @@ with st.sidebar:
     )
 
     st.caption(
-        "Soniox handles live translation. The LLM uses recent context to make short meaning hints."
+        "Soniox handles live translation. The LLM uses recent context to make a simple sentence and key terms."
     )
 
     st.divider()
@@ -982,7 +982,7 @@ gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
 
 if use_llm_hints and not gemini_api_key:
     st.warning(
-        "GEMINI_API_KEY is not set. LLM hints are disabled until you add it."
+        "GEMINI_API_KEY is not set. LLM support is disabled until you add it."
     )
 
 
@@ -1295,7 +1295,7 @@ if st.session_state.soniox_error:
     st.error(st.session_state.soniox_error)
 
 if use_llm_hints and st.session_state.llm_error:
-    st.warning(f"LLM hint error: {st.session_state.llm_error}")
+    st.warning(f"LLM error: {st.session_state.llm_error}")
 
 
 # ============================================================
@@ -1327,13 +1327,13 @@ display_english = trim_caption_soft(
 
 if use_llm_hints:
     if st.session_state.llm_running:
-        llm_status_text = "Generating interpreter hint..."
+        simple_text = "Generating simple interpreter sentence..."
+    elif st.session_state.llm_say_it_simply:
+        simple_text = st.session_state.llm_say_it_simply
     elif st.session_state.llm_main_idea:
-        llm_status_text = st.session_state.llm_main_idea
+        simple_text = st.session_state.llm_main_idea
     else:
-        llm_status_text = "Waiting for enough lecture context..."
-
-    simple_text = st.session_state.llm_say_it_simply or ""
+        simple_text = "Waiting for enough lecture context..."
 
     if st.session_state.llm_key_terms:
         llm_terms_lines = []
@@ -1352,13 +1352,11 @@ if use_llm_hints:
         llm_terms_text = "No LLM key terms yet."
 
 else:
-    llm_status_text = ""
     simple_text = ""
     llm_terms_text = ""
 
 safe_original = html.escape(display_japanese)
 safe_caption_text = html.escape(display_english)
-safe_llm_hint = html.escape(llm_status_text)
 safe_simple_text = html.escape(simple_text)
 safe_llm_terms = html.escape(llm_terms_text)
 
@@ -1366,11 +1364,6 @@ llm_html = ""
 
 if use_llm_hints:
     llm_html = f"""
-    <div>
-        <div class="caption-label">LLM Interpreter Hint</div>
-        <div class="llm-hint-box">{safe_llm_hint}</div>
-    </div>
-
     <div>
         <div class="caption-label">Say It Simply</div>
         <div class="llm-simple-box">{safe_simple_text}</div>
@@ -1471,32 +1464,16 @@ caption_html = f"""
     box-sizing: border-box;
 }}
 
-.llm-hint-box {{
-    font-size: 20px;
-    line-height: 1.3;
-    font-weight: 700;
-    padding: 14px;
-    border-radius: 16px;
-    background-color: #FEF3C7;
-    color: #111827;
-    min-height: 65px;
-    max-height: 120px;
-    overflow: hidden;
-    white-space: pre-wrap;
-    border: 1px solid #F59E0B;
-    box-sizing: border-box;
-}}
-
 .llm-simple-box {{
-    font-size: 19px;
+    font-size: 22px;
     line-height: 1.3;
-    font-weight: 650;
-    padding: 14px;
+    font-weight: 750;
+    padding: 15px;
     border-radius: 16px;
     background-color: #DBEAFE;
     color: #1E3A8A;
-    min-height: 60px;
-    max-height: 115px;
+    min-height: 75px;
+    max-height: 140px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #3B82F6;
@@ -1527,8 +1504,8 @@ caption_html = f"""
     border-radius: 18px;
     background-color: #111827;
     color: white;
-    min-height: 125px;
-    max-height: 230px;
+    min-height: 115px;
+    max-height: 210px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #374151;
@@ -1553,20 +1530,12 @@ caption_html = f"""
         max-height: 90px;
     }}
 
-    .llm-hint-box {{
-        font-size: 18px;
-        line-height: 1.25;
-        padding: 11px;
-        min-height: 60px;
-        max-height: 110px;
-    }}
-
     .llm-simple-box {{
-        font-size: 17px;
+        font-size: 19px;
         line-height: 1.25;
-        padding: 11px;
-        min-height: 55px;
-        max-height: 100px;
+        padding: 12px;
+        min-height: 65px;
+        max-height: 125px;
     }}
 
     .llm-terms-box {{
@@ -1581,8 +1550,8 @@ caption_html = f"""
         font-size: {font_size}px;
         line-height: 1.25;
         padding: 12px;
-        min-height: 115px;
-        max-height: 210px;
+        min-height: 105px;
+        max-height: 185px;
     }}
 }}
 </style>
