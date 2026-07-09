@@ -4,3 +4,4 @@ streamlit-autorefresh
 websocket-client
 av
 numpy
+google-genai
