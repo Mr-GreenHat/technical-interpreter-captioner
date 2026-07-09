@@ -30,7 +30,7 @@ MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
 LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
-LLM_MODEL_BACKUP = "gemini-3.1-flash-lite"
+LLM_MODEL_BACKUP = "gemini-2.5-flash-lite"
 
 DEFAULT_LLM_HINT_INTERVAL = 30.0
 MIN_LLM_CONTEXT_CHARS = 160
@@ -199,8 +199,30 @@ def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_t
 
 
 # ============================================================
-# Cleanup
+# Cleanup and correction
 # ============================================================
+
+def apply_llm_corrections(text, corrections):
+    if not text:
+        return ""
+
+    cleaned = text
+
+    for item in corrections or []:
+        wrong = str(item.get("wrong", "")).strip()
+        correct = str(item.get("correct", "")).strip()
+
+        if not wrong or not correct:
+            continue
+
+        # Avoid dangerous one-character replacements.
+        if len(wrong) < 2:
+            continue
+
+        cleaned = cleaned.replace(wrong, correct)
+
+    return cleaned.strip()
+
 
 def light_caption_cleanup(text):
     if not text:
@@ -209,6 +231,22 @@ def light_caption_cleanup(text):
     cleaned = text.strip()
 
     replacements = {
+        # ====================================================
+        # TTC correction
+        # ====================================================
+        "ABC is large enough": "TTC is large enough",
+        "the ABC is large enough": "the TTC is large enough",
+        "If the ABC is large enough": "If the TTC is large enough",
+        "If ABC is large enough": "If TTC is large enough",
+        "ABC value": "TTC value",
+        "the ABC": "the TTC",
+        "ABC": "TTC",
+        "Time to Collision": "TTC",
+        "time to collision": "TTC",
+
+        # ====================================================
+        # Strong correction for 慣性補償
+        # ====================================================
         "sensory compensation control": "inertia compensation control",
         "sensitivity compensation control": "inertia compensation control",
         "sensibility compensation control": "inertia compensation control",
@@ -231,6 +269,9 @@ def light_caption_cleanup(text):
         "Today is inertia compensation": "Today, I will explain inertia compensation",
         "About control": "control",
 
+        # ====================================================
+        # General technical cleanup
+        # ====================================================
         "servo-motor": "servo motor",
         "servomotor": "servo motor",
         "brake force": "braking force",
@@ -249,6 +290,11 @@ def light_caption_cleanup(text):
         cleaned = cleaned.replace(wrong, correct)
 
     lower_replacements = {
+        "abc is large enough": "TTC is large enough",
+        "the abc is large enough": "the TTC is large enough",
+        "if the abc is large enough": "If the TTC is large enough",
+        "time to collision": "TTC",
+
         "sensory compensation control": "inertia compensation control",
         "sensitivity compensation control": "inertia compensation control",
         "sensibility compensation control": "inertia compensation control",
@@ -278,6 +324,13 @@ def light_original_cleanup(text):
     cleaned = text.strip()
 
     replacements = {
+        # TTC correction
+        "ABC": "TTC",
+        "エービーシー": "TTC",
+        "エービーシーが": "TTCが",
+        "ABCが": "TTCが",
+
+        # 慣性補償 correction
         "感性補償": "慣性補償",
         "感性保証": "慣性補償",
         "感性保障": "慣性補償",
@@ -358,7 +411,7 @@ def build_llm_context(context_chunks, current_original, current_translation):
 
 
 # ============================================================
-# LLM Interpreter Hint
+# LLM Interpreter Support
 # ============================================================
 
 def parse_llm_json(text):
@@ -367,6 +420,7 @@ def parse_llm_json(text):
             "main_idea": "",
             "say_it_simply": "",
             "key_terms": [],
+            "corrections": [],
         }
 
     cleaned = text.strip()
@@ -387,6 +441,7 @@ def parse_llm_json(text):
             "main_idea": str(data.get("main_idea", "")).strip(),
             "say_it_simply": str(data.get("say_it_simply", "")).strip(),
             "key_terms": data.get("key_terms", []),
+            "corrections": data.get("corrections", []),
         }
 
     except Exception:
@@ -394,6 +449,7 @@ def parse_llm_json(text):
             "main_idea": cleaned[:220],
             "say_it_simply": "",
             "key_terms": [],
+            "corrections": [],
         }
 
 
@@ -429,7 +485,8 @@ def llm_hint_worker(
 You are an interpreter assistant.
 
 Your job is NOT to translate everything again.
-Your job is to help the interpreter understand the lecture flow quickly.
+Your job is to help the interpreter understand the lecture flow quickly
+AND repair obvious STT/translation mistakes in technical terms.
 
 Use the recent context below. The latest part is at the bottom.
 
@@ -438,10 +495,15 @@ Rules:
 - Do not add new facts.
 - Keep it short.
 - Focus on the speaker's current main point, not every detail.
-- Use the previous context to understand what the speaker is talking about.
-- Make the hint useful for a human interpreter who needs to explain it naturally.
+- Use previous context to understand what the speaker is talking about.
+- Make the simple sentence useful for a human interpreter.
 - Preserve technical terms from the glossary.
-- If the transcript is unclear, say the safest interpretation.
+- If the transcript is unclear, give the safest interpretation.
+- If STT or translation uses a wrong technical term, add it to corrections.
+- If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
+- Prefer corrected technical terms in key_terms.
+- Example correction:
+  {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
 
 Recent lecture context:
 {context_text}
@@ -458,6 +520,13 @@ Return JSON in this exact format:
   "say_it_simply": "one natural sentence the interpreter can say",
   "key_terms": [
     {{"term": "Japanese or English term", "meaning": "short meaning"}}
+  ],
+  "corrections": [
+    {{
+      "wrong": "wrong recognized word or phrase",
+      "correct": "correct word or phrase",
+      "reason": "short reason"
+    }}
   ]
 }}
 """.strip()
@@ -467,7 +536,7 @@ Return JSON in this exact format:
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=280,
+                max_output_tokens=340,
             ),
         )
 
@@ -478,6 +547,7 @@ Return JSON in this exact format:
             "main_idea": parsed.get("main_idea", ""),
             "say_it_simply": parsed.get("say_it_simply", ""),
             "key_terms": parsed.get("key_terms", []),
+            "corrections": parsed.get("corrections", []),
         })
 
     except Exception as e:
@@ -541,14 +611,15 @@ def soniox_live_worker(
         if domain_mode == "auto":
             domain_text = (
                 "Japanese automotive engineering, CAD, product design, vehicle systems, "
-                "braking systems, vehicle control, inertia compensation, classroom interpretation, "
-                "technical terms"
+                "braking systems, vehicle control, TTC, Time To Collision, AEB, "
+                "inertia compensation, classroom interpretation, technical terms"
             )
 
         elif domain_mode == "automotive":
             domain_text = (
                 "Japanese automotive engineering class, vehicle systems, braking systems, "
-                "drivetrain, suspension, steering, ADAS, vehicle control, inertia compensation"
+                "drivetrain, suspension, steering, ADAS, AEB, TTC, Time To Collision, "
+                "vehicle control, inertia compensation"
             )
 
         elif domain_mode == "cad":
@@ -585,6 +656,8 @@ def soniox_live_worker(
                     {
                         "key": "important_term",
                         "value": (
+                            "TTC means Time To Collision. "
+                            "If speech sounds like ABC in AEB context, it is probably TTC. "
                             "慣性補償 means inertia compensation. "
                             "Do not translate 慣性補償 as sensory compensation, completion assurance, "
                             "or completion compensation."
@@ -880,7 +953,7 @@ with st.sidebar:
     )
 
     st.caption(
-        "Soniox handles live translation. The LLM uses recent context to make a simple sentence and key terms."
+        "Soniox handles live translation. The LLM repairs obvious technical terms and creates a simple interpreter sentence."
     )
 
     st.divider()
@@ -944,6 +1017,7 @@ defaults = {
     "llm_main_idea": "",
     "llm_say_it_simply": "",
     "llm_key_terms": [],
+    "llm_corrections": [],
     "llm_last_call_time": 0.0,
     "llm_last_source_text": "",
     "llm_context_chunks": [],
@@ -1075,6 +1149,7 @@ if clear_clicked:
     st.session_state.llm_main_idea = ""
     st.session_state.llm_say_it_simply = ""
     st.session_state.llm_key_terms = []
+    st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
     st.session_state.llm_last_source_text = ""
 
@@ -1106,6 +1181,7 @@ if (
     st.session_state.llm_main_idea = ""
     st.session_state.llm_say_it_simply = ""
     st.session_state.llm_key_terms = []
+    st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
     st.session_state.llm_last_source_text = ""
     st.session_state.llm_last_call_time = 0.0
@@ -1188,6 +1264,7 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
         st.session_state.llm_context_chunks = []
+        st.session_state.llm_corrections = []
 
     elif item_type == "debug":
         message = item.get("message", "")
@@ -1220,6 +1297,7 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_main_idea = item.get("main_idea", "")
         st.session_state.llm_say_it_simply = item.get("say_it_simply", "")
         st.session_state.llm_key_terms = item.get("key_terms", [])
+        st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
 
@@ -1309,8 +1387,21 @@ if subtitle_display == "History":
 else:
     caption_text = st.session_state.live_translation
 
-display_japanese = trim_caption_soft(
+corrected_original = apply_llm_corrections(
     st.session_state.live_original,
+    st.session_state.llm_corrections,
+)
+
+corrected_translation = apply_llm_corrections(
+    caption_text,
+    st.session_state.llm_corrections,
+)
+
+corrected_original = light_original_cleanup(corrected_original)
+corrected_translation = light_caption_cleanup(corrected_translation)
+
+display_japanese = trim_caption_soft(
+    corrected_original,
     max_chars=MAX_ORIGINAL_CHARS,
 )
 
@@ -1321,7 +1412,7 @@ english_max_chars = (
 )
 
 display_english = trim_caption_soft(
-    caption_text,
+    corrected_translation,
     max_chars=english_max_chars,
 )
 
@@ -1329,9 +1420,15 @@ if use_llm_hints:
     if st.session_state.llm_running:
         simple_text = "Generating simple interpreter sentence..."
     elif st.session_state.llm_say_it_simply:
-        simple_text = st.session_state.llm_say_it_simply
+        simple_text = apply_llm_corrections(
+            st.session_state.llm_say_it_simply,
+            st.session_state.llm_corrections,
+        )
     elif st.session_state.llm_main_idea:
-        simple_text = st.session_state.llm_main_idea
+        simple_text = apply_llm_corrections(
+            st.session_state.llm_main_idea,
+            st.session_state.llm_corrections,
+        )
     else:
         simple_text = "Waiting for enough lecture context..."
 
@@ -1341,6 +1438,14 @@ if use_llm_hints:
         for item in st.session_state.llm_key_terms[:5]:
             term = str(item.get("term", "")).strip()
             meaning = str(item.get("meaning", "")).strip()
+
+            term = apply_llm_corrections(term, st.session_state.llm_corrections)
+            meaning = apply_llm_corrections(meaning, st.session_state.llm_corrections)
+
+            if term == "ABC":
+                term = "TTC"
+                if not meaning:
+                    meaning = "Time To Collision"
 
             if term and meaning:
                 llm_terms_lines.append(f"{term} = {meaning}")
@@ -1389,19 +1494,25 @@ if show_debug:
             else "No token update yet"
         )
 
-        st.write("Japanese:")
+        st.write("Japanese raw:")
         st.code(
             st.session_state.live_original
             if st.session_state.live_original
             else "Empty"
         )
 
-        st.write("English:")
+        st.write("Japanese corrected:")
+        st.code(corrected_original if corrected_original else "Empty")
+
+        st.write("English raw:")
         st.code(
             st.session_state.live_translation
             if st.session_state.live_translation
             else "Empty"
         )
+
+        st.write("English corrected:")
+        st.code(corrected_translation if corrected_translation else "Empty")
 
         st.write("History:")
         st.write(st.session_state.caption_history)
@@ -1415,6 +1526,7 @@ if show_debug:
             f"running={st.session_state.llm_running}\n"
             f"main_idea={st.session_state.llm_main_idea}\n"
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
+            f"corrections={st.session_state.llm_corrections}\n"
             f"error={st.session_state.llm_error}"
         )
 
