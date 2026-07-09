@@ -29,7 +29,7 @@ MAX_TRANSLATION_CHARS = 260
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
-LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
+LLM_MODEL_DEFAULT = "gemini-2.5-flash-lite"
 LLM_MODEL_BACKUP = "gemini-2.5-flash-lite"
 
 DEFAULT_LLM_HINT_INTERVAL = 30.0
@@ -932,7 +932,7 @@ with st.sidebar:
 
     use_llm_hints = st.checkbox(
         "Use LLM support",
-        value=False,
+        value=True,
     )
 
     llm_model_name = st.selectbox(
@@ -953,7 +953,7 @@ with st.sidebar:
     )
 
     st.caption(
-        "Soniox handles live translation. The LLM repairs obvious technical terms and creates a simple interpreter sentence."
+        "Soniox handles live translation. The LLM is ON by default and repairs obvious technical terms in the final caption."
     )
 
     st.divider()
@@ -1462,18 +1462,12 @@ else:
 
 safe_original = html.escape(display_japanese)
 safe_caption_text = html.escape(display_english)
-safe_simple_text = html.escape(simple_text)
 safe_llm_terms = html.escape(llm_terms_text)
 
 llm_html = ""
 
 if use_llm_hints:
     llm_html = f"""
-    <div>
-        <div class="caption-label">Say It Simply</div>
-        <div class="llm-simple-box">{safe_simple_text}</div>
-    </div>
-
     <div>
         <div class="caption-label">LLM Key Terms</div>
         <div class="llm-terms-box">{safe_llm_terms}</div>
@@ -1576,21 +1570,6 @@ caption_html = f"""
     box-sizing: border-box;
 }}
 
-.llm-simple-box {{
-    font-size: 22px;
-    line-height: 1.3;
-    font-weight: 750;
-    padding: 15px;
-    border-radius: 16px;
-    background-color: #DBEAFE;
-    color: #1E3A8A;
-    min-height: 75px;
-    max-height: 140px;
-    overflow: hidden;
-    white-space: pre-wrap;
-    border: 1px solid #3B82F6;
-    box-sizing: border-box;
-}}
 
 .llm-terms-box {{
     font-size: 16px;
@@ -1642,13 +1621,6 @@ caption_html = f"""
         max-height: 90px;
     }}
 
-    .llm-simple-box {{
-        font-size: 19px;
-        line-height: 1.25;
-        padding: 12px;
-        min-height: 65px;
-        max-height: 125px;
-    }}
 
     .llm-terms-box {{
         font-size: 15px;
