@@ -12,6 +12,9 @@ import streamlit as st
 import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
+from google import genai
+from google.genai import types
+
 
 # ============================================================
 # Settings
@@ -25,6 +28,29 @@ MAX_ORIGINAL_CHARS = 160
 MAX_TRANSLATION_CHARS = 260
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
+
+LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
+LLM_MODEL_BACKUP = "gemini-2.5-flash-lite"
+
+DEFAULT_LLM_HINT_INTERVAL = 30.0
+MIN_LLM_CONTEXT_CHARS = 160
+MAX_LLM_CONTEXT_CHUNKS = 6
+
+
+# ============================================================
+# Secrets
+# ============================================================
+
+def safe_get_secret_or_env(key):
+    try:
+        value = st.secrets.get(key)
+    except Exception:
+        value = None
+
+    if not value:
+        value = os.getenv(key)
+
+    return value
 
 
 # ============================================================
@@ -81,6 +107,101 @@ def load_soniox_context_terms(terms_file):
         return [], []
 
 
+def load_glossary_entries(terms_file):
+    entries = []
+
+    try:
+        with open(terms_file, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                jp = row.get("jp", "").strip()
+                en = row.get("en", "").strip()
+                reading = row.get("reading", "").strip()
+                common_wrong = row.get("common_wrong", "").strip()
+                notes = row.get("notes", "").strip()
+                domain = row.get("domain", "").strip()
+
+                if not jp or not en:
+                    continue
+
+                entries.append({
+                    "domain": domain,
+                    "jp": jp,
+                    "en": en,
+                    "reading": reading,
+                    "common_wrong": common_wrong,
+                    "notes": notes,
+                })
+
+    except Exception:
+        pass
+
+    return entries
+
+
+def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_terms=8):
+    original_text = original_text or ""
+    translation_text = translation_text or ""
+    translation_lower = translation_text.lower()
+
+    entries = load_glossary_entries(terms_file)
+    matched_terms = []
+
+    for row in entries:
+        jp = row["jp"]
+        en = row["en"]
+        reading = row.get("reading", "")
+        common_wrong = row.get("common_wrong", "")
+        notes = row.get("notes", "")
+
+        candidates = [jp, en, reading]
+
+        if common_wrong:
+            candidates.extend([
+                item.strip()
+                for item in common_wrong.split(";")
+                if item.strip()
+            ])
+
+        found = False
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+
+            if candidate in original_text:
+                found = True
+                break
+
+            if candidate.lower() in translation_lower:
+                found = True
+                break
+
+        if found:
+            matched_terms.append({
+                "jp": jp,
+                "en": en,
+                "notes": notes,
+            })
+
+    unique_terms = []
+    seen = set()
+
+    for item in matched_terms:
+        key = (item["jp"], item["en"])
+
+        if key not in seen:
+            unique_terms.append(item)
+            seen.add(key)
+
+    return unique_terms[:max_terms]
+
+
+# ============================================================
+# Cleanup
+# ============================================================
+
 def light_caption_cleanup(text):
     if not text:
         return ""
@@ -88,9 +209,6 @@ def light_caption_cleanup(text):
     cleaned = text.strip()
 
     replacements = {
-        # ====================================================
-        # Strong correction for 慣性補償
-        # ====================================================
         "sensory compensation control": "inertia compensation control",
         "sensitivity compensation control": "inertia compensation control",
         "sensibility compensation control": "inertia compensation control",
@@ -113,9 +231,6 @@ def light_caption_cleanup(text):
         "Today is inertia compensation": "Today, I will explain inertia compensation",
         "About control": "control",
 
-        # ====================================================
-        # General technical cleanup
-        # ====================================================
         "servo-motor": "servo motor",
         "servomotor": "servo motor",
         "brake force": "braking force",
@@ -130,11 +245,9 @@ def light_caption_cleanup(text):
         "bad product": "defective product",
     }
 
-    # Case-sensitive first
     for wrong, correct in replacements.items():
         cleaned = cleaned.replace(wrong, correct)
 
-    # Lowercase-safe correction
     lower_replacements = {
         "sensory compensation control": "inertia compensation control",
         "sensitivity compensation control": "inertia compensation control",
@@ -156,6 +269,7 @@ def light_caption_cleanup(text):
     cleaned = cleaned.replace("a inertia compensation", "inertia compensation")
 
     return cleaned.strip()
+
 
 def light_original_cleanup(text):
     if not text:
@@ -211,6 +325,169 @@ def trim_caption_soft(text, max_chars):
 
 
 # ============================================================
+# LLM context helpers
+# ============================================================
+
+def make_context_chunk(original_text, translation_text):
+    original_text = (original_text or "").strip()
+    translation_text = (translation_text or "").strip()
+
+    if not original_text and not translation_text:
+        return ""
+
+    return (
+        f"Japanese: {original_text}\n"
+        f"English: {translation_text}"
+    ).strip()
+
+
+def build_llm_context(context_chunks, current_original, current_translation):
+    chunks = list(context_chunks or [])
+
+    current_chunk = make_context_chunk(
+        current_original,
+        current_translation,
+    )
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    chunks = chunks[-MAX_LLM_CONTEXT_CHUNKS:]
+
+    return "\n\n---\n\n".join(chunks).strip()
+
+
+# ============================================================
+# LLM Interpreter Hint
+# ============================================================
+
+def parse_llm_json(text):
+    if not text:
+        return {
+            "main_idea": "",
+            "say_it_simply": "",
+            "key_terms": [],
+        }
+
+    cleaned = text.strip()
+
+    if cleaned.startswith("```json"):
+        cleaned = cleaned.replace("```json", "", 1).strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```", "", 1).strip()
+
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+
+    try:
+        data = json.loads(cleaned)
+
+        return {
+            "main_idea": str(data.get("main_idea", "")).strip(),
+            "say_it_simply": str(data.get("say_it_simply", "")).strip(),
+            "key_terms": data.get("key_terms", []),
+        }
+
+    except Exception:
+        return {
+            "main_idea": cleaned[:220],
+            "say_it_simply": "",
+            "key_terms": [],
+        }
+
+
+def llm_hint_worker(
+    result_queue,
+    api_key,
+    model_name,
+    context_text,
+    current_translation,
+    key_terms,
+):
+    try:
+        client = genai.Client(api_key=api_key)
+
+        glossary_text = ""
+
+        if key_terms:
+            glossary_lines = []
+
+            for item in key_terms:
+                jp = item.get("jp", "")
+                en = item.get("en", "")
+                notes = item.get("notes", "")
+
+                if notes:
+                    glossary_lines.append(f"- {jp} = {en} ({notes})")
+                else:
+                    glossary_lines.append(f"- {jp} = {en}")
+
+            glossary_text = "\n".join(glossary_lines)
+
+        prompt = f"""
+You are an interpreter assistant.
+
+Your job is NOT to translate everything again.
+Your job is to help the interpreter understand the lecture flow quickly.
+
+Use the recent context below. The latest part is at the bottom.
+
+Rules:
+- Output JSON only.
+- Do not add new facts.
+- Keep it short.
+- Focus on the speaker's current main point, not every detail.
+- Use the previous context to understand what the speaker is talking about.
+- Make the hint useful for a human interpreter who needs to explain it naturally.
+- Preserve technical terms from the glossary.
+- If the transcript is unclear, say the safest interpretation.
+
+Recent lecture context:
+{context_text}
+
+Current English translation:
+{current_translation}
+
+Technical glossary terms detected:
+{glossary_text}
+
+Return JSON in this exact format:
+{{
+  "main_idea": "one short sentence explaining the current main point",
+  "say_it_simply": "one natural sentence the interpreter can say",
+  "key_terms": [
+    {{"term": "Japanese or English term", "meaning": "short meaning"}}
+  ]
+}}
+""".strip()
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=280,
+            ),
+        )
+
+        parsed = parse_llm_json(response.text)
+
+        result_queue.put({
+            "type": "llm_hint",
+            "main_idea": parsed.get("main_idea", ""),
+            "say_it_simply": parsed.get("say_it_simply", ""),
+            "key_terms": parsed.get("key_terms", []),
+        })
+
+    except Exception as e:
+        result_queue.put({
+            "type": "llm_error",
+            "message": str(e),
+        })
+
+
+# ============================================================
 # Audio processor
 # ============================================================
 
@@ -263,12 +540,31 @@ def soniox_live_worker(
 
         if domain_mode == "auto":
             domain_text = (
-                "Japanese automotive engineering, vehicle control, control engineering, "
-                "inertia compensation, braking control, CAD, manufacturing, "
-                "classroom interpretation, technical terms"
+                "Japanese automotive engineering, CAD, product design, vehicle systems, "
+                "braking systems, vehicle control, inertia compensation, classroom interpretation, "
+                "technical terms"
             )
+
+        elif domain_mode == "automotive":
+            domain_text = (
+                "Japanese automotive engineering class, vehicle systems, braking systems, "
+                "drivetrain, suspension, steering, ADAS, vehicle control, inertia compensation"
+            )
+
+        elif domain_mode == "cad":
+            domain_text = (
+                "Japanese CAD class, sketch constraints, dimensions, extrusion, chamfering, "
+                "fillet, technical drawing, projection drawing, product modeling"
+            )
+
+        elif domain_mode == "product design":
+            domain_text = (
+                "Japanese product design class, design process, CAD modeling, dimensions, "
+                "materials, usability, product development, prototyping"
+            )
+
         else:
-            domain_text = f"Japanese {domain_mode} technical class interpretation"
+            domain_text = "Japanese technical classroom interpretation"
 
         config = {
             "api_key": api_key,
@@ -426,9 +722,6 @@ def soniox_live_worker(
                 if now - last_token_time > current_reset_seconds:
                     final_original = ""
                     final_translation = ""
-
-                    # Timer reset: clear current subtitle page only.
-                    # History should stay.
                     result_queue.put({"type": "page_reset"})
 
                 last_token_time = now
@@ -504,65 +797,11 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown(
-    """
-    <style>
-        .block-container {
-            padding-top: 2rem;
-            padding-bottom: 1rem;
-        }
-
-        h1 {
-            font-size: 42px !important;
-            line-height: 1.1 !important;
-        }
-
-        h2, h3 {
-            margin-top: 0.8rem !important;
-        }
-
-        div[data-testid="stAlert"] {
-            padding: 0.75rem 1rem;
-        }
-
-        @media screen and (max-width: 768px) {
-            .block-container {
-                padding-top: 1rem;
-                padding-left: 1rem;
-                padding-right: 1rem;
-            }
-
-            h1 {
-                font-size: 30px !important;
-                line-height: 1.05 !important;
-            }
-
-            h2 {
-                font-size: 25px !important;
-            }
-
-            h3 {
-                font-size: 22px !important;
-            }
-
-            p {
-                font-size: 14px !important;
-            }
-
-            div[data-testid="stVerticalBlock"] {
-                gap: 0.55rem;
-            }
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English live captions using Soniox real-time translation "
-    "and a technical glossary."
+    "Japanese → English live captions using Soniox real-time translation, "
+    "technical glossary, and optional LLM interpreter hints."
 )
 
 
@@ -575,7 +814,7 @@ with st.sidebar:
 
     domain_mode = st.selectbox(
         "Technical domain",
-        ["auto", "automotive", "control", "cad", "manufacturing"],
+        ["auto", "automotive", "cad", "product design"],
         index=0,
     )
 
@@ -614,8 +853,34 @@ with st.sidebar:
         value=False,
     )
 
+    st.divider()
+
+    st.write("LLM Interpreter Hint")
+
+    use_llm_hints = st.checkbox(
+        "Use LLM for interpreter hints",
+        value=False,
+    )
+
+    llm_model_name = st.selectbox(
+        "LLM model",
+        [
+            LLM_MODEL_DEFAULT,
+            LLM_MODEL_BACKUP,
+        ],
+        index=0,
+    )
+
+    llm_hint_interval = st.slider(
+        "LLM hint interval",
+        min_value=15.0,
+        max_value=90.0,
+        value=DEFAULT_LLM_HINT_INTERVAL,
+        step=5.0,
+    )
+
     st.caption(
-        "Font size changes immediately. Reset seconds also updates while running."
+        "Soniox handles live translation. The LLM uses recent context to make short meaning hints."
     )
 
     st.divider()
@@ -657,9 +922,6 @@ with st.sidebar:
 defaults = {
     "app_active": False,
     "pending_start_translation": False,
-
-    # Important for phone mic release:
-    # Changing this destroys and recreates the WebRTC component.
     "mic_instance_id": 0,
 
     "live_original": "",
@@ -674,6 +936,17 @@ defaults = {
     "debug_messages": [],
     "last_update_time": "",
     "last_reset_seconds": DEFAULT_RESET_SECONDS,
+
+    "llm_result_queue": queue.Queue(),
+    "llm_thread": None,
+    "llm_running": False,
+    "llm_error": "",
+    "llm_main_idea": "",
+    "llm_say_it_simply": "",
+    "llm_key_terms": [],
+    "llm_last_call_time": 0.0,
+    "llm_last_source_text": "",
+    "llm_context_chunks": [],
 }
 
 for key, value in defaults.items():
@@ -681,7 +954,6 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
-# Update reset seconds while running.
 if float(reset_seconds) != float(st.session_state.last_reset_seconds):
     st.session_state.last_reset_seconds = float(reset_seconds)
 
@@ -693,18 +965,25 @@ if float(reset_seconds) != float(st.session_state.last_reset_seconds):
 
 
 # ============================================================
-# API key
+# API keys
 # ============================================================
 
-api_key = st.secrets.get("SONIOX_API_KEY", os.getenv("SONIOX_API_KEY"))
+api_key = safe_get_secret_or_env("SONIOX_API_KEY")
 
 if not api_key:
     st.error(
         "SONIOX_API_KEY is not set.\n\n"
         "For Streamlit Cloud, add this in Secrets:\n\n"
-        'SONIOX_API_KEY = "your_api_key_here"'
+        'SONIOX_API_KEY = "your_soniox_api_key_here"'
     )
     st.stop()
+
+gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
+
+if use_llm_hints and not gemini_api_key:
+    st.warning(
+        "GEMINI_API_KEY is not set. LLM hints are disabled until you add it."
+    )
 
 
 # ============================================================
@@ -728,11 +1007,6 @@ rtc_configuration = RTCConfiguration(
 )
 
 st.subheader("Microphone")
-
-st.info(
-    "Press Start Translation to start the microphone and translation. "
-    "If microphone access is denied, allow microphone permission in browser site settings."
-)
 
 webrtc_ctx = webrtc_streamer(
     key=f"soniox-live-caption-mic-{st.session_state.mic_instance_id}",
@@ -779,9 +1053,6 @@ if toggle_clicked:
         st.session_state.pending_start_translation = False
         st.session_state.soniox_running = False
         st.session_state.soniox_stop_event.set()
-
-        # Force WebRTC component to be destroyed and recreated.
-        # This helps phone browsers release the microphone.
         st.session_state.mic_instance_id += 1
 
         st.rerun()
@@ -799,6 +1070,13 @@ if clear_clicked:
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
     st.session_state.soniox_error = ""
+
+    st.session_state.llm_context_chunks = []
+    st.session_state.llm_main_idea = ""
+    st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_key_terms = []
+    st.session_state.llm_error = ""
+    st.session_state.llm_last_source_text = ""
 
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
@@ -823,6 +1101,14 @@ if (
     st.session_state.live_translation = ""
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
+
+    st.session_state.llm_context_chunks = []
+    st.session_state.llm_main_idea = ""
+    st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_key_terms = []
+    st.session_state.llm_error = ""
+    st.session_state.llm_last_source_text = ""
+    st.session_state.llm_last_call_time = 0.0
 
     processor = webrtc_ctx.audio_processor
 
@@ -877,18 +1163,31 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
 
     elif item_type == "page_reset":
-        # Timer reset: clear current page only.
-        # Do NOT clear caption_history.
+        completed_chunk = make_context_chunk(
+            st.session_state.live_original,
+            st.session_state.live_translation,
+        )
+
+        if completed_chunk:
+            if (
+                not st.session_state.llm_context_chunks
+                or st.session_state.llm_context_chunks[-1] != completed_chunk
+            ):
+                st.session_state.llm_context_chunks.append(completed_chunk)
+                st.session_state.llm_context_chunks = (
+                    st.session_state.llm_context_chunks[-MAX_LLM_CONTEXT_CHUNKS:]
+                )
+
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
         st.session_state.last_update_time = ""
 
     elif item_type == "cleared":
-        # Manual clear: clear everything.
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
+        st.session_state.llm_context_chunks = []
 
     elif item_type == "debug":
         message = item.get("message", "")
@@ -910,6 +1209,78 @@ while not st.session_state.soniox_result_queue.empty():
 
 
 # ============================================================
+# Pull LLM results
+# ============================================================
+
+while not st.session_state.llm_result_queue.empty():
+    item = st.session_state.llm_result_queue.get()
+    item_type = item.get("type")
+
+    if item_type == "llm_hint":
+        st.session_state.llm_main_idea = item.get("main_idea", "")
+        st.session_state.llm_say_it_simply = item.get("say_it_simply", "")
+        st.session_state.llm_key_terms = item.get("key_terms", [])
+        st.session_state.llm_error = ""
+        st.session_state.llm_running = False
+
+    elif item_type == "llm_error":
+        st.session_state.llm_error = item.get("message", "")
+        st.session_state.llm_running = False
+
+
+# ============================================================
+# Start LLM hint worker
+# ============================================================
+
+if use_llm_hints and gemini_api_key:
+    source_text = build_llm_context(
+        st.session_state.llm_context_chunks,
+        st.session_state.live_original,
+        st.session_state.live_translation,
+    )
+
+    enough_text = len(source_text) >= MIN_LLM_CONTEXT_CHARS
+    changed_text = source_text != st.session_state.llm_last_source_text
+    interval_ready = (
+        time.time() - float(st.session_state.llm_last_call_time)
+        >= float(llm_hint_interval)
+    )
+
+    if (
+        st.session_state.soniox_running
+        and enough_text
+        and changed_text
+        and interval_ready
+        and not st.session_state.llm_running
+    ):
+        detected_terms = extract_key_terms_for_llm(
+            st.session_state.live_original,
+            st.session_state.live_translation,
+            terms_file,
+        )
+
+        st.session_state.llm_running = True
+        st.session_state.llm_error = ""
+        st.session_state.llm_last_call_time = time.time()
+        st.session_state.llm_last_source_text = source_text
+
+        st.session_state.llm_thread = threading.Thread(
+            target=llm_hint_worker,
+            args=(
+                st.session_state.llm_result_queue,
+                gemini_api_key,
+                llm_model_name,
+                source_text,
+                st.session_state.live_translation,
+                detected_terms,
+            ),
+            daemon=True,
+        )
+
+        st.session_state.llm_thread.start()
+
+
+# ============================================================
 # Status
 # ============================================================
 
@@ -922,6 +1293,94 @@ else:
 
 if st.session_state.soniox_error:
     st.error(st.session_state.soniox_error)
+
+if use_llm_hints and st.session_state.llm_error:
+    st.warning(f"LLM hint error: {st.session_state.llm_error}")
+
+
+# ============================================================
+# Caption display data
+# ============================================================
+
+st.subheader("Live Captions")
+
+if subtitle_display == "History":
+    caption_text = "\n\n".join(st.session_state.caption_history[-MAX_HISTORY_ITEMS:])
+else:
+    caption_text = st.session_state.live_translation
+
+display_japanese = trim_caption_soft(
+    st.session_state.live_original,
+    max_chars=MAX_ORIGINAL_CHARS,
+)
+
+english_max_chars = (
+    MAX_TRANSLATION_CHARS * 2
+    if subtitle_display == "History"
+    else MAX_TRANSLATION_CHARS
+)
+
+display_english = trim_caption_soft(
+    caption_text,
+    max_chars=english_max_chars,
+)
+
+if use_llm_hints:
+    if st.session_state.llm_running:
+        llm_status_text = "Generating interpreter hint..."
+    elif st.session_state.llm_main_idea:
+        llm_status_text = st.session_state.llm_main_idea
+    else:
+        llm_status_text = "Waiting for enough lecture context..."
+
+    simple_text = st.session_state.llm_say_it_simply or ""
+
+    if st.session_state.llm_key_terms:
+        llm_terms_lines = []
+
+        for item in st.session_state.llm_key_terms[:5]:
+            term = str(item.get("term", "")).strip()
+            meaning = str(item.get("meaning", "")).strip()
+
+            if term and meaning:
+                llm_terms_lines.append(f"{term} = {meaning}")
+            elif term:
+                llm_terms_lines.append(term)
+
+        llm_terms_text = "\n".join(llm_terms_lines)
+    else:
+        llm_terms_text = "No LLM key terms yet."
+
+else:
+    llm_status_text = ""
+    simple_text = ""
+    llm_terms_text = ""
+
+safe_original = html.escape(display_japanese)
+safe_caption_text = html.escape(display_english)
+safe_llm_hint = html.escape(llm_status_text)
+safe_simple_text = html.escape(simple_text)
+safe_llm_terms = html.escape(llm_terms_text)
+
+llm_html = ""
+
+if use_llm_hints:
+    llm_html = f"""
+    <div>
+        <div class="caption-label">LLM Interpreter Hint</div>
+        <div class="llm-hint-box">{safe_llm_hint}</div>
+    </div>
+
+    <div>
+        <div class="caption-label">Say It Simply</div>
+        <div class="llm-simple-box">{safe_simple_text}</div>
+    </div>
+
+    <div>
+        <div class="caption-label">LLM Key Terms</div>
+        <div class="llm-terms-box">{safe_llm_terms}</div>
+    </div>
+    """
 
 
 # ============================================================
@@ -954,51 +1413,32 @@ if show_debug:
         st.write("History:")
         st.write(st.session_state.caption_history)
 
+        st.write("LLM context chunks:")
+        st.write(st.session_state.llm_context_chunks)
+
+        st.write("LLM:")
+        st.code(
+            f"enabled={use_llm_hints}\n"
+            f"running={st.session_state.llm_running}\n"
+            f"main_idea={st.session_state.llm_main_idea}\n"
+            f"say_it_simply={st.session_state.llm_say_it_simply}\n"
+            f"error={st.session_state.llm_error}"
+        )
+
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
 
-        st.write("Error:")
+        st.write("Soniox error:")
         st.code(
             st.session_state.soniox_error
             if st.session_state.soniox_error
             else "No error"
         )
 
-        if st.session_state.debug_messages:
-            st.write("Messages:")
-            for message in st.session_state.debug_messages:
-                st.write("- " + str(message))
-
 
 # ============================================================
 # Caption display
 # ============================================================
-
-st.subheader("Live Captions")
-
-if subtitle_display == "History":
-    caption_text = "\n\n".join(st.session_state.caption_history[-MAX_HISTORY_ITEMS:])
-else:
-    caption_text = st.session_state.live_translation
-
-display_japanese = trim_caption_soft(
-    st.session_state.live_original,
-    max_chars=MAX_ORIGINAL_CHARS,
-)
-
-english_max_chars = (
-    MAX_TRANSLATION_CHARS * 2
-    if subtitle_display == "History"
-    else MAX_TRANSLATION_CHARS
-)
-
-display_english = trim_caption_soft(
-    caption_text,
-    max_chars=english_max_chars,
-)
-
-safe_original = html.escape(display_japanese)
-safe_caption_text = html.escape(display_english)
 
 caption_html = f"""
 <style>
@@ -1028,6 +1468,54 @@ caption_html = f"""
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
+    box-sizing: border-box;
+}}
+
+.llm-hint-box {{
+    font-size: 20px;
+    line-height: 1.3;
+    font-weight: 700;
+    padding: 14px;
+    border-radius: 16px;
+    background-color: #FEF3C7;
+    color: #111827;
+    min-height: 65px;
+    max-height: 120px;
+    overflow: hidden;
+    white-space: pre-wrap;
+    border: 1px solid #F59E0B;
+    box-sizing: border-box;
+}}
+
+.llm-simple-box {{
+    font-size: 19px;
+    line-height: 1.3;
+    font-weight: 650;
+    padding: 14px;
+    border-radius: 16px;
+    background-color: #DBEAFE;
+    color: #1E3A8A;
+    min-height: 60px;
+    max-height: 115px;
+    overflow: hidden;
+    white-space: pre-wrap;
+    border: 1px solid #3B82F6;
+    box-sizing: border-box;
+}}
+
+.llm-terms-box {{
+    font-size: 16px;
+    line-height: 1.35;
+    font-weight: 600;
+    padding: 12px;
+    border-radius: 14px;
+    background-color: #ECFDF5;
+    color: #064E3B;
+    min-height: 55px;
+    max-height: 130px;
+    overflow: hidden;
+    white-space: pre-wrap;
+    border: 1px solid #10B981;
     box-sizing: border-box;
 }}
 
@@ -1065,6 +1553,30 @@ caption_html = f"""
         max-height: 90px;
     }}
 
+    .llm-hint-box {{
+        font-size: 18px;
+        line-height: 1.25;
+        padding: 11px;
+        min-height: 60px;
+        max-height: 110px;
+    }}
+
+    .llm-simple-box {{
+        font-size: 17px;
+        line-height: 1.25;
+        padding: 11px;
+        min-height: 55px;
+        max-height: 100px;
+    }}
+
+    .llm-terms-box {{
+        font-size: 15px;
+        line-height: 1.3;
+        padding: 10px;
+        min-height: 50px;
+        max-height: 115px;
+    }}
+
     .en-caption-box {{
         font-size: {font_size}px;
         line-height: 1.25;
@@ -1080,6 +1592,8 @@ caption_html = f"""
         <div class="caption-label">Japanese Original</div>
         <div class="jp-caption-box">{safe_original}</div>
     </div>
+
+    {llm_html}
 
     <div>
         <div class="caption-label">English Caption</div>
