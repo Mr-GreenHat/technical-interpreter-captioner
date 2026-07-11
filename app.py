@@ -22,7 +22,7 @@ from google.genai import types
 # Settings
 # ============================================================
 
-SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
+SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"  # unused; kept for compatibility
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
 DEFAULT_RESET_SECONDS = 3.0
@@ -50,9 +50,39 @@ GEMINI_LIVE_WS_URL = (
 ENGINE_GEMINI_LIVE = "Gemini Mode - Gemini 3.5 Live Translate + Gemini 3.1 correction"
 ENGINE_SONIOX = ENGINE_GEMINI_LIVE  # compatibility only; Soniox is disabled in this version
 
-DEFAULT_LLM_HINT_INTERVAL = 12.0
-MIN_LLM_CONTEXT_CHARS = 80
+DEFAULT_LLM_HINT_INTERVAL = 45.0
+MIN_LLM_CONTEXT_CHARS = 180
 MAX_LLM_CONTEXT_CHUNKS = 6
+
+# Helper AI safety net.
+# Gemini 3.5 Live Translate can keep running, but Gemini 3.1 Flash-Lite
+# helper calls are limited so daily quota is protected.
+LLM_BUDGET_MODES = {
+    "High Accuracy": {
+        "interval": 20.0,
+        "min_chars": 120,
+        "session_limit": 120,
+        "description": "More frequent helper AI checks. Use only for short important demos.",
+    },
+    "Balanced": {
+        "interval": 45.0,
+        "min_chars": 180,
+        "session_limit": 80,
+        "description": "Recommended default for normal classes.",
+    },
+    "Saver": {
+        "interval": 90.0,
+        "min_chars": 260,
+        "session_limit": 40,
+        "description": "Safer for multiple classes per day.",
+    },
+    "Emergency Rule-Based Only": {
+        "interval": 999999.0,
+        "min_chars": 999999,
+        "session_limit": 0,
+        "description": "No Gemini 3.1 helper calls. Built-in glossary cleanup only.",
+    },
+}
 
 
 # Built-in non-technical / school event terms.
@@ -137,6 +167,150 @@ EXTRA_GLOSSARY_ENTRIES = [
         "en": "Business Engineering",
         "common_wrong": "business engineering;business engineer;BE;BA",
         "notes": "Full English name for BE",
+    },
+    {
+        "domain": "cad",
+        "jp": "CATIA",
+        "reading": "きゃてぃあ",
+        "en": "CATIA",
+        "common_wrong": "キャティア;カティア;キャディア;カディア;Catia;catia;CADIA",
+        "notes": "CAD software used for product design and engineering",
+    },
+    {
+        "domain": "cad",
+        "jp": "CAD",
+        "reading": "きゃど",
+        "en": "CAD",
+        "common_wrong": "キャド;cad;computer aided design;Computer Aided Design;Computer-Aided Design",
+        "notes": "Computer-Aided Design",
+    },
+    {
+        "domain": "cad",
+        "jp": "スケッチャー",
+        "reading": "すけっちゃー",
+        "en": "Sketcher",
+        "common_wrong": "スケッチ;Sketcher;sketcher;sketch",
+        "notes": "CATIA sketch workspace",
+    },
+    {
+        "domain": "cad",
+        "jp": "寸法拘束",
+        "reading": "すんぽうこうそく",
+        "en": "dimensional constraint",
+        "common_wrong": "寸法高速;寸法校則;寸法公則;dimension constraint;dimensional constraints",
+        "notes": "Constraint that defines numerical dimensions",
+    },
+    {
+        "domain": "cad",
+        "jp": "幾何拘束",
+        "reading": "きかこうそく",
+        "en": "geometric constraint",
+        "common_wrong": "幾何高速;記号拘束;幾何校則;geometry constraint;geometrical constraint",
+        "notes": "Constraint that defines geometric relationships",
+    },
+    {
+        "domain": "cad",
+        "jp": "完全拘束",
+        "reading": "かんぜんこうそく",
+        "en": "fully constrained",
+        "common_wrong": "完全高速;完全校則;full constraint;fully constraint",
+        "notes": "Sketch condition where no degrees of freedom remain",
+    },
+    {
+        "domain": "cad",
+        "jp": "自由度",
+        "reading": "じゆうど",
+        "en": "degrees of freedom",
+        "common_wrong": "自由道;degree of freedom;degrees of freedom",
+        "notes": "Remaining movement/undetermined state in a sketch",
+    },
+    {
+        "domain": "cad",
+        "jp": "Pad",
+        "reading": "ぱっど",
+        "en": "Pad",
+        "common_wrong": "パッド;pad;extrude;extrusion;押し出し",
+        "notes": "CATIA function used to extrude a sketch",
+    },
+    {
+        "domain": "cad",
+        "jp": "押し出し",
+        "reading": "おしだし",
+        "en": "extrusion",
+        "common_wrong": "押出し;押し出す;extrude;extrusion",
+        "notes": "Creating 3D geometry by extruding a sketch",
+    },
+    {
+        "domain": "cad",
+        "jp": "フィレット",
+        "reading": "ふぃれっと",
+        "en": "fillet",
+        "common_wrong": "フィレ;fillet;Fillet;filet",
+        "notes": "Rounded edge feature",
+    },
+    {
+        "domain": "cad",
+        "jp": "Chamfer",
+        "reading": "ちゃんふぁー",
+        "en": "Chamfer",
+        "common_wrong": "チャンファー;シャンファー;面取り;chamfer;Chamfering",
+        "notes": "Beveled edge feature",
+    },
+    {
+        "domain": "cad",
+        "jp": "面取り",
+        "reading": "めんとり",
+        "en": "chamfering",
+        "common_wrong": "面取;面どり;chamfer;chamfering",
+        "notes": "Removing or beveling a sharp edge",
+    },
+    {
+        "domain": "cad",
+        "jp": "設計意図",
+        "reading": "せっけいいと",
+        "en": "design intent",
+        "common_wrong": "設計糸;設計意図;design intent",
+        "notes": "Reasoning behind design dimensions and features",
+    },
+    {
+        "domain": "cad",
+        "jp": "加工性",
+        "reading": "かこうせい",
+        "en": "manufacturability",
+        "common_wrong": "加工製;加工生;manufacturability;manufacturing feasibility",
+        "notes": "How easy or realistic a part is to manufacture",
+    },
+    {
+        "domain": "automotive",
+        "jp": "ロータリーエンジン",
+        "reading": "ろーたりーえんじん",
+        "en": "rotary engine",
+        "common_wrong": "Rotary Engine;rotary engine;ロータリエンジン;ロータリーエンジン;ロタリーエンジン;ロータリー",
+        "notes": "Wankel-type rotary engine",
+    },
+    {
+        "domain": "automotive",
+        "jp": "レシプロエンジン",
+        "reading": "れしぷろえんじん",
+        "en": "reciprocating engine",
+        "common_wrong": "reciprocating engine;piston engine;レシプロ;ピストンエンジン",
+        "notes": "Conventional piston engine",
+    },
+    {
+        "domain": "automotive",
+        "jp": "ローター",
+        "reading": "ろーたー",
+        "en": "rotor",
+        "common_wrong": "rotor;Rotor;ロータ",
+        "notes": "Rotating element in a rotary engine",
+    },
+    {
+        "domain": "automotive",
+        "jp": "アペックスシール",
+        "reading": "あぺっくすしーる",
+        "en": "apex seal",
+        "common_wrong": "apex seal;Apex seal;アペックス;アペックシール",
+        "notes": "Seal at the rotor apex in a rotary engine",
     },
 ]
 
@@ -451,6 +625,38 @@ def light_caption_cleanup(text):
         "BA": "BE",
         "business engineering": "Business Engineering",
         "business engineer": "Business Engineering",
+
+        # CATIA / CAD / product design terms
+        "Catia": "CATIA",
+        "catia": "CATIA",
+        "CADIA": "CATIA",
+        "Catiya": "CATIA",
+        "Computer Aided Design": "CAD",
+        "computer aided design": "CAD",
+        "Computer-Aided Design": "CAD",
+        "cad": "CAD",
+        "dimension constraint": "dimensional constraint",
+        "dimensional constraints": "dimensional constraints",
+        "geometry constraint": "geometric constraint",
+        "geometrical constraint": "geometric constraint",
+        "fully constraint": "fully constrained",
+        "full constraint": "fully constrained",
+        "degree of freedom": "degrees of freedom",
+        "filet": "fillet",
+        "Fillet": "fillet",
+        "chamfering": "chamfering",
+        "Chamfering": "chamfering",
+        "manufacturing feasibility": "manufacturability",
+
+        # Rotary engine terms
+        "Rotary Engine": "rotary engine",
+        "rotary-engine": "rotary engine",
+        "Wankel engine": "rotary engine",
+        "apex seals": "apex seals",
+        "Apex seal": "apex seal",
+        "rotor": "rotor",
+        "reciprocating engine": "reciprocating engine",
+        "piston engine": "reciprocating engine",
     }
 
     for wrong, correct in replacements.items():
@@ -583,6 +789,57 @@ def light_original_cleanup(text):
         "ビジネス工学": "BE",
         "ビジネスエンジニアリング": "BE",
 
+        # CATIA / CAD / product design terms
+        "キャティア": "CATIA",
+        "カティア": "CATIA",
+        "キャディア": "CATIA",
+        "カディア": "CATIA",
+        "Catia": "CATIA",
+        "catia": "CATIA",
+
+        "キャド": "CAD",
+        "cad": "CAD",
+        "Computer Aided Design": "CAD",
+        "Computer-Aided Design": "CAD",
+
+        "スケッチヤー": "スケッチャー",
+        "寸法高速": "寸法拘束",
+        "寸法校則": "寸法拘束",
+        "寸法公則": "寸法拘束",
+        "幾何高速": "幾何拘束",
+        "幾何校則": "幾何拘束",
+        "記号拘束": "幾何拘束",
+        "完全高速": "完全拘束",
+        "完全校則": "完全拘束",
+        "自由道": "自由度",
+
+        "パッド": "Pad",
+        "押出し": "押し出し",
+        "フィレ": "フィレット",
+        "filet": "フィレット",
+        "Fillet": "フィレット",
+
+        "チャンファー": "Chamfer",
+        "シャンファー": "Chamfer",
+        "chamfer": "Chamfer",
+        "面取": "面取り",
+        "面どり": "面取り",
+
+        "設計糸": "設計意図",
+        "加工製": "加工性",
+        "加工生": "加工性",
+
+        # Rotary engine terms
+        "Rotary Engine": "ロータリーエンジン",
+        "rotary engine": "ロータリーエンジン",
+        "ロータリエンジン": "ロータリーエンジン",
+        "ロタリーエンジン": "ロータリーエンジン",
+        "ロータリー エンジン": "ロータリーエンジン",
+        "レシプロ": "レシプロエンジン",
+        "ピストンエンジン": "レシプロエンジン",
+        "ロータ": "ローター",
+        "アペックシール": "アペックスシール",
+
         # Common sentence cleanup
         "または急に止まると": "モーターが急に止まると",
         "急に止まると完成": "急に止まると、慣性",
@@ -661,6 +918,8 @@ def normalize_key_term_line(term, meaning):
         "ARE",
         "PDE",
         "BE",
+        "CATIA",
+        "CAD",
     }
 
     # If the LLM gives English-to-English, convert common terms back to
@@ -694,6 +953,29 @@ def normalize_key_term_line(term, meaning):
         "business engineering": ("BE", "Business Engineering"),
         "business engineer": ("BE", "Business Engineering"),
         "be": ("BE", "Business Engineering"),
+
+        "catia": ("CATIA", "CATIA"),
+        "cad": ("CAD", "Computer-Aided Design"),
+        "computer aided design": ("CAD", "Computer-Aided Design"),
+        "computer-aided design": ("CAD", "Computer-Aided Design"),
+        "sketcher": ("スケッチャー", "Sketcher"),
+        "dimensional constraint": ("寸法拘束", "dimensional constraint"),
+        "geometric constraint": ("幾何拘束", "geometric constraint"),
+        "fully constrained": ("完全拘束", "fully constrained"),
+        "degrees of freedom": ("自由度", "degrees of freedom"),
+        "pad": ("Pad", "Pad / extrusion"),
+        "extrusion": ("押し出し", "extrusion"),
+        "fillet": ("フィレット", "fillet"),
+        "chamfer": ("Chamfer", "chamfer"),
+        "chamfering": ("面取り", "chamfering"),
+        "design intent": ("設計意図", "design intent"),
+        "manufacturability": ("加工性", "manufacturability"),
+        "rotary engine": ("ロータリーエンジン", "rotary engine"),
+        "wankel engine": ("ロータリーエンジン", "rotary engine"),
+        "reciprocating engine": ("レシプロエンジン", "reciprocating engine"),
+        "piston engine": ("レシプロエンジン", "reciprocating engine"),
+        "rotor": ("ローター", "rotor"),
+        "apex seal": ("アペックスシール", "apex seal"),
     }
 
     lowered_term = term.lower()
@@ -729,6 +1011,10 @@ def normalize_key_term_line(term, meaning):
                 meaning = "Product Design Engineering"
             elif term == "BE":
                 meaning = "Business Engineering"
+            elif term == "CATIA":
+                meaning = "CAD software for 3D product design"
+            elif term == "CAD":
+                meaning = "Computer-Aided Design"
 
         if meaning:
             return f"{term} = {meaning}"
@@ -1331,6 +1617,26 @@ Rules:
   ARE = Automotive and Robotics Engineering
   PDE = Product Design Engineering
   BE = Business Engineering
+  CATIA = CATIA
+  CAD = Computer-Aided Design
+  ロータリーエンジン = rotary engine
+- CATIA / CAD correction rules:
+  Preserve CATIA and CAD exactly as acronyms.
+  スケッチャー = Sketcher
+  寸法拘束 = dimensional constraint
+  幾何拘束 = geometric constraint
+  完全拘束 = fully constrained
+  自由度 = degrees of freedom
+  Pad = Pad / extrusion
+  フィレット = fillet
+  Chamfer / 面取り = chamfer / chamfering
+  設計意図 = design intent
+  加工性 = manufacturability
+- Rotary engine correction rules:
+  ロータリーエンジン = rotary engine
+  レシプロエンジン = reciprocating engine
+  ローター = rotor
+  アペックスシール = apex seal
 - Major-name correction rules:
   If the topic is BINUS ASO majors or students, correct AROI / ARO to ARE when it means Automotive and Robotics Engineering.
   If the topic is BINUS ASO majors or students, correct PDA / ADC / PD to PDE when it means Product Design Engineering.
@@ -1461,26 +1767,28 @@ def soniox_live_worker(
                 "inertia compensation, classroom interpretation, technical terms, "
                 "Summer Course, BINUS, BINUS ASO, BINUS University, ビヌス大学, "
                 "ARE, Automotive and Robotics Engineering, PDE, Product Design Engineering, "
-                "BE, Business Engineering"
+                "BE, Business Engineering, CATIA, CAD, Sketcher, dimensional constraint, "
+                "geometric constraint, Pad, Fillet, Chamfer, rotary engine, apex seal"
             )
 
         elif domain_mode == "automotive":
             domain_text = (
                 "Japanese automotive engineering class, vehicle systems, braking systems, "
                 "drivetrain, suspension, steering, ADAS, AEB, TTC, Time To Collision, "
-                "vehicle control, inertia compensation"
+                "vehicle control, inertia compensation, rotary engine, rotor, apex seal, reciprocating engine"
             )
 
         elif domain_mode == "cad":
             domain_text = (
-                "Japanese CAD class, sketch constraints, dimensions, extrusion, chamfering, "
-                "fillet, technical drawing, projection drawing, product modeling"
+                "Japanese CAD class, CATIA, CAD, Sketcher, sketch constraints, dimensional constraints, "
+                "geometric constraints, fully constrained sketch, degrees of freedom, Pad, extrusion, "
+                "Hole, fillet, chamfering, technical drawing, projection drawing, product modeling"
             )
 
         elif domain_mode == "product design":
             domain_text = (
-                "Japanese product design class, design process, CAD modeling, dimensions, "
-                "materials, usability, product development, prototyping"
+                "Japanese product design class, CATIA, CAD modeling, design process, design intent, "
+                "dimensions, materials, usability, strength, manufacturability, cost, product development, prototyping"
             )
 
         else:
@@ -1519,6 +1827,9 @@ def soniox_live_worker(
                             "BE means Business Engineering. "
                             "If speech sounds like AROI or ARO in the BINUS ASO major context, it is probably ARE. "
                             "If speech sounds like PDA or ADC in the BINUS ASO major context, it is probably PDE. "
+                            "CATIA is CAD software. CAD means Computer-Aided Design. "
+                            "In CATIA class, Sketcher, dimensional constraint, geometric constraint, Pad, Fillet, Chamfer, Hole, design intent, and manufacturability are important terms. "
+                            "ロータリーエンジン means rotary engine. アペックスシール means apex seal. レシプロエンジン means reciprocating engine. "
                             "If Japanese sounds like ネウス大学, ビーナス大学, or ビナス大学, "
                             "it is probably ビヌス大学 / BINUS University."
                         ),
@@ -1748,7 +2059,7 @@ st.title("Technical Interpreter Captioner")
 
 st.caption(
     "Japanese → English live captions using Gemini 3.5 Live Translate, "
-    "with Gemini 3.1 Flash-Lite as the helper/correction AI."
+    "with Gemini 3.1 Flash-Lite as the optional helper/correction AI."
 )
 
 
@@ -1821,17 +2132,26 @@ with st.sidebar:
         index=0,
     )
 
-    llm_hint_interval = st.slider(
-        "LLM update interval",
-        min_value=8.0,
-        max_value=90.0,
-        value=DEFAULT_LLM_HINT_INTERVAL,
-        step=2.0,
+    llm_budget_mode = st.selectbox(
+        "AI helper budget mode",
+        list(LLM_BUDGET_MODES.keys()),
+        index=1,
     )
 
+    selected_budget = LLM_BUDGET_MODES[llm_budget_mode]
+    llm_hint_interval = float(selected_budget["interval"])
+    llm_min_context_chars = int(selected_budget["min_chars"])
+    llm_session_limit = int(selected_budget["session_limit"])
+
+    st.caption(selected_budget["description"])
     st.caption(
-        "AI correction runs after live translation."
+        f"Helper interval: {int(llm_hint_interval)} sec | "
+        f"Min new context: {llm_min_context_chars} chars | "
+        f"Session limit: {llm_session_limit} calls"
     )
+
+    current_helper_calls = st.session_state.get("llm_calls_this_session", 0)
+    st.caption(f"Helper calls this session: {current_helper_calls} / {llm_session_limit}")
 
     st.divider()
 
@@ -1896,6 +2216,8 @@ defaults = {
     "correction_status": "idle",
     "live_token_version": 0,
     "last_llm_checked_token_version": -1,
+    "llm_calls_this_session": 0,
+    "llm_budget_reached": False,
 
     "llm_result_queue": queue.Queue(),
     "llm_thread": None,
@@ -2055,6 +2377,8 @@ if clear_clicked:
     st.session_state.correction_status = "idle"
     st.session_state.live_token_version = 0
     st.session_state.last_llm_checked_token_version = -1
+    st.session_state.llm_calls_this_session = 0
+    st.session_state.llm_budget_reached = False
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -2101,6 +2425,8 @@ if (
     st.session_state.correction_status = "idle"
     st.session_state.live_token_version = 0
     st.session_state.last_llm_checked_token_version = -1
+    st.session_state.llm_calls_this_session = 0
+    st.session_state.llm_budget_reached = False
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -2248,6 +2574,8 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.correction_status = "idle"
         st.session_state.live_token_version = 0
         st.session_state.last_llm_checked_token_version = -1
+        st.session_state.llm_calls_this_session = 0
+        st.session_state.llm_budget_reached = False
 
     elif item_type == "debug":
         message = item.get("message", "")
@@ -2286,6 +2614,7 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
+        st.session_state.llm_calls_this_session += 1
 
         has_ai_update = (
             bool(st.session_state.llm_corrected_japanese_original)
@@ -2344,6 +2673,7 @@ while not st.session_state.llm_result_queue.empty():
     elif item_type == "llm_error":
         st.session_state.llm_error = item.get("message", "")
         st.session_state.llm_running = False
+        st.session_state.llm_calls_this_session += 1
         st.session_state.correction_status = "error"
 
 
@@ -2358,7 +2688,7 @@ if use_llm_hints and gemini_api_key:
         st.session_state.live_translation,
     )
 
-    enough_text = len(source_text) >= MIN_LLM_CONTEXT_CHARS
+    enough_text = len(source_text) >= int(llm_min_context_chars)
     changed_text = source_text != st.session_state.llm_last_source_text
     interval_ready = (
         time.time() - float(st.session_state.llm_last_call_time)
@@ -2370,6 +2700,12 @@ if use_llm_hints and gemini_api_key:
         st.session_state.live_token_version
         > st.session_state.last_llm_checked_token_version
     )
+    helper_budget_available = (
+        use_llm_hints
+        and not st.session_state.llm_budget_reached
+        and st.session_state.llm_calls_this_session < int(llm_session_limit)
+        and llm_budget_mode != "Emergency Rule-Based Only"
+    )
 
     if (
         st.session_state.soniox_running
@@ -2378,6 +2714,7 @@ if use_llm_hints and gemini_api_key:
         and changed_text
         and interval_ready
         and has_new_live_tokens_for_llm
+        and helper_budget_available
         and not st.session_state.llm_running
     ):
         detected_terms = extract_key_terms_for_llm(
@@ -2414,6 +2751,19 @@ if use_llm_hints and gemini_api_key:
 
 
 # ============================================================
+# Helper AI budget safety
+# ============================================================
+
+if use_llm_hints:
+    if llm_budget_mode == "Emergency Rule-Based Only":
+        st.session_state.llm_budget_reached = True
+        st.session_state.correction_status = "off"
+    elif st.session_state.llm_calls_this_session >= int(llm_session_limit):
+        st.session_state.llm_budget_reached = True
+        if st.session_state.soniox_running:
+            st.session_state.correction_status = "budget_reached"
+
+# ============================================================
 # Status
 # ============================================================
 
@@ -2429,6 +2779,12 @@ if st.session_state.soniox_error:
 
 if use_llm_hints and st.session_state.llm_error:
     st.warning(f"LLM error: {st.session_state.llm_error}")
+
+if use_llm_hints and st.session_state.llm_budget_reached:
+    if llm_budget_mode == "Emergency Rule-Based Only":
+        st.warning("Helper AI is off. Rule-based glossary correction is still active.")
+    else:
+        st.warning("Helper AI session budget reached. Switched to rule-based glossary correction only.")
 
 
 # ============================================================
@@ -2640,6 +2996,12 @@ if show_debug:
 
         st.write("Last LLM checked token version:")
         st.code(str(st.session_state.last_llm_checked_token_version))
+
+        st.write("Helper calls this session:")
+        st.code(str(st.session_state.llm_calls_this_session))
+
+        st.write("Helper budget reached:")
+        st.code(str(st.session_state.llm_budget_reached))
 
         st.write("Correction status:")
         st.code(st.session_state.correction_status)
