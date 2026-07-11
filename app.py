@@ -47,8 +47,8 @@ GEMINI_LIVE_WS_URL = (
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 )
 
-ENGINE_SONIOX = "Reliable Mode - Soniox + Gemini 3.1 correction"
 ENGINE_GEMINI_LIVE = "Gemini Mode - Gemini 3.5 Live Translate + Gemini 3.1 correction"
+ENGINE_SONIOX = ENGINE_GEMINI_LIVE  # compatibility only; Soniox is disabled in this version
 
 DEFAULT_LLM_HINT_INTERVAL = 12.0
 MIN_LLM_CONTEXT_CHARS = 80
@@ -1747,8 +1747,8 @@ st.set_page_config(
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English live captions. Reliable Mode uses Soniox; Gemini Mode uses "
-    "Gemini 3.5 Live Translate. Both can use Gemini 3.1 Flash-Lite as the helper/correction AI."
+    "Japanese → English live captions using Gemini 3.5 Live Translate, "
+    "with Gemini 3.1 Flash-Lite as the helper/correction AI."
 )
 
 
@@ -1759,14 +1759,8 @@ st.caption(
 with st.sidebar:
     st.header("Settings")
 
-    translation_engine = st.selectbox(
-        "Translation engine",
-        [
-            ENGINE_SONIOX,
-            ENGINE_GEMINI_LIVE,
-        ],
-        index=0,
-    )
+    translation_engine = ENGINE_GEMINI_LIVE
+    st.info("Translation engine: Gemini 3.5 Live Translate")
 
     domain_mode = st.selectbox(
         "Technical domain",
@@ -1866,8 +1860,8 @@ with st.sidebar:
     context_terms, translation_terms = load_soniox_context_terms(terms_file)
 
     st.caption(
-        f"Loaded {len(context_terms)} context terms and "
-        f"{len(translation_terms)} translation terms."
+        f"Loaded {len(context_terms)} glossary terms and "
+        f"{len(translation_terms)} translation mappings."
     )
 
 
@@ -1900,6 +1894,8 @@ defaults = {
     "last_helper_fix_time": "",
     "last_ai_check_time": "",
     "correction_status": "idle",
+    "live_token_version": 0,
+    "last_llm_checked_token_version": -1,
 
     "llm_result_queue": queue.Queue(),
     "llm_thread": None,
@@ -1932,7 +1928,7 @@ if st.session_state.current_engine and st.session_state.current_engine != transl
     st.rerun()
 
 if not st.session_state.current_engine:
-    st.session_state.current_engine = translation_engine
+    st.session_state.current_engine = ENGINE_GEMINI_LIVE
 
 
 if float(reset_seconds) != float(st.session_state.last_reset_seconds):
@@ -1949,18 +1945,10 @@ if float(reset_seconds) != float(st.session_state.last_reset_seconds):
 # API keys
 # ============================================================
 
-api_key = safe_get_secret_or_env("SONIOX_API_KEY")
+api_key = None  # Soniox disabled in pure Gemini version.
 gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
 
-if translation_engine == ENGINE_SONIOX and not api_key:
-    st.error(
-        "SONIOX_API_KEY is not set.\n\n"
-        "Reliable Mode needs Soniox. For Streamlit Cloud, add this in Secrets:\n\n"
-        'SONIOX_API_KEY = "your_soniox_api_key_here"'
-    )
-    st.stop()
-
-if translation_engine == ENGINE_GEMINI_LIVE and not gemini_api_key:
+if not gemini_api_key:
     st.error(
         "GEMINI_API_KEY is not set.\n\n"
         "Gemini Mode needs Gemini 3.5 Live Translate. For Streamlit Cloud, add this in Secrets:\n\n"
@@ -2065,6 +2053,8 @@ if clear_clicked:
     st.session_state.last_helper_fix_time = ""
     st.session_state.last_ai_check_time = ""
     st.session_state.correction_status = "idle"
+    st.session_state.live_token_version = 0
+    st.session_state.last_llm_checked_token_version = -1
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -2109,6 +2099,8 @@ if (
     st.session_state.last_helper_fix_time = ""
     st.session_state.last_ai_check_time = ""
     st.session_state.correction_status = "idle"
+    st.session_state.live_token_version = 0
+    st.session_state.last_llm_checked_token_version = -1
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -2127,29 +2119,16 @@ if (
     st.session_state.soniox_running = True
     st.session_state.pending_start_translation = False
 
-    if translation_engine == ENGINE_SONIOX:
-        worker_target = soniox_live_worker
-        worker_args = (
-            processor.audio_queue,
-            st.session_state.soniox_result_queue,
-            st.session_state.soniox_stop_event,
-            st.session_state.soniox_control_queue,
-            api_key,
-            terms_file,
-            domain_mode,
-            float(reset_seconds),
-        )
-    else:
-        worker_target = gemini_live_translate_worker
-        worker_args = (
-            processor.audio_queue,
-            st.session_state.soniox_result_queue,
-            st.session_state.soniox_stop_event,
-            st.session_state.soniox_control_queue,
-            gemini_api_key,
-            "en",
-            float(reset_seconds),
-        )
+    worker_target = gemini_live_translate_worker
+    worker_args = (
+        processor.audio_queue,
+        st.session_state.soniox_result_queue,
+        st.session_state.soniox_stop_event,
+        st.session_state.soniox_control_queue,
+        gemini_api_key,
+        "en",
+        float(reset_seconds),
+    )
 
     st.session_state.soniox_thread = threading.Thread(
         target=worker_target,
@@ -2173,6 +2152,7 @@ while not st.session_state.soniox_result_queue.empty():
         translation = item.get("translation", "")
 
         if original or translation:
+            st.session_state.live_token_version += 1
             prepare_next_ai_check_after_new_live_text()
 
         if st.session_state.pending_visual_reset and (original or translation):
@@ -2266,6 +2246,8 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.last_helper_fix_time = ""
         st.session_state.last_ai_check_time = ""
         st.session_state.correction_status = "idle"
+        st.session_state.live_token_version = 0
+        st.session_state.last_llm_checked_token_version = -1
 
     elif item_type == "debug":
         message = item.get("message", "")
@@ -2384,6 +2366,10 @@ if use_llm_hints and gemini_api_key:
     )
 
     translated_text_ready = bool(st.session_state.live_translation.strip())
+    has_new_live_tokens_for_llm = (
+        st.session_state.live_token_version
+        > st.session_state.last_llm_checked_token_version
+    )
 
     if (
         st.session_state.soniox_running
@@ -2391,6 +2377,7 @@ if use_llm_hints and gemini_api_key:
         and enough_text
         and changed_text
         and interval_ready
+        and has_new_live_tokens_for_llm
         and not st.session_state.llm_running
     ):
         detected_terms = extract_key_terms_for_llm(
@@ -2408,6 +2395,7 @@ if use_llm_hints and gemini_api_key:
         st.session_state.last_ai_check_time = time.strftime("%H:%M:%S")
         st.session_state.llm_last_call_time = time.time()
         st.session_state.llm_last_source_text = source_text
+        st.session_state.last_llm_checked_token_version = st.session_state.live_token_version
 
         st.session_state.llm_thread = threading.Thread(
             target=llm_hint_worker,
@@ -2430,15 +2418,9 @@ if use_llm_hints and gemini_api_key:
 # ============================================================
 
 if st.session_state.soniox_running:
-    if translation_engine == ENGINE_GEMINI_LIVE:
-        st.success("Gemini 3.5 Live Translate running.")
-    else:
-        st.success("Soniox translation running.")
+    st.success("Gemini 3.5 Live Translate running.")
 elif st.session_state.app_active:
-    if translation_engine == ENGINE_GEMINI_LIVE:
-        st.info("Starting Gemini Live Translate...")
-    else:
-        st.info("Starting microphone...")
+    st.info("Starting Gemini Live Translate...")
 else:
     st.info("Live translation stopped.")
 
@@ -2652,6 +2634,12 @@ if show_debug:
 
         st.write("Caption stage:")
         st.code(st.session_state.caption_stage)
+
+        st.write("Live token version:")
+        st.code(str(st.session_state.live_token_version))
+
+        st.write("Last LLM checked token version:")
+        st.code(str(st.session_state.last_llm_checked_token_version))
 
         st.write("Correction status:")
         st.code(st.session_state.correction_status)
