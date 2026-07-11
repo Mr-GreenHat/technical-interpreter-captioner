@@ -491,66 +491,92 @@ def gemini_live_translate_worker(
     Translation engine:
         gemini-3.5-live-translate-preview
 
-    This sends raw 16-bit PCM mono audio at 16 kHz through the Gemini Live
-    websocket API and reads both:
-        - inputTranscription  = Japanese transcript
-        - outputTranscription = translated English transcript
+    Helper/correction AI:
+        Gemini 3.1 Flash-Lite, handled separately by llm_hint_worker.
 
-    Helper/correction AI still runs separately as Gemini 3.1 Flash-Lite.
+    Important stability fixes:
+    - Wait for setupComplete before sending audio.
+    - Send 16 kHz PCM in small throttled chunks instead of flooding the socket.
+    - Surface setup errors in the debug panel.
     """
     ws = None
 
     try:
         ws_url = f"{GEMINI_LIVE_WS_URL}?key={api_key}"
-        ws = websocket.create_connection(ws_url, timeout=10)
+        ws = websocket.create_connection(
+            ws_url,
+            timeout=10,
+            enable_multithread=True,
+        )
 
         setup_message = make_gemini_live_setup(target_language_code)
         ws.send(json.dumps(setup_message))
 
         result_queue.put({
             "type": "debug",
-            "message": "Connected to Gemini 3.5 Live Translate.",
+            "message": "Connected to Gemini 3.5 Live Translate. Waiting for setupComplete...",
         })
 
+        setup_done_event = threading.Event()
         live_original = ""
         live_translation = ""
 
         def send_audio():
+            pcm16_buffer = bytearray()
+            last_send_time = time.time()
+
             while not stop_event.is_set():
                 while control_queue is not None and not control_queue.empty():
                     try:
                         command = control_queue.get_nowait()
 
                         if command == "clear":
+                            pcm16_buffer = bytearray()
                             result_queue.put({"type": "cleared"})
 
                     except queue.Empty:
                         break
 
+                if not setup_done_event.wait(timeout=0.1):
+                    continue
+
                 try:
-                    pcm48 = audio_queue.get(timeout=0.1)
+                    pcm48 = audio_queue.get(timeout=0.05)
 
-                    if not pcm48:
-                        continue
-
-                    pcm16 = downsample_pcm48_to_pcm16(pcm48)
-
-                    if not pcm16:
-                        continue
-
-                    audio_message = {
-                        "realtimeInput": {
-                            "audio": {
-                                "data": base64.b64encode(pcm16).decode("utf-8"),
-                                "mimeType": "audio/pcm;rate=16000",
-                            }
-                        }
-                    }
-
-                    ws.send(json.dumps(audio_message))
+                    if pcm48:
+                        pcm16 = downsample_pcm48_to_pcm16(pcm48)
+                        if pcm16:
+                            pcm16_buffer.extend(pcm16)
 
                 except queue.Empty:
+                    pass
+
+                # 100 ms at 16 kHz, mono, int16 = 3200 bytes.
+                # This avoids sending too many JSON messages per second.
+                now = time.time()
+                should_send = (
+                    len(pcm16_buffer) >= 3200
+                    or (pcm16_buffer and now - last_send_time >= 0.12)
+                )
+
+                if not should_send:
                     continue
+
+                chunk = bytes(pcm16_buffer[:3200])
+                pcm16_buffer = pcm16_buffer[3200:]
+                last_send_time = now
+
+                audio_message = {
+                    "realtimeInput": {
+                        "audio": {
+                            "data": base64.b64encode(chunk).decode("utf-8"),
+                            "mimeType": "audio/pcm;rate=16000",
+                        }
+                    }
+                }
+
+                try:
+                    ws.send(json.dumps(audio_message))
 
                 except Exception as e:
                     if not stop_event.is_set():
@@ -584,14 +610,26 @@ def gemini_live_translate_worker(
             try:
                 data = json.loads(msg)
             except json.JSONDecodeError:
+                result_queue.put({
+                    "type": "debug",
+                    "message": f"Gemini Live non-JSON response: {str(msg)[:300]}",
+                })
                 continue
 
             if data.get("error"):
                 result_queue.put({
                     "type": "error",
-                    "message": str(data.get("error")),
+                    "message": f"Gemini Live API error: {data.get('error')}",
                 })
                 break
+
+            if data.get("setupComplete") or data.get("setup_complete"):
+                setup_done_event.set()
+                result_queue.put({
+                    "type": "debug",
+                    "message": "Gemini Live setupComplete received. Sending audio now.",
+                })
+                continue
 
             input_text, output_text = extract_live_text_from_response(data)
 
@@ -621,7 +659,7 @@ def gemini_live_translate_worker(
         if not stop_event.is_set():
             result_queue.put({
                 "type": "error",
-                "message": str(e),
+                "message": f"Gemini Live startup error: {e}",
             })
 
     finally:
@@ -1689,7 +1727,10 @@ if st.session_state.soniox_running:
     else:
         st.success("Soniox translation running.")
 elif st.session_state.app_active:
-    st.info("Starting microphone...")
+    if translation_engine == ENGINE_GEMINI_LIVE:
+        st.info("Starting Gemini Live Translate...")
+    else:
+        st.info("Starting microphone...")
 else:
     st.info("Live translation stopped.")
 
