@@ -365,6 +365,108 @@ def light_original_cleanup(text):
     return cleaned.strip()
 
 
+
+def contains_japanese(text):
+    if not text:
+        return False
+
+    for ch in text:
+        cp = ord(ch)
+
+        if (
+            0x3040 <= cp <= 0x309F  # Hiragana
+            or 0x30A0 <= cp <= 0x30FF  # Katakana
+            or 0x4E00 <= cp <= 0x9FFF  # Kanji
+        ):
+            return True
+
+    return False
+
+
+def normalize_key_term_line(term, meaning):
+    """
+    Avoid useless English-to-English terms.
+    Prefer Japanese technical source terms:
+        ブレーキワイヤー = brake wire
+        慣性補償 = inertia compensation
+    Keep important acronyms:
+        TTC = Time To Collision
+    """
+    term = (term or "").strip()
+    meaning = (meaning or "").strip()
+
+    if not term:
+        return ""
+
+    term = light_original_cleanup(term)
+    meaning = light_caption_cleanup(meaning)
+
+    allowed_acronyms = {
+        "TTC",
+        "AEB",
+        "ADAS",
+        "ABS",
+        "ECU",
+        "CAN",
+        "PWM",
+        "PID",
+        "IPM",
+        "YOLO",
+    }
+
+    # If the LLM gives English-to-English, convert common terms back to
+    # Japanese-source display for classroom use.
+    english_to_jp = {
+        "inertia compensation control": ("慣性補償制御", "inertia compensation control"),
+        "inertia compensation": ("慣性補償", "inertia compensation"),
+        "inertia": ("慣性", "inertia"),
+        "brake wire": ("ブレーキワイヤー", "brake wire"),
+        "brake cable": ("ブレーキワイヤー", "brake wire"),
+        "servo motor": ("サーボモーター", "servo motor"),
+        "braking force": ("制動力", "braking force"),
+        "emergency braking": ("急ブレーキ", "emergency braking"),
+        "time to collision": ("TTC", "Time To Collision"),
+        "following distance": ("車間距離", "following distance"),
+        "relative speed": ("相対速度", "relative speed"),
+        "lever": ("レバー", "lever"),
+    }
+
+    lowered_term = term.lower()
+    lowered_meaning = meaning.lower()
+
+    for key, value in english_to_jp.items():
+        if key in lowered_term:
+            term, meaning = value
+            break
+
+        if key in lowered_meaning and not contains_japanese(term):
+            term, meaning = value
+            break
+
+    if contains_japanese(term):
+        if meaning:
+            return f"{term} = {meaning}"
+        return term
+
+    if term.upper() in allowed_acronyms:
+        term = term.upper()
+
+        if not meaning:
+            if term == "TTC":
+                meaning = "Time To Collision"
+            elif term == "AEB":
+                meaning = "Autonomous Emergency Braking"
+            elif term == "ADAS":
+                meaning = "Advanced Driver Assistance Systems"
+
+        if meaning:
+            return f"{term} = {meaning}"
+        return term
+
+    # Drop English-to-English non-acronym terms.
+    return ""
+
+
 def trim_caption_soft(text, max_chars):
     if not text:
         return ""
@@ -505,6 +607,7 @@ def gemini_live_translate_worker(
     control_queue,
     api_key,
     target_language_code="en",
+    caption_reset_seconds=DEFAULT_RESET_SECONDS,
 ):
     """
     Gemini 3.5 Live Translate worker using the official google-genai SDK.
@@ -529,6 +632,8 @@ def gemini_live_translate_worker(
 
         live_original = ""
         live_translation = ""
+        last_text_time = time.time()
+        reset_sent = False
 
         async with client.aio.live.connect(
             model=GEMINI_LIVE_TRANSLATE_MODEL,
@@ -594,6 +699,8 @@ def gemini_live_translate_worker(
             async def receive_loop():
                 nonlocal live_original
                 nonlocal live_translation
+                nonlocal last_text_time
+                nonlocal reset_sent
 
                 async for response in session.receive():
                     if stop_event.is_set():
@@ -625,6 +732,10 @@ def gemini_live_translate_worker(
                     if output_transcription:
                         output_text = getattr(output_transcription, "text", "") or ""
 
+                    if input_text or output_text:
+                        last_text_time = time.time()
+                        reset_sent = False
+
                     if input_text:
                         live_original = append_stream_text(
                             live_original,
@@ -647,11 +758,30 @@ def gemini_live_translate_worker(
                             "endpoint": False,
                         })
 
+            async def reset_watchdog_loop():
+                nonlocal live_original
+                nonlocal live_translation
+                nonlocal last_text_time
+                nonlocal reset_sent
+
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.25)
+
+                    if not live_original and not live_translation:
+                        continue
+
+                    if time.time() - last_text_time >= float(caption_reset_seconds) and not reset_sent:
+                        result_queue.put({"type": "page_reset"})
+                        live_original = ""
+                        live_translation = ""
+                        reset_sent = True
+
             send_task = asyncio.create_task(send_audio_loop())
             receive_task = asyncio.create_task(receive_loop())
+            reset_task = asyncio.create_task(reset_watchdog_loop())
 
             done, pending = await asyncio.wait(
-                [send_task, receive_task],
+                [send_task, receive_task, reset_task],
                 return_when=asyncio.FIRST_EXCEPTION,
             )
 
@@ -721,6 +851,7 @@ def parse_llm_json(text):
         return {
             "main_idea": "",
             "say_it_simply": "",
+            "corrected_japanese_original": "",
             "corrected_english_caption": "",
             "key_terms": [],
             "corrections": [],
@@ -743,6 +874,7 @@ def parse_llm_json(text):
         return {
             "main_idea": str(data.get("main_idea", "")).strip(),
             "say_it_simply": str(data.get("say_it_simply", "")).strip(),
+            "corrected_japanese_original": str(data.get("corrected_japanese_original", "")).strip(),
             "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
             "key_terms": data.get("key_terms", []),
             "corrections": data.get("corrections", []),
@@ -752,6 +884,7 @@ def parse_llm_json(text):
         return {
             "main_idea": cleaned[:220],
             "say_it_simply": "",
+            "corrected_japanese_original": "",
             "corrected_english_caption": "",
             "key_terms": [],
             "corrections": [],
@@ -810,6 +943,12 @@ Rules:
 - If STT or translation uses a wrong technical term, add it to corrections.
 - If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
 - Prefer corrected technical terms in key_terms.
+- Also fix obvious Japanese original mistakes in corrected_japanese_original.
+- corrected_japanese_original must stay Japanese and close to the original.
+- Do not invent missing Japanese. Only repair obvious wrong technical words.
+- For key_terms, use the Japanese source technical term when possible, for example "慣性補償 = inertia compensation".
+- Do not output English-to-English key terms like "inertia compensation = Control technique...".
+- Only output important technical words, not normal words.
 - Example correction:
   {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
 
@@ -826,9 +965,10 @@ Return JSON in this exact format:
 {{
   "main_idea": "one short sentence explaining the current main point",
   "say_it_simply": "one natural sentence the interpreter can say",
+  "corrected_japanese_original": "corrected Japanese transcript, only fixing obvious technical recognition errors, otherwise copy the Japanese original",
   "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
   "key_terms": [
-    {{"term": "Japanese or English term", "meaning": "short meaning"}}
+    {{"term": "Japanese source technical term or important acronym", "meaning": "short English meaning"}}
   ],
   "corrections": [
     {{
@@ -855,6 +995,7 @@ Return JSON in this exact format:
             "type": "llm_hint",
             "main_idea": parsed.get("main_idea", ""),
             "say_it_simply": parsed.get("say_it_simply", ""),
+            "corrected_japanese_original": parsed.get("corrected_japanese_original", ""),
             "corrected_english_caption": parsed.get("corrected_english_caption", ""),
             "source_text": context_text,
             "key_terms": parsed.get("key_terms", []),
@@ -1337,6 +1478,7 @@ defaults = {
     "llm_error": "",
     "llm_main_idea": "",
     "llm_say_it_simply": "",
+    "llm_corrected_japanese_original": "",
     "llm_corrected_english_caption": "",
     "llm_corrected_source_text": "",
     "llm_key_terms": [],
@@ -1491,6 +1633,7 @@ if clear_clicked:
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
     st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_corrected_japanese_original = ""
     st.session_state.llm_corrected_english_caption = ""
     st.session_state.llm_corrected_source_text = ""
     st.session_state.llm_key_terms = []
@@ -1525,6 +1668,7 @@ if (
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
     st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_corrected_japanese_original = ""
     st.session_state.llm_corrected_english_caption = ""
     st.session_state.llm_corrected_source_text = ""
     st.session_state.llm_key_terms = []
@@ -1559,6 +1703,7 @@ if (
             st.session_state.soniox_control_queue,
             gemini_api_key,
             "en",
+            float(reset_seconds),
         )
 
     st.session_state.soniox_thread = threading.Thread(
@@ -1618,6 +1763,9 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
         st.session_state.last_update_time = ""
+        st.session_state.llm_corrected_japanese_original = ""
+        st.session_state.llm_corrected_english_caption = ""
+        st.session_state.llm_corrected_source_text = ""
 
     elif item_type == "cleared":
         st.session_state.live_original = ""
@@ -1657,6 +1805,7 @@ while not st.session_state.llm_result_queue.empty():
     if item_type == "llm_hint":
         st.session_state.llm_main_idea = item.get("main_idea", "")
         st.session_state.llm_say_it_simply = item.get("say_it_simply", "")
+        st.session_state.llm_corrected_japanese_original = item.get("corrected_japanese_original", "")
         st.session_state.llm_corrected_english_caption = item.get("corrected_english_caption", "")
         st.session_state.llm_corrected_source_text = item.get("source_text", "")
         st.session_state.llm_key_terms = item.get("key_terms", [])
@@ -1774,13 +1923,20 @@ current_source_for_display = build_llm_context(
 
 if (
     use_llm_hints
-    and st.session_state.llm_corrected_english_caption
+    and st.session_state.llm_corrected_source_text
     and current_source_for_display == st.session_state.llm_corrected_source_text
 ):
-    corrected_translation = apply_llm_corrections(
-        st.session_state.llm_corrected_english_caption,
-        st.session_state.llm_corrections,
-    )
+    if st.session_state.llm_corrected_japanese_original:
+        corrected_original = apply_llm_corrections(
+            st.session_state.llm_corrected_japanese_original,
+            st.session_state.llm_corrections,
+        )
+
+    if st.session_state.llm_corrected_english_caption:
+        corrected_translation = apply_llm_corrections(
+            st.session_state.llm_corrected_english_caption,
+            st.session_state.llm_corrections,
+        )
 
 corrected_original = light_original_cleanup(corrected_original)
 corrected_translation = light_caption_cleanup(corrected_translation)
@@ -1820,24 +1976,25 @@ if use_llm_hints:
     if st.session_state.llm_key_terms:
         llm_terms_lines = []
 
-        for item in st.session_state.llm_key_terms[:5]:
+        for item in st.session_state.llm_key_terms[:8]:
             term = str(item.get("term", "")).strip()
             meaning = str(item.get("meaning", "")).strip()
 
             term = apply_llm_corrections(term, st.session_state.llm_corrections)
             meaning = apply_llm_corrections(meaning, st.session_state.llm_corrections)
 
-            if term == "ABC":
-                term = "TTC"
-                if not meaning:
-                    meaning = "Time To Collision"
+            line = normalize_key_term_line(term, meaning)
 
-            if term and meaning:
-                llm_terms_lines.append(f"{term} = {meaning}")
-            elif term:
-                llm_terms_lines.append(term)
+            if line and line not in llm_terms_lines:
+                llm_terms_lines.append(line)
 
-        llm_terms_text = "\n".join(llm_terms_lines)
+            if len(llm_terms_lines) >= 5:
+                break
+
+        if llm_terms_lines:
+            llm_terms_text = "\n".join(llm_terms_lines)
+        else:
+            llm_terms_text = "No Japanese technical key terms yet."
     else:
         llm_terms_text = "No LLM key terms yet."
 
@@ -1911,6 +2068,7 @@ if show_debug:
             f"running={st.session_state.llm_running}\n"
             f"main_idea={st.session_state.llm_main_idea}\n"
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
+            f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
             f"corrections={st.session_state.llm_corrections}\n"
             f"error={st.session_state.llm_error}"
