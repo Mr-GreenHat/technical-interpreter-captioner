@@ -90,6 +90,54 @@ EXTRA_GLOSSARY_ENTRIES = [
         "common_wrong": "ビナス大学;ビーナス大学;ネウス大学;ヴィヌス大学;BINUS University",
         "notes": "BINUS University",
     },
+    {
+        "domain": "school",
+        "jp": "ARE",
+        "reading": "えーあーるいー",
+        "en": "Automotive and Robotics Engineering",
+        "common_wrong": "AROI;Aroi;ARO;A.R.E.;エーアールイー;エーアール;自動車工学;自動車ロボティクス;自動車とロボット工学",
+        "notes": "BINUS ASO major: Automotive and Robotics Engineering",
+    },
+    {
+        "domain": "school",
+        "jp": "PDE",
+        "reading": "ぴーでぃーいー",
+        "en": "Product Design Engineering",
+        "common_wrong": "PDA;PDE;PD;PE;ADC;ピーディーイー;ピーディー;プロダクトデザイン;製品設計;製品デザイン工学",
+        "notes": "BINUS ASO major: Product Design Engineering",
+    },
+    {
+        "domain": "school",
+        "jp": "BE",
+        "reading": "びーいー",
+        "en": "Business Engineering",
+        "common_wrong": "B;BA;ビー;ビーイー;ビジネス工学;ビジネスエンジニアリング",
+        "notes": "BINUS ASO major: Business Engineering",
+    },
+    {
+        "domain": "school",
+        "jp": "Automotive and Robotics Engineering",
+        "reading": "おーともちぶ あんど ろぼてぃくす えんじにありんぐ",
+        "en": "Automotive and Robotics Engineering",
+        "common_wrong": "Automotive Robotics Engineering;Automotive & Robotics Engineering;automotive and robotics engineering;automotive robotics",
+        "notes": "Full English name for ARE",
+    },
+    {
+        "domain": "school",
+        "jp": "Product Design Engineering",
+        "reading": "ぷろだくと でざいん えんじにありんぐ",
+        "en": "Product Design Engineering",
+        "common_wrong": "Product Design;product design engineering;product design;PDA;ADC",
+        "notes": "Full English name for PDE",
+    },
+    {
+        "domain": "school",
+        "jp": "Business Engineering",
+        "reading": "びじねす えんじにありんぐ",
+        "en": "Business Engineering",
+        "common_wrong": "business engineering;business engineer;BE;BA",
+        "notes": "Full English name for BE",
+    },
 ]
 
 
@@ -384,6 +432,25 @@ def light_caption_cleanup(text):
         "Neus": "BINUS",
         "Binus": "BINUS",
         "summer course": "Summer Course",
+
+        # BINUS ASO major names
+        "AROI": "ARE",
+        "Aroi": "ARE",
+        "ARO": "ARE",
+        "Automotive Robotics Engineering": "Automotive and Robotics Engineering",
+        "Automotive & Robotics Engineering": "Automotive and Robotics Engineering",
+        "automotive and robotics engineering": "Automotive and Robotics Engineering",
+        "automotive robotics engineering": "Automotive and Robotics Engineering",
+
+        "PDA": "PDE",
+        "ADC": "PDE",
+        "Product Design": "Product Design Engineering",
+        "product design engineering": "Product Design Engineering",
+        "product design": "Product Design Engineering",
+
+        "BA": "BE",
+        "business engineering": "Business Engineering",
+        "business engineer": "Business Engineering",
     }
 
     for wrong, correct in replacements.items():
@@ -492,6 +559,30 @@ def light_original_cleanup(text):
         "ネウス": "ビヌス",
         "ヴィヌス": "ビヌス",
 
+        # BINUS ASO major names
+        "AROI": "ARE",
+        "Aroi": "ARE",
+        "ARO": "ARE",
+        "エーアールイー": "ARE",
+        "エーアール": "ARE",
+        "自動車ロボティクス": "ARE",
+        "自動車とロボット工学": "ARE",
+
+        "PDA": "PDE",
+        "ADC": "PDE",
+        "PD ": "PDE ",
+        "PE ": "PDE ",
+        "ピーディーイー": "PDE",
+        "ピーディー": "PDE",
+        "プロダクトデザイン": "PDE",
+        "製品デザイン工学": "PDE",
+        "製品設計": "PDE",
+
+        "BA": "BE",
+        "ビーイー": "BE",
+        "ビジネス工学": "BE",
+        "ビジネスエンジニアリング": "BE",
+
         # Common sentence cleanup
         "または急に止まると": "モーターが急に止まると",
         "急に止まると完成": "急に止まると、慣性",
@@ -567,6 +658,9 @@ def normalize_key_term_line(term, meaning):
         "PID",
         "IPM",
         "YOLO",
+        "ARE",
+        "PDE",
+        "BE",
     }
 
     # If the LLM gives English-to-English, convert common terms back to
@@ -588,6 +682,18 @@ def normalize_key_term_line(term, meaning):
         "binus aso": ("ビヌスASO", "BINUS ASO"),
         "binus university": ("ビヌス大学", "BINUS University"),
         "binus": ("ビヌス", "BINUS"),
+        "automotive and robotics engineering": ("ARE", "Automotive and Robotics Engineering"),
+        "automotive robotics engineering": ("ARE", "Automotive and Robotics Engineering"),
+        "aroi": ("ARE", "Automotive and Robotics Engineering"),
+        "are": ("ARE", "Automotive and Robotics Engineering"),
+        "product design engineering": ("PDE", "Product Design Engineering"),
+        "product design": ("PDE", "Product Design Engineering"),
+        "pda": ("PDE", "Product Design Engineering"),
+        "adc": ("PDE", "Product Design Engineering"),
+        "pde": ("PDE", "Product Design Engineering"),
+        "business engineering": ("BE", "Business Engineering"),
+        "business engineer": ("BE", "Business Engineering"),
+        "be": ("BE", "Business Engineering"),
     }
 
     lowered_term = term.lower()
@@ -617,6 +723,12 @@ def normalize_key_term_line(term, meaning):
                 meaning = "Autonomous Emergency Braking"
             elif term == "ADAS":
                 meaning = "Advanced Driver Assistance Systems"
+            elif term == "ARE":
+                meaning = "Automotive and Robotics Engineering"
+            elif term == "PDE":
+                meaning = "Product Design Engineering"
+            elif term == "BE":
+                meaning = "Business Engineering"
 
         if meaning:
             return f"{term} = {meaning}"
@@ -1216,6 +1328,14 @@ Rules:
   ビヌス = BINUS
   ビヌスASO = BINUS ASO
   ビヌス大学 = BINUS University
+  ARE = Automotive and Robotics Engineering
+  PDE = Product Design Engineering
+  BE = Business Engineering
+- Major-name correction rules:
+  If the topic is BINUS ASO majors or students, correct AROI / ARO to ARE when it means Automotive and Robotics Engineering.
+  If the topic is BINUS ASO majors or students, correct PDA / ADC / PD to PDE when it means Product Design Engineering.
+  If the topic is BINUS ASO majors or students, correct BA / B to BE only when it clearly means Business Engineering.
+  Do not change normal words to ARE/PDE/BE unless the context is clearly about majors/programs.
 - Context-only Summer Course rule:
   If the topic is clearly the ASO/BINUS Summer Course program, and the transcript says 様様, 様々, さまざま, or チーム where "course/program" makes more sense, correct it to サマーコース.
   Do NOT correct チーム when it really means team.
@@ -1339,7 +1459,9 @@ def soniox_live_worker(
                 "Japanese automotive engineering, CAD, product design, vehicle systems, "
                 "braking systems, vehicle control, TTC, Time To Collision, AEB, "
                 "inertia compensation, classroom interpretation, technical terms, "
-                "Summer Course, BINUS, BINUS ASO, BINUS University, ビヌス大学"
+                "Summer Course, BINUS, BINUS ASO, BINUS University, ビヌス大学, "
+                "ARE, Automotive and Robotics Engineering, PDE, Product Design Engineering, "
+                "BE, Business Engineering"
             )
 
         elif domain_mode == "automotive":
@@ -1392,6 +1514,11 @@ def soniox_live_worker(
                             "In the ASO/BINUS Summer Course context only, if a phrase sounds like 様様, 様々, さまざま, or チーム but the sentence is clearly about the course/program, it may mean サマーコース. Do not force this correction when it really means various or team. "
                             "ビヌス means BINUS. ビヌスASO means BINUS ASO. "
                             "ビヌス大学 means BINUS University. "
+                            "ARE means Automotive and Robotics Engineering. "
+                            "PDE means Product Design Engineering. "
+                            "BE means Business Engineering. "
+                            "If speech sounds like AROI or ARO in the BINUS ASO major context, it is probably ARE. "
+                            "If speech sounds like PDA or ADC in the BINUS ASO major context, it is probably PDE. "
                             "If Japanese sounds like ネウス大学, ビーナス大学, or ビナス大学, "
                             "it is probably ビヌス大学 / BINUS University."
                         ),
