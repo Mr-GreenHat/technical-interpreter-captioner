@@ -839,6 +839,22 @@ def gemini_live_translate_worker(
                                 first_output_seen = False
                                 result_queue.put({"type": "cleared"})
 
+                            elif command == "soft_clear_worker":
+                                # After AI correction is applied, keep the corrected UI visible
+                                # but reset Gemini's internal accumulated transcript.
+                                # This prevents the next live token from sending old+new text.
+                                pcm16_buffer = bytearray()
+                                live_original = ""
+                                live_translation = ""
+                                last_text_time = time.time()
+                                reset_sent = False
+                                first_input_seen = False
+                                first_output_seen = False
+                                result_queue.put({
+                                    "type": "debug",
+                                    "message": "Gemini worker soft-cleared after AI correction.",
+                                })
+
                         except queue.Empty:
                             break
 
@@ -1072,7 +1088,7 @@ def source_text_matches_for_correction(current_source, corrected_source):
 
     # Stricter match:
     # old AI correction should not keep overriding a new live segment.
-    return overlap_a >= 0.85 and overlap_b >= 0.70
+    return overlap_a >= 0.90 and overlap_b >= 0.80
 
 
 def build_llm_context(context_chunks, current_original, current_translation):
@@ -1456,6 +1472,17 @@ def soniox_live_worker(
                         final_translation = ""
                         last_token_time = time.time()
                         result_queue.put({"type": "cleared"})
+
+                    elif command == "soft_clear_worker":
+                        # After AI correction is applied, keep the corrected UI visible
+                        # but reset Soniox's accumulated transcript.
+                        final_original = ""
+                        final_translation = ""
+                        last_token_time = time.time()
+                        result_queue.put({
+                            "type": "debug",
+                            "message": "Soniox worker soft-cleared after AI correction.",
+                        })
 
                     elif isinstance(command, dict):
                         if command.get("type") == "set_reset_seconds":
@@ -2161,6 +2188,14 @@ while not st.session_state.llm_result_queue.empty():
         if has_ai_update:
             st.session_state.caption_stage = "ai_corrected"
             st.session_state.correction_status = "applied"
+
+            # Important:
+            # Keep the AI-corrected text visible, but reset the live worker's
+            # internal transcript buffer. Otherwise the next live token may
+            # return old+new text and look like the app went backwards.
+            if st.session_state.soniox_running:
+                st.session_state.soniox_control_queue.put("soft_clear_worker")
+
         else:
             st.session_state.caption_stage = "raw_english"
             st.session_state.correction_status = "no_change"
