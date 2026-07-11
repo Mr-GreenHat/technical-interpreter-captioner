@@ -339,11 +339,16 @@ def light_original_cleanup(text):
     replacements = {
         # TTC correction
         "ABC": "TTC",
+        "abc": "TTC",
+        "ＡＢＣ": "TTC",
+        "A B C": "TTC",
         "エービーシー": "TTC",
+        "エイビーシー": "TTC",
+        "エー・ビー・シー": "TTC",
         "エービーシーが": "TTCが",
         "ABCが": "TTCが",
 
-        # 慣性補償 correction
+        # 慣性補償 correction - single term
         "感性補償": "慣性補償",
         "感性保証": "慣性補償",
         "感性保障": "慣性補償",
@@ -351,12 +356,36 @@ def light_original_cleanup(text):
         "完成補償": "慣性補償",
         "完成保障": "慣性補償",
         "慣性保障": "慣性補償",
+        "慣性補償性": "慣性補償",
+        "慣性補償御": "慣性補償",
+        "慣性補償償": "慣性補償",
 
+        # 慣性補償制御 correction - control term
         "感性補償制御": "慣性補償制御",
         "感性保証制御": "慣性補償制御",
         "完成保証制御": "慣性補償制御",
         "完成補償制御": "慣性補償制御",
         "慣性保障制御": "慣性補償制御",
+        "慣性補償性制御": "慣性補償制御",
+        "慣性補償制御御": "慣性補償制御",
+        "慣性補償制御制御": "慣性補償制御",
+        "慣性補償制御について": "慣性補償制御について",
+
+        # 慣性 / inertia context correction
+        "感性の影響": "慣性の影響",
+        "完成の影響": "慣性の影響",
+        "慣性の駅": "慣性の影響",
+        "完成の駅": "慣性の影響",
+        "感性で位置": "慣性で位置",
+        "完成で位置": "慣性で位置",
+        "感性により": "慣性により",
+        "完成により": "慣性により",
+
+        # Common sentence cleanup
+        "または急に止まると": "モーターが急に止まると",
+        "急に止まると完成": "急に止まると、慣性",
+        "位置がずる": "位置がずれる",
+        "位置がずれます": "位置がずれます",
     }
 
     for wrong, correct in replacements.items():
@@ -826,6 +855,40 @@ def make_context_chunk(original_text, translation_text):
     ).strip()
 
 
+
+def source_text_matches_for_correction(current_source, corrected_source):
+    """
+    Live captions change every rerun, so exact equality is too strict.
+    This allows LLM corrected Japanese/English to apply when the current
+    live text is still basically the same segment.
+    """
+    current_source = (current_source or "").strip()
+    corrected_source = (corrected_source or "").strip()
+
+    if not current_source or not corrected_source:
+        return False
+
+    if current_source == corrected_source:
+        return True
+
+    if corrected_source in current_source:
+        return True
+
+    if current_source in corrected_source:
+        return True
+
+    # Japanese/English live captions may change by a few characters.
+    # Compare character overlap.
+    current_set = set(current_source)
+    corrected_set = set(corrected_source)
+
+    if not current_set or not corrected_set:
+        return False
+
+    overlap = len(current_set & corrected_set) / max(1, len(corrected_set))
+    return overlap >= 0.65
+
+
 def build_llm_context(context_chunks, current_original, current_translation):
     chunks = list(context_chunks or [])
 
@@ -943,9 +1006,12 @@ Rules:
 - If STT or translation uses a wrong technical term, add it to corrections.
 - If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
 - Prefer corrected technical terms in key_terms.
-- Also fix obvious Japanese original mistakes in corrected_japanese_original.
+- Also fix obvious Japanese Original mistakes in corrected_japanese_original.
 - corrected_japanese_original must stay Japanese and close to the original.
 - Do not invent missing Japanese. Only repair obvious wrong technical words.
+- Example Japanese correction: 感性の影響 -> 慣性の影響.
+- Example Japanese correction: 慣性補償性制御 -> 慣性補償制御.
+- Example Japanese correction: 完成の駅 -> 慣性の影響.
 - For key_terms, use the Japanese source technical term when possible, for example "慣性補償 = inertia compensation".
 - Do not output English-to-English key terms like "inertia compensation = Control technique...".
 - Only output important technical words, not normal words.
@@ -1924,7 +1990,10 @@ current_source_for_display = build_llm_context(
 if (
     use_llm_hints
     and st.session_state.llm_corrected_source_text
-    and current_source_for_display == st.session_state.llm_corrected_source_text
+    and source_text_matches_for_correction(
+        current_source_for_display,
+        st.session_state.llm_corrected_source_text,
+    )
 ):
     if st.session_state.llm_corrected_japanese_original:
         corrected_original = apply_llm_corrections(
@@ -2070,6 +2139,7 @@ if show_debug:
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
+            f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
             f"corrections={st.session_state.llm_corrections}\n"
             f"error={st.session_state.llm_error}"
         )
