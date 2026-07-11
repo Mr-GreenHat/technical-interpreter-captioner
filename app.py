@@ -26,8 +26,8 @@ SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
 DEFAULT_RESET_SECONDS = 3.0
-MAX_ORIGINAL_CHARS = 160
-MAX_TRANSLATION_CHARS = 260
+MAX_ORIGINAL_CHARS = 300
+MAX_TRANSLATION_CHARS = 480
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
@@ -45,8 +45,8 @@ GEMINI_LIVE_WS_URL = (
 ENGINE_SONIOX = "Reliable Mode - Soniox + Gemini 3.1 correction"
 ENGINE_GEMINI_LIVE = "Gemini Mode - Gemini 3.5 Live Translate + Gemini 3.1 correction"
 
-DEFAULT_LLM_HINT_INTERVAL = 30.0
-MIN_LLM_CONTEXT_CHARS = 160
+DEFAULT_LLM_HINT_INTERVAL = 12.0
+MIN_LLM_CONTEXT_CHARS = 80
 MAX_LLM_CONTEXT_CHUNKS = 6
 
 
@@ -998,8 +998,9 @@ Rules:
 - Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
 - Do not rewrite "I" as "the speaker" unless the original meaning is third-person.
 - Use previous context only to repair unclear wording and technical terms.
-- Repair obvious STT/translation mistakes in technical terms.
+- Repair obvious STT/translation mistakes in technical terms quickly.
 - Repair awkward English sentence structure so the caption sounds natural.
+- Return the corrected_japanese_original and corrected_english_caption even for short segments.
 - Keep the corrected English caption close to the current English translation.
 - Preserve technical terms from the glossary.
 - If the transcript is unclear, make the safest minimal correction.
@@ -1051,7 +1052,7 @@ Return JSON in this exact format:
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=420,
+                max_output_tokens=650,
             ),
         )
 
@@ -1473,14 +1474,15 @@ with st.sidebar:
 
     llm_hint_interval = st.slider(
         "LLM update interval",
-        min_value=15.0,
+        min_value=8.0,
         max_value=90.0,
         value=DEFAULT_LLM_HINT_INTERVAL,
-        step=5.0,
+        step=2.0,
     )
 
     st.caption(
-        "Helper AI is Gemini 3.1 Flash-Lite. Translation is Soniox in Reliable Mode, or Gemini 3.5 Live Translate in Gemini Mode."
+        "Helper AI is Gemini 3.1 Flash-Lite. Translation is Soniox in Reliable Mode, or Gemini 3.5 Live Translate in Gemini Mode. "
+        "Lower interval = faster correction, but more API calls."
     )
 
     st.divider()
@@ -2196,8 +2198,8 @@ caption_html = f"""
     border-radius: 14px;
     background-color: #F3F4F6;
     color: #111827;
-    min-height: 70px;
-    max-height: 110px;
+    min-height: 85px;
+    max-height: 190px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
@@ -2229,8 +2231,8 @@ caption_html = f"""
     border-radius: 18px;
     background-color: #111827;
     color: white;
-    min-height: 115px;
-    max-height: 210px;
+    min-height: 130px;
+    max-height: 280px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #374151;
@@ -2251,8 +2253,8 @@ caption_html = f"""
         font-size: {jp_font_size}px;
         line-height: 1.35;
         padding: 9px;
-        min-height: 55px;
-        max-height: 90px;
+        min-height: 70px;
+        max-height: 150px;
     }}
 
 
@@ -2268,8 +2270,8 @@ caption_html = f"""
         font-size: {font_size}px;
         line-height: 1.25;
         padding: 12px;
-        min-height: 105px;
-        max-height: 185px;
+        min-height: 115px;
+        max-height: 235px;
     }}
 }}
 </style>
