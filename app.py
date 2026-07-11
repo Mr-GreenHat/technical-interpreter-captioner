@@ -173,7 +173,7 @@ EXTRA_GLOSSARY_ENTRIES = [
         "jp": "CATIA",
         "reading": "きゃてぃあ",
         "en": "CATIA",
-        "common_wrong": "キャティア;カティア;キャディア;カディア;Catia;catia;CADIA",
+        "common_wrong": "キャティア;カティア;キャディア;カディア;勝ち方;書き方;キャリア;Catia;catia;CADIA;way to win",
         "notes": "CAD software used for product design and engineering",
     },
     {
@@ -631,6 +631,10 @@ def light_caption_cleanup(text):
         "catia": "CATIA",
         "CADIA": "CATIA",
         "Catiya": "CATIA",
+        "CADIA": "CATIA",
+        "the way to win": "CATIA",
+        "way to win": "CATIA",
+        "how to win": "CATIA",
         "Computer Aided Design": "CAD",
         "computer aided design": "CAD",
         "Computer-Aided Design": "CAD",
@@ -794,6 +798,9 @@ def light_original_cleanup(text):
         "カティア": "CATIA",
         "キャディア": "CATIA",
         "カディア": "CATIA",
+        "カチア": "CATIA",
+        "勝ティア": "CATIA",
+        "勝ちア": "CATIA",
         "Catia": "CATIA",
         "catia": "CATIA",
 
@@ -851,6 +858,98 @@ def light_original_cleanup(text):
         cleaned = cleaned.replace(wrong, correct)
 
     return cleaned.strip()
+
+
+def light_domain_context_cleanup(original_text, translation_text, domain_mode):
+    """
+    Context-sensitive cleanup for terms that are dangerous to replace globally.
+
+    Example:
+    - 勝ち方 normally means "way to win", so we should not always replace it.
+    - But in a CAD / product design classroom, when the lecture mentions
+      parts, sketches, Pad, constraints, or modeling, 勝ち方 is often Gemini
+      mishearing CATIA / キャティア.
+    """
+    original_text = (original_text or "").strip()
+    translation_text = (translation_text or "").strip()
+    domain = (domain_mode or "auto").lower()
+
+    combined = f"{original_text}\n{translation_text}".lower()
+
+    cad_context_words = [
+        "catia",
+        "cad",
+        "sketch",
+        "sketcher",
+        "part",
+        "parts",
+        "pad",
+        "extrusion",
+        "extrude",
+        "fillet",
+        "chamfer",
+        "hole",
+        "constraint",
+        "constraints",
+        "dimensional",
+        "geometric",
+        "model",
+        "modeling",
+        "3d",
+        "design",
+        "product",
+        "スケッチ",
+        "スケッチャー",
+        "パート",
+        "部品",
+        "寸法",
+        "拘束",
+        "幾何",
+        "押し出し",
+        "フィレット",
+        "面取り",
+        "設計",
+        "形状",
+        "モデル",
+        "モデリング",
+    ]
+
+    is_cad_domain = domain in ["auto", "cad", "product design"]
+    has_cad_context = any(word in combined for word in cad_context_words)
+
+    if is_cad_domain and has_cad_context:
+        original_replacements = {
+            "勝ち方": "CATIA",
+            "書き方": "CATIA",
+            "キャリア": "CATIA",
+            "カチア": "CATIA",
+            "勝ティア": "CATIA",
+            "勝ちア": "CATIA",
+            "キャティア": "CATIA",
+            "カティア": "CATIA",
+            "キャディア": "CATIA",
+            "カディア": "CATIA",
+        }
+
+        translation_replacements = {
+            "the way to win": "CATIA",
+            "way to win": "CATIA",
+            "how to win": "CATIA",
+            "winning method": "CATIA",
+            "So, the way to win": "So, in CATIA",
+            "So the way to win": "So in CATIA",
+            "the winning method": "CATIA",
+            "career": "CATIA",
+            "Carrier": "CATIA",
+        }
+
+        for wrong, correct in original_replacements.items():
+            original_text = original_text.replace(wrong, correct)
+
+        for wrong, correct in translation_replacements.items():
+            translation_text = translation_text.replace(wrong, correct)
+
+    return original_text.strip(), translation_text.strip()
 
 
 
@@ -955,6 +1054,9 @@ def normalize_key_term_line(term, meaning):
         "be": ("BE", "Business Engineering"),
 
         "catia": ("CATIA", "CATIA"),
+        "way to win": ("CATIA", "CATIA"),
+        "how to win": ("CATIA", "CATIA"),
+        "career": ("CATIA", "CATIA"),
         "cad": ("CAD", "Computer-Aided Design"),
         "computer aided design": ("CAD", "Computer-Aided Design"),
         "computer-aided design": ("CAD", "Computer-Aided Design"),
@@ -1622,6 +1724,9 @@ Rules:
   ロータリーエンジン = rotary engine
 - CATIA / CAD correction rules:
   Preserve CATIA and CAD exactly as acronyms.
+  If the CAD/Product Design topic is clearly about parts, sketches, constraints, Pad, or modeling,
+  correct 勝ち方 / 書き方 / キャリア / "way to win" to CATIA.
+  Do NOT correct 勝ち方 when the topic is truly about winning or competition.
   スケッチャー = Sketcher
   寸法拘束 = dimensional constraint
   幾何拘束 = geometric constraint
@@ -2077,6 +2182,7 @@ with st.sidebar:
         "Technical domain",
         ["auto", "automotive", "cad", "product design"],
         index=0,
+        help="For CATIA classes, choose 'cad' or 'product design' so CATIA is not misheard as 勝ち方 / way to win.",
     )
 
     subtitle_display = st.radio(
@@ -2476,6 +2582,11 @@ while not st.session_state.soniox_result_queue.empty():
     if item_type == "tokens":
         original = item.get("original", "")
         translation = item.get("translation", "")
+        original, translation = light_domain_context_cleanup(
+            original,
+            translation,
+            domain_mode,
+        )
 
         if original or translation:
             st.session_state.live_token_version += 1
@@ -2653,6 +2764,11 @@ while not st.session_state.llm_result_queue.empty():
                     st.session_state.llm_corrections,
                 )
             )
+            corrected_base_original, corrected_base_translation = light_domain_context_cleanup(
+                corrected_base_original,
+                corrected_base_translation,
+                domain_mode,
+            )
 
             st.session_state.live_original = corrected_base_original
             st.session_state.live_translation = corrected_base_translation
@@ -2806,6 +2922,12 @@ corrected_original = apply_llm_corrections(
 corrected_translation = apply_llm_corrections(
     caption_text,
     st.session_state.llm_corrections,
+)
+
+corrected_original, corrected_translation = light_domain_context_cleanup(
+    corrected_original,
+    corrected_translation,
+    domain_mode,
 )
 
 current_source_for_display = build_llm_context(
