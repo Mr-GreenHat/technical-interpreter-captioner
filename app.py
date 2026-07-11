@@ -55,6 +55,45 @@ MIN_LLM_CONTEXT_CHARS = 80
 MAX_LLM_CONTEXT_CHUNKS = 6
 
 
+# Built-in non-technical / school event terms.
+# These are always added even when technical_terms.csv does not include them.
+EXTRA_GLOSSARY_ENTRIES = [
+    {
+        "domain": "school",
+        "jp": "サマーコース",
+        "reading": "さまーこーす",
+        "en": "Summer Course",
+        "common_wrong": "サマコース;サマー講座;summer course",
+        "notes": "ASO/BINUS summer course program",
+    },
+    {
+        "domain": "school",
+        "jp": "ビヌス",
+        "reading": "びぬす",
+        "en": "BINUS",
+        "common_wrong": "ビナス;ビーナス;ネウス;ヴィヌス;venus;Venus",
+        "notes": "BINUS name in Japanese speech",
+    },
+    {
+        "domain": "school",
+        "jp": "ビヌスASO",
+        "reading": "びぬすえーえすおー",
+        "en": "BINUS ASO",
+        "common_wrong": "ビヌスアソ;ビヌス麻生;ビナスASO;ビーナスASO;ネウスASO;ネウスアソ;BINUS ASO",
+        "notes": "BINUS ASO program/school name",
+    },
+    {
+        "domain": "school",
+        "jp": "ビヌス大学",
+        "reading": "びぬすだいがく",
+        "en": "BINUS University",
+        "common_wrong": "ビナス大学;ビーナス大学;ネウス大学;ヴィヌス大学;BINUS University",
+        "notes": "BINUS University",
+    },
+]
+
+
+
 # ============================================================
 # Secrets
 # ============================================================
@@ -108,6 +147,28 @@ def load_soniox_context_terms(terms_file):
                         "target": en,
                     })
 
+        for extra in EXTRA_GLOSSARY_ENTRIES:
+            jp = extra.get("jp", "").strip()
+            en = extra.get("en", "").strip()
+            reading = extra.get("reading", "").strip()
+            common_wrong = extra.get("common_wrong", "").strip()
+
+            if jp:
+                terms.append(jp)
+            if reading:
+                terms.append(reading)
+            if common_wrong:
+                terms.extend([
+                    item.strip()
+                    for item in common_wrong.split(";")
+                    if item.strip()
+                ])
+            if jp and en:
+                translation_terms.append({
+                    "source": jp,
+                    "target": en,
+                })
+
         terms = list(dict.fromkeys(terms))
 
         unique_translation_terms = []
@@ -154,6 +215,14 @@ def load_glossary_entries(terms_file):
 
     except Exception:
         pass
+
+    existing = set((item.get("jp", ""), item.get("en", "")) for item in entries)
+
+    for extra in EXTRA_GLOSSARY_ENTRIES:
+        key = (extra.get("jp", ""), extra.get("en", ""))
+        if key not in existing:
+            entries.append(extra)
+            existing.add(key)
 
     return entries
 
@@ -302,6 +371,19 @@ def light_caption_cleanup(text):
         "fixture": "jig",
         "quality management": "quality control",
         "bad product": "defective product",
+
+        # School / event terms
+        "Venus University": "BINUS University",
+        "Neus University": "BINUS University",
+        "Binus University": "BINUS University",
+        "BINUS university": "BINUS University",
+        "Venus ASO": "BINUS ASO",
+        "Neus ASO": "BINUS ASO",
+        "Binus ASO": "BINUS ASO",
+        "Venus": "BINUS",
+        "Neus": "BINUS",
+        "Binus": "BINUS",
+        "summer course": "Summer Course",
     }
 
     for wrong, correct in replacements.items():
@@ -386,6 +468,27 @@ def light_original_cleanup(text):
         "感性により": "慣性により",
         "完成により": "慣性により",
 
+        # School / event terms
+        "サマコース": "サマーコース",
+        "サマー講座": "サマーコース",
+
+        "ビナスASO": "ビヌスASO",
+        "ビーナスASO": "ビヌスASO",
+        "ネウスASO": "ビヌスASO",
+        "ネウスアソ": "ビヌスASO",
+        "ビヌスアソ": "ビヌスASO",
+        "ビヌス麻生": "ビヌスASO",
+
+        "ビナス大学": "ビヌス大学",
+        "ビーナス大学": "ビヌス大学",
+        "ネウス大学": "ビヌス大学",
+        "ヴィヌス大学": "ビヌス大学",
+
+        "ビナス": "ビヌス",
+        "ビーナス": "ビヌス",
+        "ネウス": "ビヌス",
+        "ヴィヌス": "ビヌス",
+
         # Common sentence cleanup
         "または急に止まると": "モーターが急に止まると",
         "急に止まると完成": "急に止まると、慣性",
@@ -463,6 +566,10 @@ def normalize_key_term_line(term, meaning):
         "following distance": ("車間距離", "following distance"),
         "relative speed": ("相対速度", "relative speed"),
         "lever": ("レバー", "lever"),
+        "summer course": ("サマーコース", "Summer Course"),
+        "binus aso": ("ビヌスASO", "BINUS ASO"),
+        "binus university": ("ビヌス大学", "BINUS University"),
+        "binus": ("ビヌス", "BINUS"),
     }
 
     lowered_term = term.lower()
@@ -681,6 +788,13 @@ def gemini_live_translate_worker(
             })
 
             async def send_audio_loop():
+                nonlocal live_original
+                nonlocal live_translation
+                nonlocal last_text_time
+                nonlocal reset_sent
+                nonlocal first_input_seen
+                nonlocal first_output_seen
+
                 pcm16_buffer = bytearray()
                 last_send_time = time.time()
 
@@ -690,7 +804,15 @@ def gemini_live_translate_worker(
                             command = control_queue.get_nowait()
 
                             if command == "clear":
+                                # Clear the Gemini worker's internal accumulated text too.
+                                # Otherwise old text can return after pressing Clear Captions.
                                 pcm16_buffer = bytearray()
+                                live_original = ""
+                                live_translation = ""
+                                last_text_time = time.time()
+                                reset_sent = False
+                                first_input_seen = False
+                                first_output_seen = False
                                 result_queue.put({"type": "cleared"})
 
                         except queue.Empty:
@@ -1051,7 +1173,14 @@ Rules:
 - Example Japanese correction: 完成の駅 -> 慣性の影響.
 - For key_terms, use the Japanese source technical term when possible, for example "慣性補償 = inertia compensation".
 - Do not output English-to-English key terms like "inertia compensation = Control technique...".
-- Only output important technical words, not normal words.
+- Also preserve school/event names:
+  サマーコース = Summer Course
+  ビヌス = BINUS
+  ビヌスASO = BINUS ASO
+  ビヌス大学 = BINUS University
+- If the transcript says ネウス大学, ビーナス大学, or ビナス大学 in this school context, correct it to ビヌス大学.
+- Key terms may include important school/event names when relevant.
+- Only output important technical words or important proper nouns, not normal words.
 - Example correction:
   {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
 
@@ -1167,7 +1296,8 @@ def soniox_live_worker(
             domain_text = (
                 "Japanese automotive engineering, CAD, product design, vehicle systems, "
                 "braking systems, vehicle control, TTC, Time To Collision, AEB, "
-                "inertia compensation, classroom interpretation, technical terms"
+                "inertia compensation, classroom interpretation, technical terms, "
+                "Summer Course, BINUS, BINUS ASO, BINUS University, ビヌス大学"
             )
 
         elif domain_mode == "automotive":
@@ -1215,7 +1345,12 @@ def soniox_live_worker(
                             "If speech sounds like ABC in AEB context, it is probably TTC. "
                             "慣性補償 means inertia compensation. "
                             "Do not translate 慣性補償 as sensory compensation, completion assurance, "
-                            "or completion compensation."
+                            "or completion compensation. "
+                            "サマーコース means Summer Course. "
+                            "ビヌス means BINUS. ビヌスASO means BINUS ASO. "
+                            "ビヌス大学 means BINUS University. "
+                            "If Japanese sounds like ネウス大学, ビーナス大学, or ビナス大学, "
+                            "it is probably ビヌス大学 / BINUS University."
                         ),
                     },
                     {
@@ -1288,8 +1423,10 @@ def soniox_live_worker(
                     command = control_queue.get_nowait()
 
                     if command == "clear":
+                        # Clear worker-side accumulated text so old captions do not return.
                         final_original = ""
                         final_translation = ""
+                        last_token_time = time.time()
                         result_queue.put({"type": "cleared"})
 
                     elif isinstance(command, dict):
@@ -1520,7 +1657,8 @@ with st.sidebar:
         "Helper AI is Gemini 3.1 Flash-Lite and stays separate. "
         "Gemini Mode sends smaller audio chunks so Japanese can appear first; "
         "English appears when Gemini Live returns translation. "
-        "Lower LLM interval = faster correction, but more API calls."
+        "Lower LLM interval = faster correction, but more API calls. "
+        "Built-in terms include サマーコース, ビヌス, ビヌスASO, ビヌス大学."
     )
 
     st.divider()
@@ -1763,6 +1901,8 @@ if clear_clicked:
 
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
+        st.session_state.debug_messages.append("Clear requested.")
+        st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
 
 
 # ============================================================
@@ -1868,12 +2008,6 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.last_ai_check_time = ""
             st.session_state.correction_status = "pending"
             st.session_state.pending_visual_reset = False
-        st.session_state.caption_stage = "idle"
-        st.session_state.last_raw_input_time = ""
-        st.session_state.last_raw_translation_time = ""
-        st.session_state.last_helper_fix_time = ""
-        st.session_state.last_ai_check_time = ""
-        st.session_state.correction_status = "idle"
 
         if original:
             st.session_state.live_original = original
@@ -1934,8 +2068,23 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
         st.session_state.llm_context_chunks = []
+        st.session_state.llm_main_idea = ""
+        st.session_state.llm_say_it_simply = ""
+        st.session_state.llm_corrected_japanese_original = ""
+        st.session_state.llm_corrected_english_caption = ""
+        st.session_state.llm_corrected_source_text = ""
+        st.session_state.llm_key_terms = []
         st.session_state.llm_corrections = []
+        st.session_state.llm_error = ""
+        st.session_state.llm_last_source_text = ""
+        st.session_state.llm_running = False
         st.session_state.pending_visual_reset = False
+        st.session_state.caption_stage = "idle"
+        st.session_state.last_raw_input_time = ""
+        st.session_state.last_raw_translation_time = ""
+        st.session_state.last_helper_fix_time = ""
+        st.session_state.last_ai_check_time = ""
+        st.session_state.correction_status = "idle"
 
     elif item_type == "debug":
         message = item.get("message", "")
