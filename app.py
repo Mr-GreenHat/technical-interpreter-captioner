@@ -5,6 +5,8 @@ import json
 import queue
 import threading
 import time
+import tempfile
+import wave
 
 import av
 import numpy as np
@@ -29,8 +31,15 @@ MAX_TRANSLATION_CHARS = 260
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
-LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
-LLM_MODEL_BACKUP = "gemini-3.1-flash-lite"
+LLM_MODEL_DEFAULT = "gemini-2.5-flash-lite"
+LLM_MODEL_BACKUP = "gemini-2.5-flash"
+
+GEMINI_AUDIO_MODEL_DEFAULT = "gemini-2.5-flash-lite"
+GEMINI_AUDIO_MODEL_BACKUP = "gemini-2.5-flash"
+DEFAULT_GEMINI_AUDIO_CHUNK_SECONDS = 5.0
+
+ENGINE_RELIABLE = "Reliable Mode - Soniox + Gemini correction"
+ENGINE_FREE = "Free Mode - Gemini audio translation"
 
 DEFAULT_LLM_HINT_INTERVAL = 30.0
 MIN_LLM_CONTEXT_CHARS = 160
@@ -566,6 +575,288 @@ Return JSON in this exact format:
         })
 
 
+
+# ============================================================
+# Gemini audio translation worker
+# ============================================================
+
+def parse_gemini_audio_json(text):
+    if not text:
+        return {
+            "japanese_original": "",
+            "english_caption": "",
+            "corrected_english_caption": "",
+            "key_terms": [],
+            "corrections": [],
+        }
+
+    cleaned = text.strip()
+
+    if cleaned.startswith("```json"):
+        cleaned = cleaned.replace("```json", "", 1).strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```", "", 1).strip()
+
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+
+    try:
+        data = json.loads(cleaned)
+
+        return {
+            "japanese_original": str(data.get("japanese_original", "")).strip(),
+            "english_caption": str(data.get("english_caption", "")).strip(),
+            "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
+            "key_terms": data.get("key_terms", []),
+            "corrections": data.get("corrections", []),
+        }
+
+    except Exception:
+        return {
+            "japanese_original": "",
+            "english_caption": cleaned[:500],
+            "corrected_english_caption": cleaned[:500],
+            "key_terms": [],
+            "corrections": [],
+        }
+
+
+def build_gemini_audio_prompt(domain_mode, key_terms):
+    glossary_text = ""
+
+    if key_terms:
+        glossary_lines = []
+
+        for item in key_terms[:20]:
+            jp = item.get("jp", "")
+            en = item.get("en", "")
+            notes = item.get("notes", "")
+
+            if notes:
+                glossary_lines.append(f"- {jp} = {en} ({notes})")
+            else:
+                glossary_lines.append(f"- {jp} = {en}")
+
+        glossary_text = "\n".join(glossary_lines)
+
+    if domain_mode == "auto":
+        domain_text = (
+            "Japanese automotive engineering, CAD, product design, vehicle systems, "
+            "braking systems, vehicle control, TTC, Time To Collision, AEB, "
+            "inertia compensation, classroom interpretation, technical terms"
+        )
+    elif domain_mode == "automotive":
+        domain_text = (
+            "Japanese automotive engineering class, vehicle systems, braking systems, "
+            "drivetrain, suspension, steering, ADAS, AEB, TTC, Time To Collision, "
+            "vehicle control, inertia compensation"
+        )
+    elif domain_mode == "cad":
+        domain_text = (
+            "Japanese CAD class, sketch constraints, dimensions, extrusion, chamfering, "
+            "fillet, technical drawing, projection drawing, product modeling"
+        )
+    elif domain_mode == "product design":
+        domain_text = (
+            "Japanese product design class, design process, CAD modeling, dimensions, "
+            "materials, usability, product development, prototyping"
+        )
+    else:
+        domain_text = "Japanese technical classroom interpretation"
+
+    prompt = f"""
+You are a Japanese-to-English technical interpreter caption system.
+
+Task:
+1. Listen to this short audio chunk.
+2. Transcribe the Japanese speech.
+3. Translate it into natural English.
+4. Repair obvious technical term mistakes and awkward English.
+5. Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
+6. Do not summarize. Do not add new information.
+7. Keep the English caption close to what was spoken.
+8. If audio is silent or unclear, return empty strings.
+
+Domain:
+{domain_text}
+
+Important rules:
+- TTC means Time To Collision.
+- If speech sounds like ABC in AEB context, it is probably TTC.
+- 慣性補償 means inertia compensation.
+- Do not translate 慣性補償 as sensory compensation, completion assurance, or completion compensation.
+- Use short readable English captions.
+- Prefer technical terms from the glossary.
+
+Glossary:
+{glossary_text}
+
+Return JSON only in this exact format:
+{{
+  "japanese_original": "Japanese transcript from this audio chunk",
+  "english_caption": "direct English translation from this audio chunk",
+  "corrected_english_caption": "natural corrected English caption, same meaning, no summary",
+  "key_terms": [
+    {{"term": "technical term", "meaning": "short meaning"}}
+  ],
+  "corrections": [
+    {{"wrong": "wrong word or phrase", "correct": "correct word or phrase", "reason": "short reason"}}
+  ]
+}}
+""".strip()
+
+    return prompt
+
+
+def write_pcm16_wav(path, pcm_bytes, sample_rate=48000):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+
+def gemini_audio_worker(
+    audio_queue,
+    result_queue,
+    stop_event,
+    control_queue,
+    api_key,
+    terms_file,
+    domain_mode,
+    model_name,
+    chunk_seconds,
+):
+    try:
+        client = genai.Client(api_key=api_key)
+        glossary_entries = load_glossary_entries(terms_file)
+        prompt = build_gemini_audio_prompt(domain_mode, glossary_entries)
+
+        result_queue.put({
+            "type": "debug",
+            "message": "Gemini free audio mode started.",
+        })
+
+        bytes_per_second = 48000 * 2
+        target_bytes = int(float(chunk_seconds) * bytes_per_second)
+        audio_buffer = bytearray()
+
+        while not stop_event.is_set():
+            while control_queue is not None and not control_queue.empty():
+                try:
+                    command = control_queue.get_nowait()
+
+                    if command == "clear":
+                        audio_buffer = bytearray()
+                        result_queue.put({"type": "cleared"})
+
+                    elif isinstance(command, dict):
+                        if command.get("type") == "set_reset_seconds":
+                            pass
+
+                except queue.Empty:
+                    break
+
+            try:
+                audio_bytes = audio_queue.get(timeout=0.1)
+                if audio_bytes:
+                    audio_buffer.extend(audio_bytes)
+
+            except queue.Empty:
+                continue
+
+            if len(audio_buffer) < target_bytes:
+                continue
+
+            chunk = bytes(audio_buffer[:target_bytes])
+            audio_buffer = audio_buffer[target_bytes:]
+
+            tmp_path = None
+
+            try:
+                with tempfile.NamedTemporaryFile(
+                    suffix=".wav",
+                    delete=False,
+                ) as tmp:
+                    tmp_path = tmp.name
+
+                write_pcm16_wav(tmp_path, chunk, sample_rate=48000)
+
+                uploaded_file = client.files.upload(file=tmp_path)
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        prompt,
+                        uploaded_file,
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=600,
+                    ),
+                )
+
+                parsed = parse_gemini_audio_json(response.text)
+
+                original = light_original_cleanup(parsed.get("japanese_original", ""))
+                english = parsed.get("corrected_english_caption", "") or parsed.get("english_caption", "")
+                english = light_caption_cleanup(english)
+
+                corrections = parsed.get("corrections", [])
+                key_terms = parsed.get("key_terms", [])
+
+                if original or english:
+                    result_queue.put({
+                        "type": "tokens",
+                        "original": original,
+                        "translation": english,
+                        "endpoint": True,
+                    })
+
+                    result_queue.put({
+                        "type": "llm_hint",
+                        "main_idea": "",
+                        "say_it_simply": "",
+                        "corrected_english_caption": english,
+                        "source_text": make_context_chunk(original, english),
+                        "key_terms": key_terms,
+                        "corrections": corrections,
+                    })
+
+                    result_queue.put({
+                        "type": "page_reset",
+                    })
+
+            except Exception as e:
+                if not stop_event.is_set():
+                    result_queue.put({
+                        "type": "error",
+                        "message": f"Gemini audio error: {e}",
+                    })
+                break
+
+            finally:
+                if tmp_path:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+    except Exception as e:
+        if not stop_event.is_set():
+            result_queue.put({
+                "type": "error",
+                "message": str(e),
+            })
+
+    finally:
+        result_queue.put({
+            "type": "stopped",
+        })
+
+
+
 # ============================================================
 # Audio processor
 # ============================================================
@@ -882,8 +1173,8 @@ st.set_page_config(
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English live captions using Soniox real-time translation, "
-    "technical glossary, and optional LLM interpreter support."
+    "Japanese → English live captions. Reliable Mode uses Soniox + Gemini correction. "
+    "Free Mode uses Gemini audio translation + correction."
 )
 
 
@@ -893,6 +1184,15 @@ st.caption(
 
 with st.sidebar:
     st.header("Settings")
+
+    translation_engine = st.selectbox(
+        "Translation engine",
+        [
+            ENGINE_RELIABLE,
+            ENGINE_FREE,
+        ],
+        index=0,
+    )
 
     domain_mode = st.selectbox(
         "Technical domain",
@@ -961,8 +1261,25 @@ with st.sidebar:
         step=5.0,
     )
 
+    gemini_audio_model_name = st.selectbox(
+        "Gemini free audio model",
+        [
+            GEMINI_AUDIO_MODEL_DEFAULT,
+            GEMINI_AUDIO_MODEL_BACKUP,
+        ],
+        index=0,
+    )
+
+    gemini_audio_chunk_seconds = st.slider(
+        "Gemini audio chunk seconds",
+        min_value=3.0,
+        max_value=12.0,
+        value=DEFAULT_GEMINI_AUDIO_CHUNK_SECONDS,
+        step=1.0,
+    )
+
     st.caption(
-        "Soniox handles live translation. The LLM is ON by default and repairs technical terms plus awkward English in the final caption."
+        "Reliable Mode uses Soniox for live translation. Free Mode uses Gemini audio chunks. Gemini correction is ON by default."
     )
 
     st.divider()
@@ -1005,6 +1322,7 @@ defaults = {
     "app_active": False,
     "pending_start_translation": False,
     "mic_instance_id": 0,
+    "current_engine": "",
 
     "live_original": "",
     "live_translation": "",
@@ -1039,6 +1357,19 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
+if st.session_state.current_engine and st.session_state.current_engine != translation_engine:
+    st.session_state.app_active = False
+    st.session_state.pending_start_translation = False
+    st.session_state.soniox_running = False
+    st.session_state.soniox_stop_event.set()
+    st.session_state.mic_instance_id += 1
+    st.session_state.current_engine = translation_engine
+    st.rerun()
+
+if not st.session_state.current_engine:
+    st.session_state.current_engine = translation_engine
+
+
 if float(reset_seconds) != float(st.session_state.last_reset_seconds):
     st.session_state.last_reset_seconds = float(reset_seconds)
 
@@ -1054,16 +1385,23 @@ if float(reset_seconds) != float(st.session_state.last_reset_seconds):
 # ============================================================
 
 api_key = safe_get_secret_or_env("SONIOX_API_KEY")
+gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
 
-if not api_key:
+if translation_engine == ENGINE_RELIABLE and not api_key:
     st.error(
         "SONIOX_API_KEY is not set.\n\n"
-        "For Streamlit Cloud, add this in Secrets:\n\n"
+        "Reliable Mode needs Soniox. For Streamlit Cloud, add this in Secrets:\n\n"
         'SONIOX_API_KEY = "your_soniox_api_key_here"'
     )
     st.stop()
 
-gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
+if translation_engine == ENGINE_FREE and not gemini_api_key:
+    st.error(
+        "GEMINI_API_KEY is not set.\n\n"
+        "Free Mode needs Gemini. For Streamlit Cloud, add this in Secrets:\n\n"
+        'GEMINI_API_KEY = "your_gemini_api_key_here"'
+    )
+    st.stop()
 
 if use_llm_hints and not gemini_api_key:
     st.warning(
@@ -1206,9 +1544,9 @@ if (
     st.session_state.soniox_running = True
     st.session_state.pending_start_translation = False
 
-    st.session_state.soniox_thread = threading.Thread(
-        target=soniox_live_worker,
-        args=(
+    if translation_engine == ENGINE_RELIABLE:
+        worker_target = soniox_live_worker
+        worker_args = (
             processor.audio_queue,
             st.session_state.soniox_result_queue,
             st.session_state.soniox_stop_event,
@@ -1217,7 +1555,24 @@ if (
             terms_file,
             domain_mode,
             float(reset_seconds),
-        ),
+        )
+    else:
+        worker_target = gemini_audio_worker
+        worker_args = (
+            processor.audio_queue,
+            st.session_state.soniox_result_queue,
+            st.session_state.soniox_stop_event,
+            st.session_state.soniox_control_queue,
+            gemini_api_key,
+            terms_file,
+            domain_mode,
+            gemini_audio_model_name,
+            float(gemini_audio_chunk_seconds),
+        )
+
+    st.session_state.soniox_thread = threading.Thread(
+        target=worker_target,
+        args=worker_args,
         daemon=True,
     )
 
@@ -1327,7 +1682,7 @@ while not st.session_state.llm_result_queue.empty():
 # Start LLM hint worker
 # ============================================================
 
-if use_llm_hints and gemini_api_key:
+if use_llm_hints and gemini_api_key and translation_engine == ENGINE_RELIABLE:
     source_text = build_llm_context(
         st.session_state.llm_context_chunks,
         st.session_state.live_original,
@@ -1380,7 +1735,10 @@ if use_llm_hints and gemini_api_key:
 # ============================================================
 
 if st.session_state.soniox_running:
-    st.success("Live translation running.")
+    if translation_engine == ENGINE_FREE:
+        st.success("Free Gemini audio translation running.")
+    else:
+        st.success("Reliable Soniox translation running.")
 elif st.session_state.app_active:
     st.info("Starting microphone...")
 else:
@@ -1514,6 +1872,9 @@ if use_llm_hints:
 
 if show_debug:
     with st.expander("Debug", expanded=True):
+        st.write("Engine:")
+        st.code(translation_engine)
+
         st.write("Last update:")
         st.code(
             st.session_state.last_update_time
