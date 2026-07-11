@@ -31,6 +31,11 @@ MAX_TRANSLATION_CHARS = 480
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
+# Gemini Live low-latency audio send settings.
+# 40 ms at 16 kHz mono int16 = 1280 bytes.
+GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
+GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
+
 # Helper / correction AI
 LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
 LLM_MODEL_BACKUP = "gemini-3.1-flash-lite"
@@ -663,6 +668,8 @@ def gemini_live_translate_worker(
         live_translation = ""
         last_text_time = time.time()
         reset_sent = False
+        first_input_seen = False
+        first_output_seen = False
 
         async with client.aio.live.connect(
             model=GEMINI_LIVE_TRANSLATE_MODEL,
@@ -701,19 +708,24 @@ def gemini_live_translate_worker(
                     except queue.Empty:
                         pass
 
-                    # 100 ms at 16 kHz mono int16 = 3200 bytes.
+                    # Low latency:
+                    # Send about 40 ms of 16 kHz mono int16 audio per packet.
+                    # This helps Gemini receive speech earlier.
                     now = time.time()
                     should_send = (
-                        len(pcm16_buffer) >= 3200
-                        or (pcm16_buffer and now - last_send_time >= 0.12)
+                        len(pcm16_buffer) >= GEMINI_LIVE_AUDIO_CHUNK_BYTES
+                        or (
+                            pcm16_buffer
+                            and now - last_send_time >= GEMINI_LIVE_AUDIO_FLUSH_SECONDS
+                        )
                     )
 
                     if not should_send:
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(0.005)
                         continue
 
-                    chunk = bytes(pcm16_buffer[:3200])
-                    pcm16_buffer = pcm16_buffer[3200:]
+                    chunk = bytes(pcm16_buffer[:GEMINI_LIVE_AUDIO_CHUNK_BYTES])
+                    pcm16_buffer = pcm16_buffer[GEMINI_LIVE_AUDIO_CHUNK_BYTES:]
                     last_send_time = now
 
                     await session.send_realtime_input(
@@ -723,13 +735,15 @@ def gemini_live_translate_worker(
                         )
                     )
 
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.003)
 
             async def receive_loop():
                 nonlocal live_original
                 nonlocal live_translation
                 nonlocal last_text_time
                 nonlocal reset_sent
+                nonlocal first_input_seen
+                nonlocal first_output_seen
 
                 async for response in session.receive():
                     if stop_event.is_set():
@@ -766,20 +780,42 @@ def gemini_live_translate_worker(
                         reset_sent = False
 
                     if input_text:
+                        if not first_input_seen:
+                            first_input_seen = True
+                            result_queue.put({
+                                "type": "debug",
+                                "message": "Gemini Live input transcription started.",
+                            })
+
                         live_original = append_stream_text(
                             live_original,
                             light_original_cleanup(input_text),
                             max_chars=MAX_ORIGINAL_CHARS * 2,
                         )
 
+                        # Show Japanese immediately, even before English translation arrives.
+                        result_queue.put({
+                            "type": "tokens",
+                            "original": live_original,
+                            "translation": live_translation,
+                            "endpoint": False,
+                        })
+
                     if output_text:
+                        if not first_output_seen:
+                            first_output_seen = True
+                            result_queue.put({
+                                "type": "debug",
+                                "message": "Gemini Live output translation started.",
+                            })
+
                         live_translation = append_stream_text(
                             live_translation,
                             light_caption_cleanup(output_text),
                             max_chars=MAX_TRANSLATION_CHARS * 2,
                         )
 
-                    if input_text or output_text:
+                        # English appears when Gemini finishes/streams translation.
                         result_queue.put({
                             "type": "tokens",
                             "original": live_original,
@@ -1481,8 +1517,10 @@ with st.sidebar:
     )
 
     st.caption(
-        "Helper AI is Gemini 3.1 Flash-Lite. Translation is Soniox in Reliable Mode, or Gemini 3.5 Live Translate in Gemini Mode. "
-        "Lower interval = faster correction, but more API calls."
+        "Helper AI is Gemini 3.1 Flash-Lite and stays separate. "
+        "Gemini Mode sends smaller audio chunks so Japanese can appear first; "
+        "English appears when Gemini Live returns translation. "
+        "Lower LLM interval = faster correction, but more API calls."
     )
 
     st.divider()
@@ -2160,6 +2198,9 @@ if show_debug:
             f"error={st.session_state.llm_error}"
         )
 
+        st.write("Gemini audio chunk bytes:")
+        st.code(str(GEMINI_LIVE_AUDIO_CHUNK_BYTES))
+
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
 
@@ -2299,5 +2340,5 @@ st.html(caption_html)
 # ============================================================
 
 if st.session_state.app_active or st.session_state.soniox_running:
-    time.sleep(0.7)
+    time.sleep(0.2)
     st.rerun()
