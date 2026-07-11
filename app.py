@@ -469,6 +469,9 @@ def light_original_cleanup(text):
         "完成により": "慣性により",
 
         # School / event terms
+        # Safe direct corrections only.
+        # Do NOT hard-replace チーム / 様々 / さまざま here;
+        # those are handled only by the helper AI using context.
         "サマコース": "サマーコース",
         "サマー講座": "サマーコース",
 
@@ -1213,6 +1216,10 @@ Rules:
   ビヌス = BINUS
   ビヌスASO = BINUS ASO
   ビヌス大学 = BINUS University
+- Context-only Summer Course rule:
+  If the topic is clearly the ASO/BINUS Summer Course program, and the transcript says 様様, 様々, さまざま, or チーム where "course/program" makes more sense, correct it to サマーコース.
+  Do NOT correct チーム when it really means team.
+  Do NOT correct 様々 or さまざま when it really means various.
 - If the transcript says ネウス大学, ビーナス大学, or ビナス大学 in this school context, correct it to ビヌス大学.
 - Key terms may include important school/event names when relevant.
 - Only output important technical words or important proper nouns, not normal words.
@@ -1382,6 +1389,7 @@ def soniox_live_worker(
                             "Do not translate 慣性補償 as sensory compensation, completion assurance, "
                             "or completion compensation. "
                             "サマーコース means Summer Course. "
+                            "In the ASO/BINUS Summer Course context only, if a phrase sounds like 様様, 様々, さまざま, or チーム but the sentence is clearly about the course/program, it may mean サマーコース. Do not force this correction when it really means various or team. "
                             "ビヌス means BINUS. ビヌスASO means BINUS ASO. "
                             "ビヌス大学 means BINUS University. "
                             "If Japanese sounds like ネウス大学, ビーナス大学, or ビナス大学, "
