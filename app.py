@@ -483,11 +483,9 @@ def make_gemini_live_sdk_config(target_language_code="en"):
     """
     SDK config for Gemini 3.5 Live Translate.
 
-    This matches Google's Python SDK example:
-    - response_modalities=["AUDIO"]
-    - input_audio_transcription enabled
-    - output_audio_transcription enabled
-    - translation_config target_language_code
+    Correct model roles:
+    - Translation engine: gemini-3.5-live-translate-preview
+    - Helper/correction AI: gemini-3.1-flash-lite
     """
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -515,12 +513,9 @@ def gemini_live_translate_worker(
         gemini-3.5-live-translate-preview
 
     Helper/correction AI:
-        Gemini 3.1 Flash-Lite, handled separately by llm_hint_worker.
+        gemini-3.1-flash-lite, handled separately by llm_hint_worker.
 
-    Why this version:
-    The raw websocket connection can close without a useful close reason in
-    Streamlit/websocket-client. The official SDK handles the Live API session
-    more reliably and exposes clearer Python exceptions.
+    This keeps AudioProcessor and Soniox worker untouched.
     """
 
     async def run_live_session():
@@ -682,6 +677,227 @@ def gemini_live_translate_worker(
         result_queue.put({
             "type": "stopped",
         })
+
+
+# ============================================================
+# LLM context helpers
+# ============================================================
+
+def make_context_chunk(original_text, translation_text):
+    original_text = (original_text or "").strip()
+    translation_text = (translation_text or "").strip()
+
+    if not original_text and not translation_text:
+        return ""
+
+    return (
+        f"Japanese: {original_text}\n"
+        f"English: {translation_text}"
+    ).strip()
+
+
+def build_llm_context(context_chunks, current_original, current_translation):
+    chunks = list(context_chunks or [])
+
+    current_chunk = make_context_chunk(
+        current_original,
+        current_translation,
+    )
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    chunks = chunks[-MAX_LLM_CONTEXT_CHUNKS:]
+
+    return "\n\n---\n\n".join(chunks).strip()
+
+
+# ============================================================
+# LLM Interpreter Support
+# ============================================================
+
+def parse_llm_json(text):
+    if not text:
+        return {
+            "main_idea": "",
+            "say_it_simply": "",
+            "corrected_english_caption": "",
+            "key_terms": [],
+            "corrections": [],
+        }
+
+    cleaned = text.strip()
+
+    if cleaned.startswith("```json"):
+        cleaned = cleaned.replace("```json", "", 1).strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```", "", 1).strip()
+
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+
+    try:
+        data = json.loads(cleaned)
+
+        return {
+            "main_idea": str(data.get("main_idea", "")).strip(),
+            "say_it_simply": str(data.get("say_it_simply", "")).strip(),
+            "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
+            "key_terms": data.get("key_terms", []),
+            "corrections": data.get("corrections", []),
+        }
+
+    except Exception:
+        return {
+            "main_idea": cleaned[:220],
+            "say_it_simply": "",
+            "corrected_english_caption": "",
+            "key_terms": [],
+            "corrections": [],
+        }
+
+
+def llm_hint_worker(
+    result_queue,
+    api_key,
+    model_name,
+    context_text,
+    current_translation,
+    key_terms,
+):
+    try:
+        client = genai.Client(api_key=api_key)
+
+        glossary_text = ""
+
+        if key_terms:
+            glossary_lines = []
+
+            for item in key_terms:
+                jp = item.get("jp", "")
+                en = item.get("en", "")
+                notes = item.get("notes", "")
+
+                if notes:
+                    glossary_lines.append(f"- {jp} = {en} ({notes})")
+                else:
+                    glossary_lines.append(f"- {jp} = {en}")
+
+            glossary_text = "\n".join(glossary_lines)
+
+        prompt = f"""
+You are an interpreter assistant.
+
+Your job is NOT to translate everything again.
+Your job is to help the interpreter understand the lecture flow quickly
+AND repair obvious STT/translation mistakes in technical terms.
+
+Use the recent context below. The latest part is at the bottom.
+
+Rules:
+- Output JSON only.
+- Do not add new facts.
+- Do not summarize the speaker.
+- Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
+- Do not rewrite "I" as "the speaker" unless the original meaning is third-person.
+- Use previous context only to repair unclear wording and technical terms.
+- Repair obvious STT/translation mistakes in technical terms.
+- Repair awkward English sentence structure so the caption sounds natural.
+- Keep the corrected English caption close to the current English translation.
+- Preserve technical terms from the glossary.
+- If the transcript is unclear, make the safest minimal correction.
+- If STT or translation uses a wrong technical term, add it to corrections.
+- If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
+- Prefer corrected technical terms in key_terms.
+- Example correction:
+  {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
+
+Recent lecture context:
+{context_text}
+
+Current English translation:
+{current_translation}
+
+Technical glossary terms detected:
+{glossary_text}
+
+Return JSON in this exact format:
+{{
+  "main_idea": "one short sentence explaining the current main point",
+  "say_it_simply": "one natural sentence the interpreter can say",
+  "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
+  "key_terms": [
+    {{"term": "Japanese or English term", "meaning": "short meaning"}}
+  ],
+  "corrections": [
+    {{
+      "wrong": "wrong recognized word or phrase",
+      "correct": "correct word or phrase",
+      "reason": "short reason"
+    }}
+  ]
+}}
+""".strip()
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=420,
+            ),
+        )
+
+        parsed = parse_llm_json(response.text)
+
+        result_queue.put({
+            "type": "llm_hint",
+            "main_idea": parsed.get("main_idea", ""),
+            "say_it_simply": parsed.get("say_it_simply", ""),
+            "corrected_english_caption": parsed.get("corrected_english_caption", ""),
+            "source_text": context_text,
+            "key_terms": parsed.get("key_terms", []),
+            "corrections": parsed.get("corrections", []),
+        })
+
+    except Exception as e:
+        result_queue.put({
+            "type": "llm_error",
+            "message": str(e),
+        })
+
+
+# ============================================================
+# Audio processor
+# ============================================================
+
+class AudioProcessor:
+    def __init__(self):
+        self.audio_queue = queue.Queue()
+        self.resampler = av.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=48000,
+        )
+
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        try:
+            resampled_frames = self.resampler.resample(frame)
+
+            for resampled_frame in resampled_frames:
+                audio = resampled_frame.to_ndarray().reshape(-1)
+
+                if audio.size == 0:
+                    continue
+
+                pcm16 = audio.astype(np.int16)
+                self.audio_queue.put(pcm16.tobytes())
+
+        except Exception:
+            pass
+
+        return frame
 
 
 # ============================================================
