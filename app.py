@@ -5,6 +5,7 @@ import json
 import queue
 import threading
 import time
+import asyncio
 import base64
 
 import av
@@ -477,6 +478,28 @@ def extract_live_text_from_response(data):
     return input_text, output_text
 
 
+
+def make_gemini_live_sdk_config(target_language_code="en"):
+    """
+    SDK config for Gemini 3.5 Live Translate.
+
+    This matches Google's Python SDK example:
+    - response_modalities=["AUDIO"]
+    - input_audio_transcription enabled
+    - output_audio_transcription enabled
+    - translation_config target_language_code
+    """
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        translation_config=types.TranslationConfig(
+            target_language_code=target_language_code,
+            echo_target_language=True,
+        ),
+    )
+
+
 def gemini_live_translate_worker(
     audio_queue,
     result_queue,
@@ -486,7 +509,7 @@ def gemini_live_translate_worker(
     target_language_code="en",
 ):
     """
-    Gemini 3.5 Live Translate worker.
+    Gemini 3.5 Live Translate worker using the official google-genai SDK.
 
     Translation engine:
         gemini-3.5-live-translate-preview
@@ -494,406 +517,171 @@ def gemini_live_translate_worker(
     Helper/correction AI:
         Gemini 3.1 Flash-Lite, handled separately by llm_hint_worker.
 
-    Important stability fixes:
-    - Wait for setupComplete before sending audio.
-    - Send 16 kHz PCM in small throttled chunks instead of flooding the socket.
-    - Surface setup errors in the debug panel.
+    Why this version:
+    The raw websocket connection can close without a useful close reason in
+    Streamlit/websocket-client. The official SDK handles the Live API session
+    more reliably and exposes clearer Python exceptions.
     """
-    ws = None
 
-    try:
-        ws_url = f"{GEMINI_LIVE_WS_URL}?key={api_key}"
-        ws = websocket.create_connection(
-            ws_url,
-            timeout=10,
-            enable_multithread=True,
-        )
-
-        setup_message = make_gemini_live_setup(target_language_code)
-        ws.send(json.dumps(setup_message))
+    async def run_live_session():
+        client = genai.Client(api_key=api_key)
+        config = make_gemini_live_sdk_config(target_language_code)
 
         result_queue.put({
             "type": "debug",
-            "message": "Connected to Gemini 3.5 Live Translate. Waiting for setupComplete...",
+            "message": "Connecting with official Gemini Live SDK...",
         })
 
-        setup_done_event = threading.Event()
         live_original = ""
         live_translation = ""
 
-        def send_audio():
-            pcm16_buffer = bytearray()
-            last_send_time = time.time()
+        async with client.aio.live.connect(
+            model=GEMINI_LIVE_TRANSLATE_MODEL,
+            config=config,
+        ) as session:
+            result_queue.put({
+                "type": "debug",
+                "message": "Gemini 3.5 Live Translate session started.",
+            })
 
-            while not stop_event.is_set():
-                while control_queue is not None and not control_queue.empty():
+            async def send_audio_loop():
+                pcm16_buffer = bytearray()
+                last_send_time = time.time()
+
+                while not stop_event.is_set():
+                    while control_queue is not None and not control_queue.empty():
+                        try:
+                            command = control_queue.get_nowait()
+
+                            if command == "clear":
+                                pcm16_buffer = bytearray()
+                                result_queue.put({"type": "cleared"})
+
+                        except queue.Empty:
+                            break
+
                     try:
-                        command = control_queue.get_nowait()
+                        pcm48 = await asyncio.to_thread(audio_queue.get, True, 0.05)
 
-                        if command == "clear":
-                            pcm16_buffer = bytearray()
-                            result_queue.put({"type": "cleared"})
+                        if pcm48:
+                            pcm16 = downsample_pcm48_to_pcm16(pcm48)
+
+                            if pcm16:
+                                pcm16_buffer.extend(pcm16)
 
                     except queue.Empty:
+                        pass
+
+                    # 100 ms at 16 kHz mono int16 = 3200 bytes.
+                    now = time.time()
+                    should_send = (
+                        len(pcm16_buffer) >= 3200
+                        or (pcm16_buffer and now - last_send_time >= 0.12)
+                    )
+
+                    if not should_send:
+                        await asyncio.sleep(0.01)
+                        continue
+
+                    chunk = bytes(pcm16_buffer[:3200])
+                    pcm16_buffer = pcm16_buffer[3200:]
+                    last_send_time = now
+
+                    await session.send_realtime_input(
+                        audio=types.Blob(
+                            data=chunk,
+                            mime_type="audio/pcm;rate=16000",
+                        )
+                    )
+
+                    await asyncio.sleep(0.01)
+
+            async def receive_loop():
+                nonlocal live_original
+                nonlocal live_translation
+
+                async for response in session.receive():
+                    if stop_event.is_set():
                         break
 
-                if not setup_done_event.wait(timeout=0.1):
-                    continue
+                    server_content = getattr(response, "server_content", None)
 
-                try:
-                    pcm48 = audio_queue.get(timeout=0.05)
+                    if not server_content:
+                        continue
 
-                    if pcm48:
-                        pcm16 = downsample_pcm48_to_pcm16(pcm48)
-                        if pcm16:
-                            pcm16_buffer.extend(pcm16)
+                    input_transcription = getattr(
+                        server_content,
+                        "input_transcription",
+                        None,
+                    )
 
-                except queue.Empty:
-                    pass
+                    output_transcription = getattr(
+                        server_content,
+                        "output_transcription",
+                        None,
+                    )
 
-                # 100 ms at 16 kHz, mono, int16 = 3200 bytes.
-                # This avoids sending too many JSON messages per second.
-                now = time.time()
-                should_send = (
-                    len(pcm16_buffer) >= 3200
-                    or (pcm16_buffer and now - last_send_time >= 0.12)
-                )
+                    input_text = ""
+                    output_text = ""
 
-                if not should_send:
-                    continue
+                    if input_transcription:
+                        input_text = getattr(input_transcription, "text", "") or ""
 
-                chunk = bytes(pcm16_buffer[:3200])
-                pcm16_buffer = pcm16_buffer[3200:]
-                last_send_time = now
+                    if output_transcription:
+                        output_text = getattr(output_transcription, "text", "") or ""
 
-                audio_message = {
-                    "realtimeInput": {
-                        "audio": {
-                            "data": base64.b64encode(chunk).decode("utf-8"),
-                            "mimeType": "audio/pcm;rate=16000",
-                        }
-                    }
-                }
+                    if input_text:
+                        live_original = append_stream_text(
+                            live_original,
+                            light_original_cleanup(input_text),
+                            max_chars=MAX_ORIGINAL_CHARS * 2,
+                        )
 
-                try:
-                    ws.send(json.dumps(audio_message))
+                    if output_text:
+                        live_translation = append_stream_text(
+                            live_translation,
+                            light_caption_cleanup(output_text),
+                            max_chars=MAX_TRANSLATION_CHARS * 2,
+                        )
 
-                except Exception as e:
-                    if not stop_event.is_set():
+                    if input_text or output_text:
                         result_queue.put({
-                            "type": "error",
-                            "message": f"Gemini Live audio send error: {e}",
+                            "type": "tokens",
+                            "original": live_original,
+                            "translation": live_translation,
+                            "endpoint": False,
                         })
-                    break
 
-        sender_thread = threading.Thread(target=send_audio, daemon=True)
-        sender_thread.start()
+            send_task = asyncio.create_task(send_audio_loop())
+            receive_task = asyncio.create_task(receive_loop())
 
-        while not stop_event.is_set():
-            try:
-                msg = ws.recv()
+            done, pending = await asyncio.wait(
+                [send_task, receive_task],
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
 
-            except websocket.WebSocketTimeoutException:
-                continue
+            for task in pending:
+                task.cancel()
 
-            except Exception as e:
-                if not stop_event.is_set():
-                    result_queue.put({
-                        "type": "error",
-                        "message": f"Gemini Live receive error: {e}",
-                    })
-                break
+            for task in done:
+                error = task.exception()
+                if error:
+                    raise error
 
-            if not msg:
-                continue
-
-            try:
-                data = json.loads(msg)
-            except json.JSONDecodeError:
-                result_queue.put({
-                    "type": "debug",
-                    "message": f"Gemini Live non-JSON response: {str(msg)[:300]}",
-                })
-                continue
-
-            if data.get("error"):
-                result_queue.put({
-                    "type": "error",
-                    "message": f"Gemini Live API error: {data.get('error')}",
-                })
-                break
-
-            if data.get("setupComplete") or data.get("setup_complete"):
-                setup_done_event.set()
-                result_queue.put({
-                    "type": "debug",
-                    "message": "Gemini Live setupComplete received. Sending audio now.",
-                })
-                continue
-
-            input_text, output_text = extract_live_text_from_response(data)
-
-            if input_text:
-                live_original = append_stream_text(
-                    live_original,
-                    light_original_cleanup(input_text),
-                    max_chars=MAX_ORIGINAL_CHARS * 2,
-                )
-
-            if output_text:
-                live_translation = append_stream_text(
-                    live_translation,
-                    light_caption_cleanup(output_text),
-                    max_chars=MAX_TRANSLATION_CHARS * 2,
-                )
-
-            if input_text or output_text:
-                result_queue.put({
-                    "type": "tokens",
-                    "original": live_original,
-                    "translation": live_translation,
-                    "endpoint": False,
-                })
+    try:
+        asyncio.run(run_live_session())
 
     except Exception as e:
         if not stop_event.is_set():
             result_queue.put({
                 "type": "error",
-                "message": f"Gemini Live startup error: {e}",
+                "message": f"Gemini Live SDK error: {e}",
             })
 
     finally:
-        try:
-            if ws is not None:
-                ws.close()
-        except Exception:
-            pass
-
         result_queue.put({
             "type": "stopped",
         })
-
-
-
-# ============================================================
-# LLM context helpers
-# ============================================================
-
-def make_context_chunk(original_text, translation_text):
-    original_text = (original_text or "").strip()
-    translation_text = (translation_text or "").strip()
-
-    if not original_text and not translation_text:
-        return ""
-
-    return (
-        f"Japanese: {original_text}\n"
-        f"English: {translation_text}"
-    ).strip()
-
-
-def build_llm_context(context_chunks, current_original, current_translation):
-    chunks = list(context_chunks or [])
-
-    current_chunk = make_context_chunk(
-        current_original,
-        current_translation,
-    )
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    chunks = chunks[-MAX_LLM_CONTEXT_CHUNKS:]
-
-    return "\n\n---\n\n".join(chunks).strip()
-
-
-# ============================================================
-# LLM Interpreter Support
-# ============================================================
-
-def parse_llm_json(text):
-    if not text:
-        return {
-            "main_idea": "",
-            "say_it_simply": "",
-            "corrected_english_caption": "",
-            "key_terms": [],
-            "corrections": [],
-        }
-
-    cleaned = text.strip()
-
-    if cleaned.startswith("```json"):
-        cleaned = cleaned.replace("```json", "", 1).strip()
-
-    if cleaned.startswith("```"):
-        cleaned = cleaned.replace("```", "", 1).strip()
-
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3].strip()
-
-    try:
-        data = json.loads(cleaned)
-
-        return {
-            "main_idea": str(data.get("main_idea", "")).strip(),
-            "say_it_simply": str(data.get("say_it_simply", "")).strip(),
-            "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
-            "key_terms": data.get("key_terms", []),
-            "corrections": data.get("corrections", []),
-        }
-
-    except Exception:
-        return {
-            "main_idea": cleaned[:220],
-            "say_it_simply": "",
-            "corrected_english_caption": "",
-            "key_terms": [],
-            "corrections": [],
-        }
-
-
-def llm_hint_worker(
-    result_queue,
-    api_key,
-    model_name,
-    context_text,
-    current_translation,
-    key_terms,
-):
-    try:
-        client = genai.Client(api_key=api_key)
-
-        glossary_text = ""
-
-        if key_terms:
-            glossary_lines = []
-
-            for item in key_terms:
-                jp = item.get("jp", "")
-                en = item.get("en", "")
-                notes = item.get("notes", "")
-
-                if notes:
-                    glossary_lines.append(f"- {jp} = {en} ({notes})")
-                else:
-                    glossary_lines.append(f"- {jp} = {en}")
-
-            glossary_text = "\n".join(glossary_lines)
-
-        prompt = f"""
-You are an interpreter assistant.
-
-Your job is NOT to translate everything again.
-Your job is to help the interpreter understand the lecture flow quickly
-AND repair obvious STT/translation mistakes in technical terms.
-
-Use the recent context below. The latest part is at the bottom.
-
-Rules:
-- Output JSON only.
-- Do not add new facts.
-- Do not summarize the speaker.
-- Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
-- Do not rewrite "I" as "the speaker" unless the original meaning is third-person.
-- Use previous context only to repair unclear wording and technical terms.
-- Repair obvious STT/translation mistakes in technical terms.
-- Repair awkward English sentence structure so the caption sounds natural.
-- Keep the corrected English caption close to the current English translation.
-- Preserve technical terms from the glossary.
-- If the transcript is unclear, make the safest minimal correction.
-- If STT or translation uses a wrong technical term, add it to corrections.
-- If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
-- Prefer corrected technical terms in key_terms.
-- Example correction:
-  {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
-
-Recent lecture context:
-{context_text}
-
-Current English translation:
-{current_translation}
-
-Technical glossary terms detected:
-{glossary_text}
-
-Return JSON in this exact format:
-{{
-  "main_idea": "one short sentence explaining the current main point",
-  "say_it_simply": "one natural sentence the interpreter can say",
-  "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
-  "key_terms": [
-    {{"term": "Japanese or English term", "meaning": "short meaning"}}
-  ],
-  "corrections": [
-    {{
-      "wrong": "wrong recognized word or phrase",
-      "correct": "correct word or phrase",
-      "reason": "short reason"
-    }}
-  ]
-}}
-""".strip()
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=420,
-            ),
-        )
-
-        parsed = parse_llm_json(response.text)
-
-        result_queue.put({
-            "type": "llm_hint",
-            "main_idea": parsed.get("main_idea", ""),
-            "say_it_simply": parsed.get("say_it_simply", ""),
-            "corrected_english_caption": parsed.get("corrected_english_caption", ""),
-            "source_text": context_text,
-            "key_terms": parsed.get("key_terms", []),
-            "corrections": parsed.get("corrections", []),
-        })
-
-    except Exception as e:
-        result_queue.put({
-            "type": "llm_error",
-            "message": str(e),
-        })
-
-
-# ============================================================
-# Audio processor
-# ============================================================
-
-class AudioProcessor:
-    def __init__(self):
-        self.audio_queue = queue.Queue()
-        self.resampler = av.AudioResampler(
-            format="s16",
-            layout="mono",
-            rate=48000,
-        )
-
-    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
-        try:
-            resampled_frames = self.resampler.resample(frame)
-
-            for resampled_frame in resampled_frames:
-                audio = resampled_frame.to_ndarray().reshape(-1)
-
-                if audio.size == 0:
-                    continue
-
-                pcm16 = audio.astype(np.int16)
-                self.audio_queue.put(pcm16.tobytes())
-
-        except Exception:
-            pass
-
-        return frame
 
 
 # ============================================================
@@ -1894,6 +1682,9 @@ if show_debug:
 
         st.write("History:")
         st.write(st.session_state.caption_history)
+
+        st.write("Debug messages:")
+        st.write(st.session_state.debug_messages)
 
         st.write("LLM context chunks:")
         st.write(st.session_state.llm_context_chunks)
