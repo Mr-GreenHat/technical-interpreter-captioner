@@ -505,26 +505,17 @@ def light_original_cleanup(text):
 
 
 
-def clear_stale_ai_correction_for_new_live_text():
+def prepare_next_ai_check_after_new_live_text():
     """
-    When new live speech arrives after an AI-corrected segment, immediately
-    remove the previous helper result. This prevents the old AI-corrected
-    caption from hiding the new live Japanese/English until the next AI call.
+    When new live speech arrives after an AI-corrected segment, keep the
+    corrected caption visible and let the live worker continue from that
+    corrected base. The next helper AI call will update the continued text.
     """
     if st.session_state.caption_stage != "ai_corrected":
         return
 
-    st.session_state.llm_corrected_japanese_original = ""
-    st.session_state.llm_corrected_english_caption = ""
-    st.session_state.llm_corrected_source_text = ""
-    st.session_state.llm_key_terms = []
-    st.session_state.llm_corrections = []
-    st.session_state.llm_main_idea = ""
-    st.session_state.llm_say_it_simply = ""
-    st.session_state.llm_error = ""
-    st.session_state.last_helper_fix_time = ""
     st.session_state.correction_status = "pending"
-    st.session_state.caption_stage = "raw_started"
+    st.session_state.caption_stage = "raw_continuing"
 
 
 def contains_japanese(text):
@@ -839,20 +830,20 @@ def gemini_live_translate_worker(
                                 first_output_seen = False
                                 result_queue.put({"type": "cleared"})
 
-                            elif command == "soft_clear_worker":
-                                # After AI correction is applied, keep the corrected UI visible
-                                # but reset Gemini's internal accumulated transcript.
-                                # This prevents the next live token from sending old+new text.
+                            elif isinstance(command, dict) and command.get("type") == "set_base_caption":
+                                # After AI correction is applied, do NOT clear the text.
+                                # Use the corrected text as the new worker base, so
+                                # the next live tokens continue from the fixed caption.
+                                live_original = command.get("original", "") or live_original
+                                live_translation = command.get("translation", "") or live_translation
                                 pcm16_buffer = bytearray()
-                                live_original = ""
-                                live_translation = ""
                                 last_text_time = time.time()
                                 reset_sent = False
-                                first_input_seen = False
-                                first_output_seen = False
+                                first_input_seen = bool(live_original)
+                                first_output_seen = bool(live_translation)
                                 result_queue.put({
                                     "type": "debug",
-                                    "message": "Gemini worker soft-cleared after AI correction.",
+                                    "message": "Gemini worker base updated after AI correction.",
                                 })
 
                         except queue.Empty:
@@ -1473,15 +1464,16 @@ def soniox_live_worker(
                         last_token_time = time.time()
                         result_queue.put({"type": "cleared"})
 
-                    elif command == "soft_clear_worker":
-                        # After AI correction is applied, keep the corrected UI visible
-                        # but reset Soniox's accumulated transcript.
-                        final_original = ""
-                        final_translation = ""
+                    elif isinstance(command, dict) and command.get("type") == "set_base_caption":
+                        # After AI correction is applied, do NOT clear the text.
+                        # Use the corrected text as the new worker base, so
+                        # the next live tokens continue from the fixed caption.
+                        final_original = command.get("original", "") or final_original
+                        final_translation = command.get("translation", "") or final_translation
                         last_token_time = time.time()
                         result_queue.put({
                             "type": "debug",
-                            "message": "Soniox worker soft-cleared after AI correction.",
+                            "message": "Soniox worker base updated after AI correction.",
                         })
 
                     elif isinstance(command, dict):
@@ -2046,7 +2038,7 @@ while not st.session_state.soniox_result_queue.empty():
         translation = item.get("translation", "")
 
         if original or translation:
-            clear_stale_ai_correction_for_new_live_text()
+            prepare_next_ai_check_after_new_live_text()
 
         if st.session_state.pending_visual_reset and (original or translation):
             st.session_state.live_original = ""
@@ -2190,11 +2182,41 @@ while not st.session_state.llm_result_queue.empty():
             st.session_state.correction_status = "applied"
 
             # Important:
-            # Keep the AI-corrected text visible, but reset the live worker's
-            # internal transcript buffer. Otherwise the next live token may
-            # return old+new text and look like the app went backwards.
+            # Keep the AI-corrected text visible AND continue from it.
+            # The worker's internal base is replaced with the corrected text,
+            # so the next live tokens append to the fixed caption instead of
+            # returning old text or starting from empty.
+            corrected_base_original = (
+                st.session_state.llm_corrected_japanese_original
+                or st.session_state.live_original
+            )
+            corrected_base_translation = (
+                st.session_state.llm_corrected_english_caption
+                or st.session_state.live_translation
+            )
+
+            corrected_base_original = light_original_cleanup(
+                apply_llm_corrections(
+                    corrected_base_original,
+                    st.session_state.llm_corrections,
+                )
+            )
+            corrected_base_translation = light_caption_cleanup(
+                apply_llm_corrections(
+                    corrected_base_translation,
+                    st.session_state.llm_corrections,
+                )
+            )
+
+            st.session_state.live_original = corrected_base_original
+            st.session_state.live_translation = corrected_base_translation
+
             if st.session_state.soniox_running:
-                st.session_state.soniox_control_queue.put("soft_clear_worker")
+                st.session_state.soniox_control_queue.put({
+                    "type": "set_base_caption",
+                    "original": corrected_base_original,
+                    "translation": corrected_base_translation,
+                })
 
         else:
             st.session_state.caption_stage = "raw_english"
@@ -2244,11 +2266,8 @@ if use_llm_hints and gemini_api_key:
 
         st.session_state.llm_running = True
         st.session_state.llm_error = ""
-        st.session_state.llm_corrected_japanese_original = ""
-        st.session_state.llm_corrected_english_caption = ""
-        st.session_state.llm_corrected_source_text = ""
-        st.session_state.llm_key_terms = []
-        st.session_state.llm_corrections = []
+        # Keep the previous corrected text visible while the next AI check runs.
+        # New result will replace it when ready.
         st.session_state.caption_stage = "ai_checking"
         st.session_state.correction_status = "checking"
         st.session_state.last_ai_check_time = time.strftime("%H:%M:%S")
