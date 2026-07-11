@@ -1441,7 +1441,7 @@ with st.sidebar:
     )
 
     reset_seconds = st.slider(
-        "Reset caption after pause",
+        "Prepare new caption after pause",
         min_value=1.5,
         max_value=8.0,
         value=DEFAULT_RESET_SECONDS,
@@ -1537,6 +1537,7 @@ defaults = {
     "debug_messages": [],
     "last_update_time": "",
     "last_reset_seconds": DEFAULT_RESET_SECONDS,
+    "pending_visual_reset": False,
 
     "llm_result_queue": queue.Queue(),
     "llm_thread": None,
@@ -1695,6 +1696,7 @@ if clear_clicked:
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
     st.session_state.soniox_error = ""
+    st.session_state.pending_visual_reset = False
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -1730,6 +1732,7 @@ if (
     st.session_state.live_translation = ""
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
+    st.session_state.pending_visual_reset = False
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -1793,6 +1796,17 @@ while not st.session_state.soniox_result_queue.empty():
         original = item.get("original", "")
         translation = item.get("translation", "")
 
+        if st.session_state.pending_visual_reset and (original or translation):
+            st.session_state.live_original = ""
+            st.session_state.live_translation = ""
+            st.session_state.caption_history = []
+            st.session_state.llm_corrected_japanese_original = ""
+            st.session_state.llm_corrected_english_caption = ""
+            st.session_state.llm_corrected_source_text = ""
+            st.session_state.llm_key_terms = []
+            st.session_state.llm_corrections = []
+            st.session_state.pending_visual_reset = False
+
         if original:
             st.session_state.live_original = original
 
@@ -1826,12 +1840,10 @@ while not st.session_state.soniox_result_queue.empty():
                     st.session_state.llm_context_chunks[-MAX_LLM_CONTEXT_CHUNKS:]
                 )
 
-        st.session_state.live_original = ""
-        st.session_state.live_translation = ""
-        st.session_state.last_update_time = ""
-        st.session_state.llm_corrected_japanese_original = ""
-        st.session_state.llm_corrected_english_caption = ""
-        st.session_state.llm_corrected_source_text = ""
+        # Do not clear the visible caption immediately after pause.
+        # Keep it on screen so the reader has time to read it.
+        # The next incoming token will clear/replace the old caption.
+        st.session_state.pending_visual_reset = True
 
     elif item_type == "cleared":
         st.session_state.live_original = ""
@@ -1840,6 +1852,7 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.last_update_time = ""
         st.session_state.llm_context_chunks = []
         st.session_state.llm_corrections = []
+        st.session_state.pending_visual_reset = False
 
     elif item_type == "debug":
         message = item.get("message", "")
@@ -2135,6 +2148,7 @@ if show_debug:
         st.code(
             f"enabled={use_llm_hints}\n"
             f"running={st.session_state.llm_running}\n"
+            f"pending_visual_reset={st.session_state.pending_visual_reset}\n"
             f"main_idea={st.session_state.llm_main_idea}\n"
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
