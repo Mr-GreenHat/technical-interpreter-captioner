@@ -1582,6 +1582,8 @@ defaults = {
     "last_raw_input_time": "",
     "last_raw_translation_time": "",
     "last_helper_fix_time": "",
+    "last_ai_check_time": "",
+    "correction_status": "idle",
 
     "llm_result_queue": queue.Queue(),
     "llm_thread": None,
@@ -1745,6 +1747,8 @@ if clear_clicked:
     st.session_state.last_raw_input_time = ""
     st.session_state.last_raw_translation_time = ""
     st.session_state.last_helper_fix_time = ""
+    st.session_state.last_ai_check_time = ""
+    st.session_state.correction_status = "idle"
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -1785,6 +1789,8 @@ if (
     st.session_state.last_raw_input_time = ""
     st.session_state.last_raw_translation_time = ""
     st.session_state.last_helper_fix_time = ""
+    st.session_state.last_ai_check_time = ""
+    st.session_state.correction_status = "idle"
 
     st.session_state.llm_context_chunks = []
     st.session_state.llm_main_idea = ""
@@ -1859,21 +1865,34 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.llm_corrections = []
             st.session_state.caption_stage = "raw_started"
             st.session_state.last_helper_fix_time = ""
+            st.session_state.last_ai_check_time = ""
+            st.session_state.correction_status = "pending"
             st.session_state.pending_visual_reset = False
         st.session_state.caption_stage = "idle"
         st.session_state.last_raw_input_time = ""
         st.session_state.last_raw_translation_time = ""
         st.session_state.last_helper_fix_time = ""
+        st.session_state.last_ai_check_time = ""
+        st.session_state.correction_status = "idle"
 
         if original:
             st.session_state.live_original = original
             st.session_state.caption_stage = "raw_japanese"
             st.session_state.last_raw_input_time = time.strftime("%H:%M:%S")
 
+            if not st.session_state.live_translation:
+                st.session_state.correction_status = "waiting_for_english"
+
         if translation:
             st.session_state.live_translation = translation
             st.session_state.caption_stage = "raw_english"
             st.session_state.last_raw_translation_time = time.strftime("%H:%M:%S")
+
+            if use_llm_hints and gemini_api_key:
+                if not st.session_state.llm_running and not st.session_state.llm_corrected_source_text:
+                    st.session_state.correction_status = "pending"
+            else:
+                st.session_state.correction_status = "off"
 
             if (
                 not st.session_state.caption_history
@@ -1906,6 +1925,8 @@ while not st.session_state.soniox_result_queue.empty():
         # Keep it on screen so the reader has time to read it.
         # The next incoming token will clear/replace the old caption.
         st.session_state.pending_visual_reset = True
+        if st.session_state.live_translation and use_llm_hints and gemini_api_key:
+            st.session_state.correction_status = "pending"
 
     elif item_type == "cleared":
         st.session_state.live_original = ""
@@ -1953,12 +1974,27 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
-        st.session_state.caption_stage = "ai_corrected"
+
+        has_ai_update = (
+            bool(st.session_state.llm_corrected_japanese_original)
+            or bool(st.session_state.llm_corrected_english_caption)
+            or bool(st.session_state.llm_key_terms)
+            or bool(st.session_state.llm_corrections)
+        )
+
+        if has_ai_update:
+            st.session_state.caption_stage = "ai_corrected"
+            st.session_state.correction_status = "applied"
+        else:
+            st.session_state.caption_stage = "raw_english"
+            st.session_state.correction_status = "no_change"
+
         st.session_state.last_helper_fix_time = time.strftime("%H:%M:%S")
 
     elif item_type == "llm_error":
         st.session_state.llm_error = item.get("message", "")
         st.session_state.llm_running = False
+        st.session_state.correction_status = "error"
 
 
 # ============================================================
@@ -1997,6 +2033,9 @@ if use_llm_hints and gemini_api_key:
 
         st.session_state.llm_running = True
         st.session_state.llm_error = ""
+        st.session_state.caption_stage = "ai_checking"
+        st.session_state.correction_status = "checking"
+        st.session_state.last_ai_check_time = time.strftime("%H:%M:%S")
         st.session_state.llm_last_call_time = time.time()
         st.session_state.llm_last_source_text = source_text
 
@@ -2136,6 +2175,30 @@ else:
     en_status_text = "Waiting for English translation..."
 
 
+if not use_llm_hints:
+    correction_status_text = "AI correction off"
+elif not gemini_api_key:
+    correction_status_text = "AI correction unavailable: GEMINI_API_KEY missing"
+elif st.session_state.llm_error:
+    correction_status_text = f"AI correction error: {st.session_state.llm_error}"
+elif st.session_state.llm_running:
+    correction_status_text = "AI correction checking..."
+elif source_is_corrected and st.session_state.last_helper_fix_time:
+    correction_status_text = f"AI correction applied at {st.session_state.last_helper_fix_time}"
+elif st.session_state.live_translation:
+    correction_status_text = "AI correction pending"
+elif st.session_state.live_original:
+    correction_status_text = "Waiting for English before AI correction"
+else:
+    correction_status_text = "Waiting for speech"
+
+if st.session_state.llm_running:
+    jp_status_text = "Live Japanese / AI checking..."
+    en_status_text = "Live English / AI checking..."
+elif st.session_state.correction_status == "pending" and st.session_state.live_translation:
+    en_status_text = "Live English / AI correction pending"
+
+
 if use_llm_hints:
     if st.session_state.llm_running:
         simple_text = "Generating simple interpreter sentence..."
@@ -2152,7 +2215,11 @@ if use_llm_hints:
     else:
         simple_text = "Waiting for enough lecture context..."
 
-    if st.session_state.llm_key_terms:
+    if st.session_state.llm_running:
+        llm_terms_text = "AI checking key terms and caption corrections..."
+    elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
+        llm_terms_text = "AI correction pending..."
+    elif st.session_state.llm_key_terms:
         llm_terms_lines = []
 
         for item in st.session_state.llm_key_terms[:8]:
@@ -2186,11 +2253,17 @@ safe_caption_text = html.escape(display_english)
 safe_llm_terms = html.escape(llm_terms_text)
 safe_jp_status = html.escape(jp_status_text)
 safe_en_status = html.escape(en_status_text)
+safe_correction_status = html.escape(correction_status_text)
 
 llm_html = ""
 
 if use_llm_hints:
     llm_html = f"""
+    <div>
+        <div class="caption-label">Correction Status</div>
+        <div class="correction-status-box">{safe_correction_status}</div>
+    </div>
+
     <div>
         <div class="caption-label">LLM Key Terms</div>
         <div class="llm-terms-box">{safe_llm_terms}</div>
@@ -2209,6 +2282,12 @@ if show_debug:
 
         st.write("Caption stage:")
         st.code(st.session_state.caption_stage)
+
+        st.write("Correction status:")
+        st.code(st.session_state.correction_status)
+
+        st.write("Last AI check time:")
+        st.code(st.session_state.last_ai_check_time or "None")
 
         st.write("Last raw Japanese time:")
         st.code(st.session_state.last_raw_input_time or "None")
@@ -2303,6 +2382,32 @@ caption_html = f"""
     font-weight: 700;
 }}
 
+.caption-status {{
+    margin-left: 8px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    background-color: #1F2937;
+    color: #D1D5DB;
+}}
+
+.correction-status-box {{
+    font-size: 15px;
+    line-height: 1.35;
+    font-weight: 700;
+    padding: 10px 12px;
+    border-radius: 14px;
+    background-color: #EFF6FF;
+    color: #1E3A8A;
+    min-height: 42px;
+    max-height: 80px;
+    overflow: hidden;
+    white-space: pre-wrap;
+    border: 1px solid #60A5FA;
+    box-sizing: border-box;
+}}
+
 .jp-caption-box {{
     font-size: {jp_font_size}px;
     line-height: 1.35;
@@ -2369,6 +2474,14 @@ caption_html = f"""
         max-height: 150px;
     }}
 
+
+    .correction-status-box {{
+        font-size: 14px;
+        line-height: 1.3;
+        padding: 9px;
+        min-height: 38px;
+        max-height: 70px;
+    }}
 
     .llm-terms-box {{
         font-size: 15px;
