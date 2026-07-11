@@ -3375,7 +3375,10 @@ caption_html = f"""
 </div>
 """
 
-st.html(caption_html)
+# Render captions through a stable Streamlit placeholder.
+# This prevents duplicated caption blocks during fast live reruns.
+caption_placeholder = st.empty()
+caption_placeholder.markdown(caption_html, unsafe_allow_html=True)
 
 
 # ============================================================
