@@ -503,6 +503,30 @@ def light_original_cleanup(text):
 
 
 
+
+
+def clear_stale_ai_correction_for_new_live_text():
+    """
+    When new live speech arrives after an AI-corrected segment, immediately
+    remove the previous helper result. This prevents the old AI-corrected
+    caption from hiding the new live Japanese/English until the next AI call.
+    """
+    if st.session_state.caption_stage != "ai_corrected":
+        return
+
+    st.session_state.llm_corrected_japanese_original = ""
+    st.session_state.llm_corrected_english_caption = ""
+    st.session_state.llm_corrected_source_text = ""
+    st.session_state.llm_key_terms = []
+    st.session_state.llm_corrections = []
+    st.session_state.llm_main_idea = ""
+    st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_error = ""
+    st.session_state.last_helper_fix_time = ""
+    st.session_state.correction_status = "pending"
+    st.session_state.caption_stage = "raw_started"
+
+
 def contains_japanese(text):
     if not text:
         return False
@@ -1043,8 +1067,12 @@ def source_text_matches_for_correction(current_source, corrected_source):
     if not current_set or not corrected_set:
         return False
 
-    overlap = len(current_set & corrected_set) / max(1, len(corrected_set))
-    return overlap >= 0.65
+    overlap_a = len(current_set & corrected_set) / max(1, len(corrected_set))
+    overlap_b = len(current_set & corrected_set) / max(1, len(current_set))
+
+    # Stricter match:
+    # old AI correction should not keep overriding a new live segment.
+    return overlap_a >= 0.85 and overlap_b >= 0.70
 
 
 def build_llm_context(context_chunks, current_original, current_translation):
@@ -1654,11 +1682,7 @@ with st.sidebar:
     )
 
     st.caption(
-        "Helper AI is Gemini 3.1 Flash-Lite and stays separate. "
-        "Gemini Mode sends smaller audio chunks so Japanese can appear first; "
-        "English appears when Gemini Live returns translation. "
-        "Lower LLM interval = faster correction, but more API calls. "
-        "Built-in terms include サマーコース, ビヌス, ビヌスASO, ビヌス大学."
+        "AI correction runs after live translation."
     )
 
     st.divider()
@@ -1994,6 +2018,9 @@ while not st.session_state.soniox_result_queue.empty():
         original = item.get("original", "")
         translation = item.get("translation", "")
 
+        if original or translation:
+            clear_stale_ai_correction_for_new_live_text()
+
         if st.session_state.pending_visual_reset and (original or translation):
             st.session_state.live_original = ""
             st.session_state.live_translation = ""
@@ -2182,6 +2209,11 @@ if use_llm_hints and gemini_api_key:
 
         st.session_state.llm_running = True
         st.session_state.llm_error = ""
+        st.session_state.llm_corrected_japanese_original = ""
+        st.session_state.llm_corrected_english_caption = ""
+        st.session_state.llm_corrected_source_text = ""
+        st.session_state.llm_key_terms = []
+        st.session_state.llm_corrections = []
         st.session_state.caption_stage = "ai_checking"
         st.session_state.correction_status = "checking"
         st.session_state.last_ai_check_time = time.strftime("%H:%M:%S")
