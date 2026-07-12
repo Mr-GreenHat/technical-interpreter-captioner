@@ -11,7 +11,6 @@ import base64
 import av
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
@@ -3432,13 +3431,7 @@ caption_html = f"""
 </div>
 """
 
-# Render raw HTML with Streamlit Components.
-# This avoids markdown escaping and prevents literal <div> code from appearing.
-components.html(
-    caption_html,
-    height=680,
-    scrolling=False,
-)
+st.html(caption_html)
 
 
 # ============================================================
