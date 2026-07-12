@@ -32,7 +32,7 @@ MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
 # Japanese-only safety:
-# If Gemini hears Spanish/English/other languages by mistake, ignore it.
+# Ignore accidental Spanish/English/other-language recognition.
 JAPANESE_ONLY_MODE = True
 
 # Gemini Live low-latency audio send settings.
@@ -539,9 +539,9 @@ def apply_llm_corrections(text, corrections):
 
 def is_japanese_text(text):
     """
-    Return True only when text contains Japanese script.
-    This prevents accidental Spanish/English/other-language recognition
-    from being displayed or translated.
+    True when text contains Japanese script.
+    English acronyms inside Japanese sentences are okay if the sentence
+    also contains Hiragana/Katakana/Kanji.
     """
     if not text:
         return False
@@ -657,6 +657,10 @@ def light_caption_cleanup(text):
         "catia": "CATIA",
         "CADIA": "CATIA",
         "Catiya": "CATIA",
+        "CADIA": "CATIA",
+        "the way to win": "CATIA",
+        "way to win": "CATIA",
+        "how to win": "CATIA",
         "Computer Aided Design": "CAD",
         "computer aided design": "CAD",
         "Computer-Aided Design": "CAD",
@@ -954,7 +958,10 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
         }
 
         translation_replacements = {
-                        "winning method": "CATIA",
+            "the way to win": "CATIA",
+            "way to win": "CATIA",
+            "how to win": "CATIA",
+            "winning method": "CATIA",
             "So, the way to win": "So, in CATIA",
             "So the way to win": "So in CATIA",
             "the winning method": "CATIA",
@@ -1075,6 +1082,7 @@ def normalize_key_term_line(term, meaning):
         "catia": ("CATIA", "CATIA"),
         "way to win": ("CATIA", "CATIA"),
         "how to win": ("CATIA", "CATIA"),
+        "career": ("CATIA", "CATIA"),
         "cad": ("CAD", "Computer-Aided Design"),
         "computer aided design": ("CAD", "Computer-Aided Design"),
         "computer-aided design": ("CAD", "Computer-Aided Design"),
@@ -2391,69 +2399,12 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
-def fresh_worker_channels():
-    """Create fresh worker queues/events so old stop/error messages do not leak."""
-    st.session_state.soniox_result_queue = queue.Queue()
-    st.session_state.soniox_control_queue = queue.Queue()
-    st.session_state.soniox_stop_event = threading.Event()
-    st.session_state.soniox_thread = None
-
-
-def reset_live_text_state(reset_budget=False):
-    """Reset visible text and helper state, without touching microphone state."""
-    st.session_state.live_original = ""
-    st.session_state.live_translation = ""
-    st.session_state.caption_history = []
-    st.session_state.last_update_time = ""
-    st.session_state.soniox_error = ""
-    st.session_state.pending_visual_reset = False
-    st.session_state.caption_stage = "idle"
-    st.session_state.last_raw_input_time = ""
-    st.session_state.last_raw_translation_time = ""
-    st.session_state.last_helper_fix_time = ""
-    st.session_state.last_ai_check_time = ""
-    st.session_state.correction_status = "idle"
-    st.session_state.live_token_version = 0
-    st.session_state.last_llm_checked_token_version = -1
-
-    st.session_state.llm_context_chunks = []
-    st.session_state.llm_main_idea = ""
-    st.session_state.llm_say_it_simply = ""
-    st.session_state.llm_corrected_japanese_original = ""
-    st.session_state.llm_corrected_english_caption = ""
-    st.session_state.llm_corrected_source_text = ""
-    st.session_state.llm_key_terms = []
-    st.session_state.llm_corrections = []
-    st.session_state.llm_error = ""
-    st.session_state.llm_last_source_text = ""
-    st.session_state.llm_running = False
-
-    if reset_budget:
-        st.session_state.llm_calls_this_session = 0
-        st.session_state.llm_budget_reached = False
-
-
-def stop_translation_cleanly():
-    """Stop current Gemini/WebRTC session. A new Start will use fresh channels."""
-    try:
-        st.session_state.soniox_stop_event.set()
-    except Exception:
-        pass
-
+if st.session_state.current_engine and st.session_state.current_engine != translation_engine:
     st.session_state.app_active = False
     st.session_state.pending_start_translation = False
     st.session_state.soniox_running = False
-    st.session_state.llm_running = False
-
-    # Force browser to build a new WebRTC component after stop.
+    st.session_state.soniox_stop_event.set()
     st.session_state.mic_instance_id += 1
-
-    # Drop stale messages from the old worker.
-    fresh_worker_channels()
-
-
-if st.session_state.current_engine and st.session_state.current_engine != translation_engine:
-    stop_translation_cleanly()
     st.session_state.current_engine = translation_engine
     st.rerun()
 
@@ -2515,7 +2466,7 @@ rtc_configuration = RTCConfiguration(
 st.subheader("Microphone")
 
 webrtc_ctx = webrtc_streamer(
-    key=f"gemini-live-caption-mic-{st.session_state.mic_instance_id}",
+    key=f"soniox-live-caption-mic-{st.session_state.mic_instance_id}",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -2530,15 +2481,6 @@ webrtc_ctx = webrtc_streamer(
     async_processing=True,
     desired_playing_state=st.session_state.app_active,
 )
-
-if (
-    st.session_state.soniox_running
-    and st.session_state.soniox_thread is not None
-    and not st.session_state.soniox_thread.is_alive()
-):
-    st.session_state.soniox_running = False
-    if st.session_state.app_active:
-        st.warning("Gemini worker stopped. Press Stop, then Start again.")
 
 
 # ============================================================
@@ -2564,25 +2506,49 @@ clear_clicked = st.button(
 
 if toggle_clicked:
     if st.session_state.app_active:
-        stop_translation_cleanly()
+        st.session_state.app_active = False
+        st.session_state.pending_start_translation = False
+        st.session_state.soniox_running = False
+        st.session_state.soniox_stop_event.set()
+        st.session_state.mic_instance_id += 1
+
         st.rerun()
 
     else:
-        # Do not increment mic_instance_id here.
-        # Stop already creates the new mic key. Incrementing again on Start
-        # can make WebRTC unstable and result in no initial output.
-        fresh_worker_channels()
-        reset_live_text_state(reset_budget=False)
-
         st.session_state.app_active = True
         st.session_state.pending_start_translation = True
-        st.session_state.soniox_running = False
         st.session_state.soniox_error = ""
 
         st.rerun()
 
 if clear_clicked:
-    reset_live_text_state(reset_budget=True)
+    st.session_state.live_original = ""
+    st.session_state.live_translation = ""
+    st.session_state.caption_history = []
+    st.session_state.last_update_time = ""
+    st.session_state.soniox_error = ""
+    st.session_state.pending_visual_reset = False
+    st.session_state.caption_stage = "idle"
+    st.session_state.last_raw_input_time = ""
+    st.session_state.last_raw_translation_time = ""
+    st.session_state.last_helper_fix_time = ""
+    st.session_state.last_ai_check_time = ""
+    st.session_state.correction_status = "idle"
+    st.session_state.live_token_version = 0
+    st.session_state.last_llm_checked_token_version = -1
+    st.session_state.llm_calls_this_session = 0
+    st.session_state.llm_budget_reached = False
+
+    st.session_state.llm_context_chunks = []
+    st.session_state.llm_main_idea = ""
+    st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_corrected_japanese_original = ""
+    st.session_state.llm_corrected_english_caption = ""
+    st.session_state.llm_corrected_source_text = ""
+    st.session_state.llm_key_terms = []
+    st.session_state.llm_corrections = []
+    st.session_state.llm_error = ""
+    st.session_state.llm_last_source_text = ""
 
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
@@ -2600,9 +2566,37 @@ if (
     and not st.session_state.soniox_running
     and webrtc_ctx.audio_processor
 ):
-    fresh_worker_channels()
-    reset_live_text_state(reset_budget=True)
+    st.session_state.soniox_stop_event = threading.Event()
+    st.session_state.soniox_result_queue = queue.Queue()
+    st.session_state.soniox_control_queue = queue.Queue()
+    st.session_state.soniox_error = ""
     st.session_state.debug_messages = []
+    st.session_state.live_original = ""
+    st.session_state.live_translation = ""
+    st.session_state.caption_history = []
+    st.session_state.last_update_time = ""
+    st.session_state.pending_visual_reset = False
+    st.session_state.caption_stage = "idle"
+    st.session_state.last_raw_input_time = ""
+    st.session_state.last_raw_translation_time = ""
+    st.session_state.last_helper_fix_time = ""
+    st.session_state.last_ai_check_time = ""
+    st.session_state.correction_status = "idle"
+    st.session_state.live_token_version = 0
+    st.session_state.last_llm_checked_token_version = -1
+    st.session_state.llm_calls_this_session = 0
+    st.session_state.llm_budget_reached = False
+
+    st.session_state.llm_context_chunks = []
+    st.session_state.llm_main_idea = ""
+    st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_corrected_japanese_original = ""
+    st.session_state.llm_corrected_english_caption = ""
+    st.session_state.llm_corrected_source_text = ""
+    st.session_state.llm_key_terms = []
+    st.session_state.llm_corrections = []
+    st.session_state.llm_error = ""
+    st.session_state.llm_last_source_text = ""
     st.session_state.llm_last_call_time = 0.0
 
     processor = webrtc_ctx.audio_processor
@@ -2630,17 +2624,8 @@ if (
     st.session_state.soniox_thread.start()
 
 
-if (
-    st.session_state.pending_start_translation
-    and st.session_state.app_active
-    and not st.session_state.soniox_running
-    and not webrtc_ctx.audio_processor
-):
-    st.info("Waiting for microphone to become ready...")
-
-
 # ============================================================
-# Pull Gemini results into UI state
+# Pull Soniox results into UI state
 # ============================================================
 
 while not st.session_state.soniox_result_queue.empty():
@@ -2772,9 +2757,7 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.mic_instance_id += 1
 
     elif item_type == "stopped":
-        # If an old worker sends "stopped" after a new Start, do not kill the new session.
-        if not st.session_state.app_active:
-            st.session_state.soniox_running = False
+        st.session_state.soniox_running = False
 
 
 # ============================================================
