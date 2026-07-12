@@ -11,6 +11,7 @@ import base64
 import av
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
@@ -30,6 +31,10 @@ MAX_ORIGINAL_CHARS = 300
 MAX_TRANSLATION_CHARS = 480
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
+
+# Japanese-only safety:
+# If Gemini hears Spanish/English/other languages by mistake, ignore it.
+JAPANESE_ONLY_MODE = True
 
 # Gemini Live low-latency audio send settings.
 # 40 ms at 16 kHz mono int16 = 1280 bytes.
@@ -533,6 +538,28 @@ def apply_llm_corrections(text, corrections):
     return cleaned.strip()
 
 
+def is_japanese_text(text):
+    """
+    Return True only when text contains Japanese script.
+    This prevents accidental Spanish/English/other-language recognition
+    from being displayed or translated.
+    """
+    if not text:
+        return False
+
+    for ch in text:
+        cp = ord(ch)
+
+        if (
+            0x3040 <= cp <= 0x309F  # Hiragana
+            or 0x30A0 <= cp <= 0x30FF  # Katakana
+            or 0x4E00 <= cp <= 0x9FFF  # Kanji
+        ):
+            return True
+
+    return False
+
+
 def light_caption_cleanup(text):
     if not text:
         return ""
@@ -631,10 +658,6 @@ def light_caption_cleanup(text):
         "catia": "CATIA",
         "CADIA": "CATIA",
         "Catiya": "CATIA",
-        "CADIA": "CATIA",
-        "the way to win": "CATIA",
-        "way to win": "CATIA",
-        "how to win": "CATIA",
         "Computer Aided Design": "CAD",
         "computer aided design": "CAD",
         "Computer-Aided Design": "CAD",
@@ -932,10 +955,7 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
         }
 
         translation_replacements = {
-            "the way to win": "CATIA",
-            "way to win": "CATIA",
-            "how to win": "CATIA",
-            "winning method": "CATIA",
+                        "winning method": "CATIA",
             "So, the way to win": "So, in CATIA",
             "So the way to win": "So in CATIA",
             "the winning method": "CATIA",
@@ -1056,7 +1076,6 @@ def normalize_key_term_line(term, meaning):
         "catia": ("CATIA", "CATIA"),
         "way to win": ("CATIA", "CATIA"),
         "how to win": ("CATIA", "CATIA"),
-        "career": ("CATIA", "CATIA"),
         "cad": ("CAD", "Computer-Aided Design"),
         "computer aided design": ("CAD", "Computer-Aided Design"),
         "computer-aided design": ("CAD", "Computer-Aided Design"),
@@ -1295,6 +1314,7 @@ def gemini_live_translate_worker(
         reset_sent = False
         first_input_seen = False
         first_output_seen = False
+        japanese_seen_in_segment = False
 
         async with client.aio.live.connect(
             model=GEMINI_LIVE_TRANSLATE_MODEL,
@@ -1312,6 +1332,7 @@ def gemini_live_translate_worker(
                 nonlocal reset_sent
                 nonlocal first_input_seen
                 nonlocal first_output_seen
+                nonlocal japanese_seen_in_segment
 
                 pcm16_buffer = bytearray()
                 last_send_time = time.time()
@@ -1331,6 +1352,7 @@ def gemini_live_translate_worker(
                                 reset_sent = False
                                 first_input_seen = False
                                 first_output_seen = False
+                                japanese_seen_in_segment = False
                                 result_queue.put({"type": "cleared"})
 
                             elif isinstance(command, dict) and command.get("type") == "set_base_caption":
@@ -1344,6 +1366,7 @@ def gemini_live_translate_worker(
                                 reset_sent = False
                                 first_input_seen = bool(live_original)
                                 first_output_seen = bool(live_translation)
+                                japanese_seen_in_segment = is_japanese_text(live_original)
                                 result_queue.put({
                                     "type": "debug",
                                     "message": "Gemini worker base updated after AI correction.",
@@ -1400,6 +1423,7 @@ def gemini_live_translate_worker(
                 nonlocal reset_sent
                 nonlocal first_input_seen
                 nonlocal first_output_seen
+                nonlocal japanese_seen_in_segment
 
                 async for response in session.receive():
                     if stop_event.is_set():
@@ -1436,54 +1460,74 @@ def gemini_live_translate_worker(
                         reset_sent = False
 
                     if input_text:
-                        if not first_input_seen:
-                            first_input_seen = True
+                        # Japanese-only guard.
+                        # If Gemini accidentally recognizes Spanish/English/other language,
+                        # do not show it and do not allow its English output to appear.
+                        if JAPANESE_ONLY_MODE and not is_japanese_text(input_text):
                             result_queue.put({
                                 "type": "debug",
-                                "message": "Gemini Live input transcription started.",
+                                "message": f"Ignored non-Japanese input: {input_text[:80]}",
                             })
+                        else:
+                            japanese_seen_in_segment = True
 
-                        live_original = append_stream_text(
-                            live_original,
-                            light_original_cleanup(input_text),
-                            max_chars=MAX_ORIGINAL_CHARS * 2,
-                        )
+                            if not first_input_seen:
+                                first_input_seen = True
+                                result_queue.put({
+                                    "type": "debug",
+                                    "message": "Gemini Live Japanese input transcription started.",
+                                })
 
-                        # Show Japanese immediately, even before English translation arrives.
-                        result_queue.put({
-                            "type": "tokens",
-                            "original": live_original,
-                            "translation": live_translation,
-                            "endpoint": False,
-                        })
+                            live_original = append_stream_text(
+                                live_original,
+                                light_original_cleanup(input_text),
+                                max_chars=MAX_ORIGINAL_CHARS * 2,
+                            )
+
+                            # Show Japanese immediately, even before English translation arrives.
+                            result_queue.put({
+                                "type": "tokens",
+                                "original": live_original,
+                                "translation": live_translation,
+                                "endpoint": False,
+                            })
 
                     if output_text:
-                        if not first_output_seen:
-                            first_output_seen = True
+                        # Do not show translation unless a valid Japanese source
+                        # has been seen in this segment.
+                        if JAPANESE_ONLY_MODE and not japanese_seen_in_segment:
                             result_queue.put({
                                 "type": "debug",
-                                "message": "Gemini Live output translation started.",
+                                "message": f"Ignored output because no Japanese source was detected: {output_text[:80]}",
                             })
+                        else:
+                            if not first_output_seen:
+                                first_output_seen = True
+                                result_queue.put({
+                                    "type": "debug",
+                                    "message": "Gemini Live English output translation started.",
+                                })
 
-                        live_translation = append_stream_text(
-                            live_translation,
-                            light_caption_cleanup(output_text),
-                            max_chars=MAX_TRANSLATION_CHARS * 2,
-                        )
+                            live_translation = append_stream_text(
+                                live_translation,
+                                light_caption_cleanup(output_text),
+                                max_chars=MAX_TRANSLATION_CHARS * 2,
+                            )
 
-                        # English appears when Gemini finishes/streams translation.
-                        result_queue.put({
-                            "type": "tokens",
-                            "original": live_original,
-                            "translation": live_translation,
-                            "endpoint": False,
-                        })
+                            # English appears when Gemini finishes/streams translation.
+                            result_queue.put({
+                                "type": "tokens",
+                                "original": live_original,
+                                "translation": live_translation,
+                                "endpoint": False,
+                            })
 
             async def reset_watchdog_loop():
                 nonlocal live_original
                 nonlocal live_translation
                 nonlocal last_text_time
                 nonlocal reset_sent
+                nonlocal japanese_seen_in_segment
 
                 while not stop_event.is_set():
                     await asyncio.sleep(0.25)
@@ -1495,6 +1539,7 @@ def gemini_live_translate_worker(
                         result_queue.put({"type": "page_reset"})
                         live_original = ""
                         live_translation = ""
+                        japanese_seen_in_segment = False
                         reset_sent = True
 
             send_task = asyncio.create_task(send_audio_loop())
@@ -2177,6 +2222,7 @@ with st.sidebar:
 
     translation_engine = ENGINE_GEMINI_LIVE
     st.info("Translation engine: Gemini 3.5 Live Translate")
+    st.caption("Language filter: Japanese only")
 
     domain_mode = st.selectbox(
         "Technical domain",
@@ -2346,12 +2392,69 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
-if st.session_state.current_engine and st.session_state.current_engine != translation_engine:
+def fresh_worker_channels():
+    """Create fresh worker queues/events so old stop/error messages do not leak."""
+    st.session_state.soniox_result_queue = queue.Queue()
+    st.session_state.soniox_control_queue = queue.Queue()
+    st.session_state.soniox_stop_event = threading.Event()
+    st.session_state.soniox_thread = None
+
+
+def reset_live_text_state(reset_budget=False):
+    """Reset visible text and helper state, without touching microphone state."""
+    st.session_state.live_original = ""
+    st.session_state.live_translation = ""
+    st.session_state.caption_history = []
+    st.session_state.last_update_time = ""
+    st.session_state.soniox_error = ""
+    st.session_state.pending_visual_reset = False
+    st.session_state.caption_stage = "idle"
+    st.session_state.last_raw_input_time = ""
+    st.session_state.last_raw_translation_time = ""
+    st.session_state.last_helper_fix_time = ""
+    st.session_state.last_ai_check_time = ""
+    st.session_state.correction_status = "idle"
+    st.session_state.live_token_version = 0
+    st.session_state.last_llm_checked_token_version = -1
+
+    st.session_state.llm_context_chunks = []
+    st.session_state.llm_main_idea = ""
+    st.session_state.llm_say_it_simply = ""
+    st.session_state.llm_corrected_japanese_original = ""
+    st.session_state.llm_corrected_english_caption = ""
+    st.session_state.llm_corrected_source_text = ""
+    st.session_state.llm_key_terms = []
+    st.session_state.llm_corrections = []
+    st.session_state.llm_error = ""
+    st.session_state.llm_last_source_text = ""
+    st.session_state.llm_running = False
+
+    if reset_budget:
+        st.session_state.llm_calls_this_session = 0
+        st.session_state.llm_budget_reached = False
+
+
+def stop_translation_cleanly():
+    """Stop current Gemini/WebRTC session. A new Start will use fresh channels."""
+    try:
+        st.session_state.soniox_stop_event.set()
+    except Exception:
+        pass
+
     st.session_state.app_active = False
     st.session_state.pending_start_translation = False
     st.session_state.soniox_running = False
-    st.session_state.soniox_stop_event.set()
+    st.session_state.llm_running = False
+
+    # Force browser to build a new WebRTC component after stop.
     st.session_state.mic_instance_id += 1
+
+    # Drop stale messages from the old worker.
+    fresh_worker_channels()
+
+
+if st.session_state.current_engine and st.session_state.current_engine != translation_engine:
+    stop_translation_cleanly()
     st.session_state.current_engine = translation_engine
     st.rerun()
 
@@ -2413,7 +2516,7 @@ rtc_configuration = RTCConfiguration(
 st.subheader("Microphone")
 
 webrtc_ctx = webrtc_streamer(
-    key=f"soniox-live-caption-mic-{st.session_state.mic_instance_id}",
+    key=f"gemini-live-caption-mic-{st.session_state.mic_instance_id}",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -2428,6 +2531,15 @@ webrtc_ctx = webrtc_streamer(
     async_processing=True,
     desired_playing_state=st.session_state.app_active,
 )
+
+if (
+    st.session_state.soniox_running
+    and st.session_state.soniox_thread is not None
+    and not st.session_state.soniox_thread.is_alive()
+):
+    st.session_state.soniox_running = False
+    if st.session_state.app_active:
+        st.warning("Gemini worker stopped. Press Stop, then Start again.")
 
 
 # ============================================================
@@ -2453,49 +2565,25 @@ clear_clicked = st.button(
 
 if toggle_clicked:
     if st.session_state.app_active:
-        st.session_state.app_active = False
-        st.session_state.pending_start_translation = False
-        st.session_state.soniox_running = False
-        st.session_state.soniox_stop_event.set()
-        st.session_state.mic_instance_id += 1
-
+        stop_translation_cleanly()
         st.rerun()
 
     else:
+        # Do not increment mic_instance_id here.
+        # Stop already creates the new mic key. Incrementing again on Start
+        # can make WebRTC unstable and result in no initial output.
+        fresh_worker_channels()
+        reset_live_text_state(reset_budget=False)
+
         st.session_state.app_active = True
         st.session_state.pending_start_translation = True
+        st.session_state.soniox_running = False
         st.session_state.soniox_error = ""
 
         st.rerun()
 
 if clear_clicked:
-    st.session_state.live_original = ""
-    st.session_state.live_translation = ""
-    st.session_state.caption_history = []
-    st.session_state.last_update_time = ""
-    st.session_state.soniox_error = ""
-    st.session_state.pending_visual_reset = False
-    st.session_state.caption_stage = "idle"
-    st.session_state.last_raw_input_time = ""
-    st.session_state.last_raw_translation_time = ""
-    st.session_state.last_helper_fix_time = ""
-    st.session_state.last_ai_check_time = ""
-    st.session_state.correction_status = "idle"
-    st.session_state.live_token_version = 0
-    st.session_state.last_llm_checked_token_version = -1
-    st.session_state.llm_calls_this_session = 0
-    st.session_state.llm_budget_reached = False
-
-    st.session_state.llm_context_chunks = []
-    st.session_state.llm_main_idea = ""
-    st.session_state.llm_say_it_simply = ""
-    st.session_state.llm_corrected_japanese_original = ""
-    st.session_state.llm_corrected_english_caption = ""
-    st.session_state.llm_corrected_source_text = ""
-    st.session_state.llm_key_terms = []
-    st.session_state.llm_corrections = []
-    st.session_state.llm_error = ""
-    st.session_state.llm_last_source_text = ""
+    reset_live_text_state(reset_budget=True)
 
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
@@ -2513,37 +2601,9 @@ if (
     and not st.session_state.soniox_running
     and webrtc_ctx.audio_processor
 ):
-    st.session_state.soniox_stop_event = threading.Event()
-    st.session_state.soniox_result_queue = queue.Queue()
-    st.session_state.soniox_control_queue = queue.Queue()
-    st.session_state.soniox_error = ""
+    fresh_worker_channels()
+    reset_live_text_state(reset_budget=True)
     st.session_state.debug_messages = []
-    st.session_state.live_original = ""
-    st.session_state.live_translation = ""
-    st.session_state.caption_history = []
-    st.session_state.last_update_time = ""
-    st.session_state.pending_visual_reset = False
-    st.session_state.caption_stage = "idle"
-    st.session_state.last_raw_input_time = ""
-    st.session_state.last_raw_translation_time = ""
-    st.session_state.last_helper_fix_time = ""
-    st.session_state.last_ai_check_time = ""
-    st.session_state.correction_status = "idle"
-    st.session_state.live_token_version = 0
-    st.session_state.last_llm_checked_token_version = -1
-    st.session_state.llm_calls_this_session = 0
-    st.session_state.llm_budget_reached = False
-
-    st.session_state.llm_context_chunks = []
-    st.session_state.llm_main_idea = ""
-    st.session_state.llm_say_it_simply = ""
-    st.session_state.llm_corrected_japanese_original = ""
-    st.session_state.llm_corrected_english_caption = ""
-    st.session_state.llm_corrected_source_text = ""
-    st.session_state.llm_key_terms = []
-    st.session_state.llm_corrections = []
-    st.session_state.llm_error = ""
-    st.session_state.llm_last_source_text = ""
     st.session_state.llm_last_call_time = 0.0
 
     processor = webrtc_ctx.audio_processor
@@ -2571,8 +2631,17 @@ if (
     st.session_state.soniox_thread.start()
 
 
+if (
+    st.session_state.pending_start_translation
+    and st.session_state.app_active
+    and not st.session_state.soniox_running
+    and not webrtc_ctx.audio_processor
+):
+    st.info("Waiting for microphone to become ready...")
+
+
 # ============================================================
-# Pull Soniox results into UI state
+# Pull Gemini results into UI state
 # ============================================================
 
 while not st.session_state.soniox_result_queue.empty():
@@ -2704,7 +2773,9 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.mic_instance_id += 1
 
     elif item_type == "stopped":
-        st.session_state.soniox_running = False
+        # If an old worker sends "stopped" after a new Start, do not kill the new session.
+        if not st.session_state.app_active:
+            st.session_state.soniox_running = False
 
 
 # ============================================================
@@ -3193,6 +3264,9 @@ if show_debug:
         st.write("Gemini audio chunk bytes:")
         st.code(str(GEMINI_LIVE_AUDIO_CHUNK_BYTES))
 
+        st.write("Japanese-only mode:")
+        st.code(str(JAPANESE_ONLY_MODE))
+
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
 
@@ -3358,7 +3432,13 @@ caption_html = f"""
 </div>
 """
 
-st.html(caption_html)
+# Render raw HTML with Streamlit Components.
+# This avoids markdown escaping and prevents literal <div> code from appearing.
+components.html(
+    caption_html,
+    height=680,
+    scrolling=False,
+)
 
 
 # ============================================================
