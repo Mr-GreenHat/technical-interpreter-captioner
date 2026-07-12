@@ -2991,6 +2991,7 @@ current_source_for_display = build_llm_context(
 
 if (
     use_llm_hints
+    and st.session_state.caption_stage == "ai_corrected"
     and st.session_state.llm_corrected_source_text
     and source_text_matches_for_correction(
         current_source_for_display,
@@ -3033,6 +3034,7 @@ if st.session_state.live_original and not display_english:
 
 source_is_corrected = (
     use_llm_hints
+    and st.session_state.caption_stage == "ai_corrected"
     and st.session_state.llm_corrected_source_text
     and source_text_matches_for_correction(
         current_source_for_display,
@@ -3050,6 +3052,9 @@ if source_is_corrected:
 elif st.session_state.live_original and not st.session_state.live_translation:
     jp_status_text = "Live Japanese"
     en_status_text = "Waiting for English translation..."
+elif st.session_state.caption_stage == "raw_continuing":
+    jp_status_text = "Live Japanese / continuing after AI correction"
+    en_status_text = "Live English / continuing after AI correction"
 elif st.session_state.live_translation:
     jp_status_text = "Live Japanese"
     en_status_text = "Live English translation"
