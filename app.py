@@ -2613,35 +2613,155 @@ def is_usable_llm_result(parsed):
     return False
 
 
+def build_gemma_helper_configs():
+    """
+    Gemma 4 can spend many tokens on internal thinking and then produce no
+    final answer before max tokens. For this caption helper task we want a
+    fast final JSON answer, so we ask for minimal thinking.
+
+    We try configs in order because some SDK/API combinations may reject
+    JSON mode or thinking_config. The app stays Gemma-only; these are just
+    different configs for the same selected Gemma model.
+    """
+    configs = []
+
+    # Best case: JSON mode + minimal thinking.
+    try:
+        configs.append((
+            "json_minimal_thinking",
+            types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal",
+                ),
+            ),
+        ))
+    except Exception:
+        pass
+
+    # If JSON mode is rejected, still minimize thinking.
+    try:
+        configs.append((
+            "text_minimal_thinking",
+            types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal",
+                ),
+            ),
+        ))
+    except Exception:
+        pass
+
+    # Last fallback: plain Gemma config. Still Gemma-only.
+    configs.append((
+        "plain_text",
+        types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
+        ),
+    ))
+
+    return configs
+
+
 def generate_content_with_timeout(client, model_name, prompt, timeout_seconds):
     """
     Run a helper model call in a daemon thread so a slow Gemma call cannot
-    block the app forever. If it times out, fallback can try another model.
+    block the app forever.
+
+    Returns:
+        (response, config_label)
+
+    Important:
+    The selected model remains Gemma. If one config produces only thought /
+    prompt echo / empty final text, we try the next config for the same Gemma
+    model before declaring failure.
     """
     local_queue = queue.Queue()
 
     def call_model():
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
-                ),
-            )
+        config_attempts = []
+        last_response = None
+        last_label = ""
+        last_error = ""
+
+        for config_label, config in build_gemma_helper_configs():
+            started_at = time.time()
+
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config,
+                )
+
+                elapsed = time.time() - started_at
+                last_response = response
+                last_label = config_label
+
+                final_text = ""
+                try:
+                    final_text = extract_text_from_gemini_response(response)
+                except Exception as extract_error:
+                    final_text = ""
+                    last_error = f"text extraction error: {extract_error}"
+
+                config_attempts.append({
+                    "config": config_label,
+                    "seconds": round(elapsed, 2),
+                    "has_final_text": bool(final_text.strip()),
+                    "final_text_preview": final_text[:160],
+                })
+
+                # If this config produced final text, use it.
+                if final_text.strip() and not looks_like_prompt_echo(final_text):
+                    local_queue.put({
+                        "ok": True,
+                        "response": response,
+                        "config_label": config_label,
+                        "config_attempts": config_attempts,
+                        "error": "",
+                    })
+                    return
+
+                # Otherwise try the next config. This is the key fix for
+                # "only thought text / no final answer".
+                continue
+
+            except Exception as e:
+                elapsed = time.time() - started_at
+                last_error = str(e)
+                config_attempts.append({
+                    "config": config_label,
+                    "seconds": round(elapsed, 2),
+                    "has_final_text": False,
+                    "error": str(e)[:280],
+                })
+                continue
+
+        # If no config produced final text, still return the last response
+        # if we have one, so the debug panel can show finish_reason / usage.
+        if last_response is not None:
             local_queue.put({
                 "ok": True,
-                "response": response,
-                "error": "",
+                "response": last_response,
+                "config_label": f"{last_label}_no_final_text",
+                "config_attempts": config_attempts,
+                "error": last_error,
             })
+            return
 
-        except Exception as e:
-            local_queue.put({
-                "ok": False,
-                "response": None,
-                "error": str(e),
-            })
+        local_queue.put({
+            "ok": False,
+            "response": None,
+            "config_label": "",
+            "config_attempts": config_attempts,
+            "error": last_error or "All Gemma configs failed before returning a response.",
+        })
 
     worker = threading.Thread(target=call_model, daemon=True)
     worker.start()
@@ -2660,7 +2780,11 @@ def generate_content_with_timeout(client, model_name, prompt, timeout_seconds):
     if not item["ok"]:
         raise RuntimeError(item["error"])
 
-    return item["response"]
+    response = item["response"]
+    response._helper_config_label = item.get("config_label", "")
+    response._helper_config_attempts = item.get("config_attempts", [])
+
+    return response, item.get("config_label", "")
 
 def llm_hint_worker(
     result_queue,
@@ -2701,18 +2825,18 @@ def llm_hint_worker(
 Return ONLY one JSON object. Do not use markdown. Do not use code fences.
 The first character must be {{ and the last character must be }}.
 
-You are correcting a live Japanese-to-English classroom caption.
+You correct a live Japanese-to-English classroom caption.
 
-Your job:
+Tasks:
 1. Fix obvious STT/translation mistakes in technical terms and proper nouns.
-2. Fix English grammar so it sounds natural.
-3. Keep the speaker perspective. If the speaker says I/we, keep I/we.
+2. Fix English grammar naturally.
+3. Keep speaker perspective. If the speaker says I/we, keep I/we.
 4. Stay close to the current caption. Do not invent new facts.
-5. If the speech is unclear, set is_unclear to true and keep corrections minimal.
+5. If unclear, set is_unclear true and keep correction minimal.
 6. Always fill corrected_japanese_original and corrected_english_caption.
 7. If no correction is needed, copy the current Japanese/English text.
 
-High-priority correction hints:
+Important hints:
 - サマーコース = Summer Course.
 - ビヌス大学 = BINUS University.
 - In school-event context: sauna/saunas, mackerel course, virtual cram school can mean Summer Course.
@@ -2734,12 +2858,12 @@ Current English caption:
 Detected glossary terms:
 {glossary_text}
 
-Return exactly this JSON shape:
+JSON shape:
 {{
   "main_idea": "short current main point, or empty string",
   "say_it_simply": "one natural sentence the interpreter can say, or empty string",
-  "corrected_japanese_original": "corrected Japanese transcript, or copy the Japanese if no correction",
-  "corrected_english_caption": "corrected natural English caption, or copy the English if no correction",
+  "corrected_japanese_original": "corrected Japanese transcript, or copy Japanese if no correction",
+  "corrected_english_caption": "corrected natural English caption, or copy English if no correction",
   "is_unclear": false,
   "unclear_reason": "",
   "key_terms": [
@@ -2767,7 +2891,7 @@ Return exactly this JSON shape:
             started_at = time.time()
 
             try:
-                response = generate_content_with_timeout(
+                response, config_label = generate_content_with_timeout(
                     client,
                     candidate_model,
                     prompt,
@@ -2776,6 +2900,12 @@ Return exactly this JSON shape:
 
                 elapsed = time.time() - started_at
                 response_debug = describe_gemini_response(response)
+                response_debug["helper_config_label"] = config_label
+                response_debug["helper_config_attempts"] = getattr(
+                    response,
+                    "_helper_config_attempts",
+                    [],
+                )
                 response_text_for_parse = response_debug.get("response_text", "") or ""
 
                 if not response_text_for_parse.strip():
@@ -2822,6 +2952,7 @@ Return exactly this JSON shape:
                         "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
                         "loose_parse": bool(candidate_parsed.get("loose_parse", False)),
                         "note": "usable correction",
+                        "config": config_label,
                         "response_debug": response_debug,
                     })
                     break
@@ -2835,8 +2966,9 @@ Return exactly this JSON shape:
                     "note": (
                         "model returned no usable final answer. "
                         "It may have returned only thought/prompt text, invalid JSON, or empty text. "
-                        "Try increasing output tokens or using the other Gemma model."
+                        "The selected Gemma model was called, but it did not produce a final correction."
                     ),
+                    "config": config_label,
                     "raw_preview": (candidate_parsed.get("raw_text", "") or "")[:220],
                     "response_debug": response_debug,
                 })
@@ -3263,8 +3395,11 @@ def summarize_last_helper_attempts(attempts):
 
         response_label = response_text[:160] if response_text else "<no final answer text>"
 
+        config_label = item.get("config", "")
+        config_text = f", config={config_label}" if config_label else ""
+
         lines.append(
-            f"{model}: {status}, {seconds}s, parse_ok={parse_ok}, "
+            f"{model}: {status}, {seconds}s{config_text}, parse_ok={parse_ok}, "
             f"finish_reason={finish_reason}, note={note}, "
             f"response_text_preview={response_label!r}, "
             f"safety={safety_summary}"
@@ -3880,10 +4015,10 @@ if st.session_state.llm_running:
         if helper_elapsed > float(LLM_MODEL_WATCHDOG_SECONDS):
             st.session_state.llm_running = False
             st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
+            st.session_state.llm_last_start_epoch = 0.0
             st.session_state.llm_error = (
                 f"Gemma helper watchdog timeout after {helper_elapsed:.1f} seconds. "
-                "No usable helper result reached the UI. This usually means Gemma "
-                "returned no final answer or the helper thread got stuck."
+                "The selected Gemma model did not deliver a usable final answer to the UI."
             )
             st.session_state.correction_status = "error"
 
@@ -4083,7 +4218,10 @@ if use_llm_hints and gemini_api_key:
             "status": "started",
             "seconds": 0,
             "parse_ok": False,
-            "note": "Gemma helper thread started; waiting for response.",
+            "note": (
+                "Gemma helper thread started. "
+                "Using minimal thinking + JSON mode first."
+            ),
         }]
         # Keep the previous corrected text visible while the next AI check runs.
         # New result will replace it when ready.
