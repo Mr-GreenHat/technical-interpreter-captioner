@@ -57,7 +57,9 @@ LLM_MODEL_OPTIONS = [
 
 # Helper model robustness.
 # If Gemma hangs or is slow, do not let the app wait forever.
-LLM_MODEL_TIMEOUT_SECONDS = 18.0
+LLM_MODEL_TIMEOUT_SECONDS = 30.0
+LLM_MODEL_WATCHDOG_SECONDS = 40.0
+LLM_MAX_OUTPUT_TOKENS = 2048
 LLM_MIN_USABLE_CORRECTION_CHARS = 5
 
 # Translation model for Gemini Live Translate mode
@@ -2624,8 +2626,8 @@ def generate_content_with_timeout(client, model_name, prompt, timeout_seconds):
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=650,
+                    temperature=0.0,
+                    max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
                 ),
             )
             local_queue.put({
@@ -2670,6 +2672,8 @@ def llm_hint_worker(
     class_context="",
     fallback_model_names=None,
 ):
+    attempts = []
+
     try:
         client = genai.Client(api_key=api_key)
 
@@ -2694,129 +2698,59 @@ def llm_hint_worker(
             class_context = "No fixed class context was selected."
 
         prompt = f"""
-You are an interpreter assistant.
+Return ONLY one JSON object. Do not use markdown. Do not use code fences.
+The first character must be {{ and the last character must be }}.
 
-Your job is NOT to translate everything again.
-Your job is to help the interpreter understand the lecture flow quickly
-AND repair obvious STT/translation mistakes in technical terms.
+You are correcting a live Japanese-to-English classroom caption.
 
-Use the selected class/domain context as fixed background.
-Use the recent context below. The latest part is at the bottom.
+Your job:
+1. Fix obvious STT/translation mistakes in technical terms and proper nouns.
+2. Fix English grammar so it sounds natural.
+3. Keep the speaker perspective. If the speaker says I/we, keep I/we.
+4. Stay close to the current caption. Do not invent new facts.
+5. If the speech is unclear, set is_unclear to true and keep corrections minimal.
+6. Always fill corrected_japanese_original and corrected_english_caption.
+7. If no correction is needed, copy the current Japanese/English text.
 
-Rules:
-- Output JSON only. Do not use markdown. Do not use code fences.
-- The first character of your response must be {{ and the last character must be }}.
-- You must fill corrected_japanese_original and corrected_english_caption.
-- Treat the selected class/domain context as high-priority background for repairing STT mistakes.
-- The selected class/domain context does not override actual speech. Do not invent terms that are not supported by the current sentence.
-- If the selected domain is CAD/Product Design, prefer CATIA/CAD vocabulary when the current sentence mentions parts, sketches, constraints, modeling, or design.
-- If the selected domain is Automotive, prefer automotive/AEB/TTC/braking/control vocabulary when the current sentence mentions vehicles, braking, distance, motor, control, or engine.
-- Do not add new facts.
-- Do not summarize the speaker.
-- Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
-- Do not rewrite "I" as "the speaker" unless the original meaning is third-person.
-- Use previous context only to repair unclear wording and technical terms.
-- Repair obvious STT/translation mistakes in technical terms quickly.
-- Repair awkward English sentence structure so the caption sounds natural.
-- Return the corrected_japanese_original and corrected_english_caption even for short segments.
-- Keep the corrected English caption close to the current English translation.
-- Preserve technical terms from the glossary.
-- If the transcript is unclear, make the safest minimal correction.
-- If the sentence is broken, missing a key word, or does not make sense even with the selected class/domain context, set is_unclear to true and explain briefly in unclear_reason.
-- If you are not confident whether a term is CATIA, Sketcher, TTC, AEB, rotary engine, etc., set is_unclear to true instead of forcing the correction.
-- Do not hide uncertainty. It is safer to mark unclear than to invent a technical term.
-- Only include "[unclear]" inside corrected_english_caption when a critical missing phrase prevents a reliable caption. Otherwise use is_unclear and unclear_reason only.
-- If STT or translation uses a wrong technical term, add it to corrections.
-- If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
-- Prefer corrected technical terms in key_terms.
-- Also fix obvious Japanese Original mistakes in corrected_japanese_original.
-- corrected_japanese_original must stay Japanese and close to the original.
-- Do not invent missing Japanese. Only repair obvious wrong technical words.
-- Example Japanese correction: 感性の影響 -> 慣性の影響.
-- Example Japanese correction: 慣性補償性制御 -> 慣性補償制御.
-- Example Japanese correction: 完成の駅 -> 慣性の影響.
-- For key_terms, use the Japanese source technical term when possible, for example "慣性補償 = inertia compensation".
-- Do not output English-to-English key terms like "inertia compensation = Control technique...".
-- Also preserve school/event names:
-  サマーコース = Summer Course
-  ビヌス = BINUS
-  ビヌスASO = BINUS ASO
-  ビヌス大学 = BINUS University
-  ARE = Automotive and Robotics Engineering
-  PDE = Product Design Engineering
-  BE = Business Engineering
-  CATIA = CATIA
-  CAD = Computer-Aided Design
-  ロータリーエンジン = rotary engine
-- CATIA / CAD correction rules:
-  Preserve CATIA and CAD exactly as acronyms.
-  If the CAD/Product Design topic is clearly about parts, sketches, constraints, Pad, or modeling,
-  correct 勝ち方 / 書き方 / キャリア / "way to win" to CATIA.
-  Do NOT correct 勝ち方 when the topic is truly about winning or competition.
-  スケッチャー = Sketcher
-  寸法拘束 = dimensional constraint
-  幾何拘束 = geometric constraint
-  完全拘束 = fully constrained
-  自由度 = degrees of freedom
-  Pad = Pad / extrusion
-  フィレット = fillet
-  Chamfer / 面取り = chamfer / chamfering
-  設計意図 = design intent
-  加工性 = manufacturability
-- Rotary engine correction rules:
-  ロータリーエンジン = rotary engine
-  レシプロエンジン = reciprocating engine
-  ローター = rotor
-  アペックスシール = apex seal
-- Major-name correction rules:
-  If the topic is BINUS ASO majors or students, correct AROI / ARO to ARE when it means Automotive and Robotics Engineering.
-  If the topic is BINUS ASO majors or students, correct PDA / ADC / PD to PDE when it means Product Design Engineering.
-  If the topic is BINUS ASO majors or students, correct BA / B to BE only when it clearly means Business Engineering.
-  Do not change normal words to ARE/PDE/BE unless the context is clearly about majors/programs.
-- Context-only Summer Course rule:
-  If the topic is clearly the ASO/BINUS Summer Course program, and the transcript says 様様, 様々, さまざま, or チーム where "course/program" makes more sense, correct it to サマーコース.
-  Do NOT correct チーム when it really means team.
-  Do NOT correct 様々 or さまざま when it really means various.
-- If the transcript says ネウス大学, ビーナス大学, or ビナス大学 in this school context, correct it to ビヌス大学.
-- In ASO/BINUS school-event context, if English says "mackerel school", "mackerel course", or "mackerel class", correct it to Summer Course.
-- In ASO/BINUS school-event context, if Japanese says サバ塾, 鯖塾, サバ学校, or サバコース, correct it to サマーコース.
-- Key terms may include important school/event names when relevant.
-- Only output important technical words or important proper nouns, not normal words.
-- Example correction:
-  {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
+High-priority correction hints:
+- サマーコース = Summer Course.
+- ビヌス大学 = BINUS University.
+- In school-event context: sauna/saunas, mackerel course, virtual cram school can mean Summer Course.
+- News university, New Tiger students, new style students can mean BINUS University students.
+- CATIA = CATIA. In CAD context, 勝ち方 / way to win can mean CATIA.
+- TTC = Time To Collision. In AEB/braking context, ABC can mean TTC.
+- 慣性補償 = inertia compensation. Sensory/completion compensation can mean inertia compensation.
+- ロータリーエンジン = rotary engine.
 
 Selected class/domain context:
 {class_context}
 
-Recent lecture context:
+Recent caption context:
 {context_text}
 
-Current English translation:
+Current English caption:
 {current_translation}
 
-Technical glossary terms detected:
+Detected glossary terms:
 {glossary_text}
 
-Return JSON in this exact format:
+Return exactly this JSON shape:
 {{
-  "main_idea": "one short sentence explaining the current main point",
-  "say_it_simply": "one natural sentence the interpreter can say",
-  "corrected_japanese_original": "corrected Japanese transcript, only fixing obvious technical recognition errors, otherwise copy the Japanese original",
-  "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
+  "main_idea": "short current main point, or empty string",
+  "say_it_simply": "one natural sentence the interpreter can say, or empty string",
+  "corrected_japanese_original": "corrected Japanese transcript, or copy the Japanese if no correction",
+  "corrected_english_caption": "corrected natural English caption, or copy the English if no correction",
   "is_unclear": false,
-  "unclear_reason": "short reason when the speech/transcript is unclear, otherwise empty string",
+  "unclear_reason": "",
   "key_terms": [
-    {{"term": "Japanese source technical term or important acronym", "meaning": "short English meaning"}}
+    {{"term": "Japanese term or acronym", "meaning": "English meaning"}}
   ],
   "corrections": [
-    {{
-      "wrong": "wrong recognized word or phrase",
-      "correct": "correct word or phrase",
-      "reason": "short reason"
-    }}
+    {{"wrong": "wrong word", "correct": "correct word", "reason": "short reason"}}
   ]
 }}
 """.strip()
+
 
         fallback_model_names = fallback_model_names or []
 
@@ -2900,7 +2834,8 @@ Return JSON in this exact format:
                     "parse_error": candidate_parsed.get("parse_error", ""),
                     "note": (
                         "model returned no usable final answer. "
-                        "It may have returned only thought/prompt text, invalid JSON, or empty text"
+                        "It may have returned only thought/prompt text, invalid JSON, or empty text. "
+                        "Try increasing output tokens or using the other Gemma model."
                     ),
                     "raw_preview": (candidate_parsed.get("raw_text", "") or "")[:220],
                     "response_debug": response_debug,
@@ -2943,6 +2878,7 @@ Return JSON in this exact format:
         result_queue.put({
             "type": "llm_error",
             "message": str(e),
+            "attempts": attempts,
         })
 
 
@@ -3531,6 +3467,7 @@ defaults = {
     "raw_low_confidence_reason": "",
     "llm_last_start_time": "",
     "llm_last_finish_time": "",
+    "llm_last_start_epoch": 0.0,
     "llm_context_chunks": [],
 }
 
@@ -3931,6 +3868,35 @@ while not st.session_state.soniox_result_queue.empty():
 
 
 # ============================================================
+# LLM helper watchdog
+# ============================================================
+
+if st.session_state.llm_running:
+    start_epoch = float(st.session_state.get("llm_last_start_epoch", 0.0) or 0.0)
+
+    if start_epoch:
+        helper_elapsed = time.time() - start_epoch
+
+        if helper_elapsed > float(LLM_MODEL_WATCHDOG_SECONDS):
+            st.session_state.llm_running = False
+            st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
+            st.session_state.llm_error = (
+                f"Gemma helper watchdog timeout after {helper_elapsed:.1f} seconds. "
+                "No usable helper result reached the UI. This usually means Gemma "
+                "returned no final answer or the helper thread got stuck."
+            )
+            st.session_state.correction_status = "error"
+
+            if not st.session_state.llm_last_attempts:
+                st.session_state.llm_last_attempts = [{
+                    "model": llm_model_name,
+                    "status": "watchdog_timeout",
+                    "seconds": round(helper_elapsed, 2),
+                    "parse_ok": False,
+                    "note": "Streamlit-side watchdog fired before a usable result was received.",
+                }]
+
+# ============================================================
 # Pull LLM results
 # ============================================================
 
@@ -3954,6 +3920,7 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
         st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
+        st.session_state.llm_last_start_epoch = 0.0
         st.session_state.llm_calls_this_session += 1
 
         has_ai_update = (
@@ -4024,8 +3991,13 @@ while not st.session_state.llm_result_queue.empty():
 
     elif item_type == "llm_error":
         st.session_state.llm_error = item.get("message", "")
+        st.session_state.llm_last_attempts = item.get(
+            "attempts",
+            st.session_state.llm_last_attempts,
+        )
         st.session_state.llm_running = False
         st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
+        st.session_state.llm_last_start_epoch = 0.0
         st.session_state.llm_calls_this_session += 1
         st.session_state.correction_status = "error"
 
@@ -4102,8 +4074,17 @@ if use_llm_hints and gemini_api_key:
 
         st.session_state.llm_running = True
         st.session_state.llm_error = ""
-        st.session_state.llm_last_attempts = []
+        st.session_state.llm_last_finish_time = ""
         st.session_state.llm_last_start_time = time.strftime("%H:%M:%S")
+        st.session_state.llm_last_start_epoch = time.time()
+        st.session_state.llm_used_model = ""
+        st.session_state.llm_last_attempts = [{
+            "model": llm_model_name,
+            "status": "started",
+            "seconds": 0,
+            "parse_ok": False,
+            "note": "Gemma helper thread started; waiting for response.",
+        }]
         # Keep the previous corrected text visible while the next AI check runs.
         # New result will replace it when ready.
         st.session_state.caption_stage = "ai_checking"
@@ -4305,9 +4286,15 @@ elif st.session_state.llm_error:
     )
 elif st.session_state.llm_running:
     start_time = st.session_state.llm_last_start_time or "now"
+    start_epoch = float(st.session_state.get("llm_last_start_epoch", 0.0) or 0.0)
+    elapsed_text = ""
+
+    if start_epoch:
+        elapsed_text = f", elapsed {time.time() - start_epoch:.1f}s"
+
     correction_status_text = (
         f"AI correction checking with {llm_model_name} "
-        f"(started {start_time}, timeout {LLM_MODEL_TIMEOUT_SECONDS:.0f}s/model)"
+        f"(started {start_time}{elapsed_text}, timeout {LLM_MODEL_TIMEOUT_SECONDS:.0f}s/model)"
     )
 elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
     unclear_reason = st.session_state.llm_unclear_reason.strip()
@@ -4495,9 +4482,12 @@ if show_debug:
         st.code(json.dumps(st.session_state.llm_last_attempts, ensure_ascii=False, indent=2))
 
         st.write("Helper last start / finish:")
+        start_epoch = float(st.session_state.get("llm_last_start_epoch", 0.0) or 0.0)
+        elapsed = time.time() - start_epoch if start_epoch else 0.0
         st.code(
             f"start={st.session_state.llm_last_start_time}\n"
             f"finish={st.session_state.llm_last_finish_time}\n"
+            f"elapsed={elapsed:.1f}s\n"
             f"used_model={st.session_state.llm_used_model}"
         )
 
