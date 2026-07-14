@@ -2075,17 +2075,66 @@ def make_json_safe(value, depth=0):
     return str(value)[:600]
 
 
+def looks_like_prompt_echo(text):
+    """
+    Gemma can sometimes return or expose prompt/thought text instead of a
+    final answer. Do not treat that as a valid correction.
+    """
+    text = (text or "").strip()
+
+    if not text:
+        return False
+
+    markers = [
+        "Role: Interpreter assistant",
+        "Goal: Help interpreter",
+        "Input: Recent context",
+        "Current English translation",
+        "Selected class/domain context",
+        "Return JSON",
+        "Output JSON",
+        "corrected_japanese_original",
+        "corrected_english_caption",
+        "Technical glossary terms detected",
+    ]
+
+    marker_count = sum(1 for marker in markers if marker in text)
+
+    # One marker can appear inside a quoted debug message,
+    # but multiple markers means it is probably the prompt itself.
+    if marker_count >= 2:
+        return True
+
+    # If it starts like the exact prompt, reject.
+    if text.startswith("* Role: Interpreter assistant"):
+        return True
+
+    return False
+
+
+def shorten_error_for_ui(message, max_chars=650):
+    message = str(message or "").strip()
+
+    if len(message) <= max_chars:
+        return message
+
+    return message[:max_chars] + " ... [truncated; open debug panel for full details]"
+
+
 def extract_text_from_gemini_response(response):
     """
-    Gemma sometimes returns empty response.text even when the actual output
-    is inside candidates[0].content.parts[0].text. This collects all text
-    from response.text and candidate parts.
+    Gemma sometimes returns empty response.text even when candidate parts exist.
+
+    Important:
+    Do NOT collect parts where part.thought == True.
+    Those can contain hidden reasoning / prompt-like text and are not the
+    final helper answer. Accepting them makes the app apply nonsense.
     """
     texts = []
 
     try:
         response_text = getattr(response, "text", "") or ""
-        if response_text.strip():
+        if response_text.strip() and not looks_like_prompt_echo(response_text):
             texts.append(response_text.strip())
     except Exception:
         pass
@@ -2098,9 +2147,21 @@ def extract_text_from_gemini_response(response):
             parts = getattr(content, "parts", None) or []
 
             for part in parts:
+                is_thought = False
+
+                try:
+                    is_thought = bool(getattr(part, "thought", False))
+                except Exception:
+                    is_thought = False
+
+                # Critical fix:
+                # Ignore thought parts. They are not the final answer.
+                if is_thought:
+                    continue
+
                 part_text = getattr(part, "text", "") or ""
 
-                if part_text.strip():
+                if part_text.strip() and not looks_like_prompt_echo(part_text):
                     texts.append(part_text.strip())
 
     except Exception:
@@ -2117,20 +2178,23 @@ def extract_text_from_gemini_response(response):
 
     return "\n\n".join(unique_texts).strip()
 
-
 def extract_gemma_loose_corrections(raw_text, context_text, current_translation):
     """
     Gemma may answer with an explanation instead of JSON, for example:
       Problem 1: "サウナ" ... correct it to "サマーコース"
       Problem 2: "ニュース" ... likely BINUS
 
-    This function turns those useful explanations into the JSON-like fields
-    our app needs. It does not try to be magic; it only handles repeated
-    known classroom correction patterns.
+    This function turns useful final-answer explanations into JSON-like fields.
+    It must NOT parse prompt echo / thought text.
     """
     raw_text = (raw_text or "").strip()
     context_text = (context_text or "").strip()
     current_translation = (current_translation or "").strip()
+
+    # If the only extracted text is actually the prompt / thought,
+    # do not pretend Gemma succeeded.
+    if not raw_text or looks_like_prompt_echo(raw_text):
+        return None
 
     combined = f"{raw_text}\n{context_text}\n{current_translation}"
     combined_lower = combined.lower()
@@ -2779,7 +2843,28 @@ Return JSON in this exact format:
                 elapsed = time.time() - started_at
                 response_debug = describe_gemini_response(response)
                 response_text_for_parse = response_debug.get("response_text", "") or ""
-                candidate_parsed = parse_llm_json(response_text_for_parse)
+
+                if not response_text_for_parse.strip():
+                    candidate_parsed = {
+                        "parse_ok": False,
+                        "raw_text": "",
+                        "parse_error": (
+                            "No final Gemma answer text was found. "
+                            "The model may have returned only thought/prompt text."
+                        ),
+                    }
+
+                elif looks_like_prompt_echo(response_text_for_parse):
+                    candidate_parsed = {
+                        "parse_ok": False,
+                        "raw_text": response_text_for_parse,
+                        "parse_error": (
+                            "Gemma returned prompt/instruction echo, not a final answer."
+                        ),
+                    }
+
+                else:
+                    candidate_parsed = parse_llm_json(response_text_for_parse)
 
                 if not is_usable_llm_result(candidate_parsed):
                     loose_parsed = extract_gemma_loose_corrections(
@@ -2814,8 +2899,8 @@ Return JSON in this exact format:
                     "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
                     "parse_error": candidate_parsed.get("parse_error", ""),
                     "note": (
-                        "model returned no usable corrected_japanese_original "
-                        "or corrected_english_caption, and loose parser found no correction"
+                        "model returned no usable final answer. "
+                        "It may have returned only thought/prompt text, invalid JSON, or empty text"
                     ),
                     "raw_preview": (candidate_parsed.get("raw_text", "") or "")[:220],
                     "response_debug": response_debug,
@@ -3240,10 +3325,12 @@ def summarize_last_helper_attempts(attempts):
             finish_reason = candidates[0].get("finish_reason", "")
             safety_summary = str(candidates[0].get("safety_ratings", ""))[:220]
 
+        response_label = response_text[:160] if response_text else "<no final answer text>"
+
         lines.append(
             f"{model}: {status}, {seconds}s, parse_ok={parse_ok}, "
             f"finish_reason={finish_reason}, note={note}, "
-            f"response_text_preview={response_text[:160]!r}, "
+            f"response_text_preview={response_label!r}, "
             f"safety={safety_summary}"
         )
 
@@ -4081,7 +4168,7 @@ if st.session_state.soniox_error:
 if use_llm_hints and st.session_state.llm_error:
     st.warning(
         "LLM error: "
-        + st.session_state.llm_error
+        + shorten_error_for_ui(st.session_state.llm_error)
         + "\n\nLast Gemma attempt summary:\n"
         + summarize_last_helper_attempts(st.session_state.llm_last_attempts)
     )
@@ -4212,7 +4299,10 @@ if not use_llm_hints:
 elif not gemini_api_key:
     correction_status_text = "AI correction unavailable: GEMINI_API_KEY missing"
 elif st.session_state.llm_error:
-    correction_status_text = f"AI correction error: {st.session_state.llm_error}"
+    correction_status_text = (
+        "AI correction error: "
+        + shorten_error_for_ui(st.session_state.llm_error)
+    )
 elif st.session_state.llm_running:
     start_time = st.session_state.llm_last_start_time or "now"
     correction_status_text = (
