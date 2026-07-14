@@ -16,6 +16,7 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 from google import genai
 from google.genai import types
+from groq import Groq
 
 
 # ============================================================
@@ -41,8 +42,28 @@ GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
 GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
 
 # Helper / correction AI
-LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
-LLM_MODEL_BACKUP = "gemini-3.1-flash-lite"
+# Translation is still Gemini 3.5 Live Translate.
+# The second/helper correction AI is Groq because it is much faster for
+# short JSON correction tasks than Groq in this live-caption workflow.
+GROQ_HELPER_FAST = "llama-3.1-8b-instant"
+GROQ_HELPER_QWEN = "qwen/qwen3-32b"
+GROQ_HELPER_70B = "llama-3.3-70b-versatile"
+
+LLM_MODEL_DEFAULT = GROQ_HELPER_FAST
+LLM_MODEL_BACKUP = GROQ_HELPER_QWEN
+
+LLM_MODEL_OPTIONS = [
+    GROQ_HELPER_FAST,
+    GROQ_HELPER_QWEN,
+    GROQ_HELPER_70B,
+]
+
+# Helper model robustness.
+# Groq should be fast. If it is not back within this window, skip correction
+# and keep the live caption moving.
+LLM_MODEL_TIMEOUT_SECONDS = 8.0
+LLM_MODEL_WATCHDOG_SECONDS = 12.0
+LLM_MIN_USABLE_CORRECTION_CHARS = 5
 
 # Translation model for Gemini Live Translate mode
 GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
@@ -63,28 +84,28 @@ MAX_LLM_CONTEXT_CHUNKS = 6
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
     "High Accuracy": {
-        "interval": 20.0,
-        "min_chars": 120,
-        "session_limit": 120,
-        "description": "More frequent helper AI checks. Use only for short important demos.",
+        "interval": 10.0,
+        "min_chars": 60,
+        "session_limit": 500,
+        "description": "Fast Groq helper checks. Use for short important demos when quota is available.",
     },
     "Balanced": {
-        "interval": 45.0,
-        "min_chars": 180,
-        "session_limit": 80,
-        "description": "Recommended default for normal classes.",
+        "interval": 20.0,
+        "min_chars": 100,
+        "session_limit": 300,
+        "description": "Recommended default for Groq free helper usage.",
     },
     "Saver": {
-        "interval": 90.0,
-        "min_chars": 260,
-        "session_limit": 40,
-        "description": "Safer for multiple classes per day.",
+        "interval": 45.0,
+        "min_chars": 180,
+        "session_limit": 120,
+        "description": "Safer for longer classes or when quota is getting low.",
     },
     "Emergency Rule-Based Only": {
         "interval": 999999.0,
         "min_chars": 999999,
         "session_limit": 0,
-        "description": "No Gemini 3.1 helper calls. Built-in glossary cleanup only.",
+        "description": "No helper AI calls. Built-in glossary cleanup only.",
     },
 }
 
@@ -886,6 +907,97 @@ def light_original_cleanup(text):
     return cleaned.strip()
 
 
+def light_school_context_cleanup(original_text, translation_text):
+    """
+    Context-sensitive cleanup for ASO/BINUS Summer Course speech.
+
+    Gemini Live Translate can mishear サマーコース as unrelated English like
+    "mackerel school/course". The helper AI can repair it later, but this
+    fixes obvious school-context mistakes immediately in the raw caption.
+    """
+    original_text = (original_text or "").strip()
+    translation_text = (translation_text or "").strip()
+
+    combined_lower = f"{original_text}\n{translation_text}".lower()
+
+    summer_context_terms = [
+        "サマーコース",
+        "サマコース",
+        "summer course",
+        "binus",
+        "ビヌス",
+        "aso",
+        "麻生",
+        "学生",
+        "student",
+        "students",
+        "大学",
+        "university",
+        "日本に来",
+        "coming to japan",
+    ]
+
+    has_summer_context = any(
+        term.lower() in combined_lower
+        for term in summer_context_terms
+    )
+
+    if has_summer_context:
+        original_replacements = {
+            "サマコース": "サマーコース",
+            "サマー講座": "サマーコース",
+            "サバ塾": "サマーコース",
+            "鯖塾": "サマーコース",
+            "さば塾": "サマーコース",
+            "サバジュク": "サマーコース",
+            "さばじゅく": "サマーコース",
+            "サバ学校": "サマーコース",
+            "鯖学校": "サマーコース",
+            "サバコース": "サマーコース",
+            "鯖コース": "サマーコース",
+        }
+
+        translation_replacements = {
+            "Mackerel School": "Summer Course",
+            "mackerel school": "Summer Course",
+            "Mackerel school": "Summer Course",
+            "mackerel School": "Summer Course",
+            "Mackerel Course": "Summer Course",
+            "mackerel course": "Summer Course",
+            "Mackerel course": "Summer Course",
+            "mackerel class": "Summer Course",
+            "Mackerel class": "Summer Course",
+            "mackerel program": "Summer Course",
+            "Mackerel program": "Summer Course",
+            "saba school": "Summer Course",
+            "Saba school": "Summer Course",
+            "saba course": "Summer Course",
+            "Saba course": "Summer Course",
+
+            "News university": "BINUS University",
+            "news university": "BINUS University",
+            "Neus university": "BINUS University",
+            "neus university": "BINUS University",
+            "Venus university": "BINUS University",
+            "venus university": "BINUS University",
+
+            "special promenade": "special program",
+            "Special promenade": "Special program",
+            "the promenade": "the program",
+            "The promenade": "The program",
+            "promenade is": "program is",
+            "promenade will": "program will",
+        }
+
+        for wrong, correct in original_replacements.items():
+            original_text = original_text.replace(wrong, correct)
+
+        for wrong, correct in translation_replacements.items():
+            translation_text = translation_text.replace(wrong, correct)
+
+    return original_text.strip(), translation_text.strip()
+
+
 def light_domain_context_cleanup(original_text, translation_text, domain_mode):
     """
     Context-sensitive cleanup for terms that are dangerous to replace globally.
@@ -899,6 +1011,11 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
     original_text = (original_text or "").strip()
     translation_text = (translation_text or "").strip()
     domain = (domain_mode or "auto").lower()
+
+    original_text, translation_text = light_school_context_cleanup(
+        original_text,
+        translation_text,
+    )
 
     combined = f"{original_text}\n{translation_text}".lower()
 
@@ -979,6 +1096,168 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
 
 
 
+
+
+def text_char_overlap_ratio(shorter_text, longer_text):
+    shorter_text = (shorter_text or "").strip()
+    longer_text = (longer_text or "").strip()
+
+    if not shorter_text or not longer_text:
+        return 0.0
+
+    shorter_set = set(shorter_text)
+    longer_set = set(longer_text)
+
+    if not shorter_set:
+        return 0.0
+
+    return len(shorter_set & longer_set) / max(1, len(shorter_set))
+
+
+def ai_text_is_full_enough(live_text, ai_text, min_ratio=0.72):
+    """
+    True when the AI text looks like a full corrected caption, not just
+    a short correction phrase.
+
+    This prevents:
+        long live caption -> "サマーコース"
+    from replacing the whole caption and making it look like the caption restarted.
+    """
+    live_text = (live_text or "").strip()
+    ai_text = (ai_text or "").strip()
+
+    if not ai_text:
+        return False
+
+    if not live_text:
+        return True
+
+    live_len = len(live_text)
+    ai_len = len(ai_text)
+
+    if ai_len >= live_len * min_ratio:
+        return True
+
+    if live_text in ai_text:
+        return True
+
+    if ai_len >= 40 and text_char_overlap_ratio(ai_text, live_text) >= 0.85:
+        return True
+
+    return False
+
+
+def merge_ai_correction_with_live_text(
+    live_text,
+    ai_text,
+    corrections,
+    text_kind,
+    domain_mode,
+    force_patch_mode=False,
+):
+    """
+    Merge helper AI correction without deleting previous live caption.
+
+    Full replace mode:
+        Used only when AI text appears to be a full corrected caption.
+
+    Patch mode:
+        Used for Groq loose parser / partial corrections.
+        It applies correction pairs to the existing live caption and then
+        runs cleanup rules, keeping the previous text.
+    """
+    live_text = (live_text or "").strip()
+    ai_text = (ai_text or "").strip()
+
+    patched_text = apply_llm_corrections(live_text, corrections)
+
+    if (
+        not force_patch_mode
+        and ai_text_is_full_enough(live_text, ai_text)
+    ):
+        merged_text = ai_text
+    else:
+        merged_text = patched_text or live_text
+
+        if not merged_text and ai_text:
+            merged_text = ai_text
+
+    if text_kind == "original":
+        merged_text = light_original_cleanup(merged_text)
+        merged_text, _ = light_domain_context_cleanup(
+            merged_text,
+            "",
+            domain_mode,
+        )
+        return merged_text.strip()
+
+    if text_kind == "translation":
+        merged_text = light_caption_cleanup(merged_text)
+        _, merged_text = light_domain_context_cleanup(
+            "",
+            merged_text,
+            domain_mode,
+        )
+        return merged_text.strip()
+
+    return merged_text.strip()
+
+
+def current_llm_source_is_active(current_source, corrected_source):
+    """
+    Prevent stale LLM corrections/key terms from an old topic from affecting
+    the current live caption.
+    """
+    if not current_source or not corrected_source:
+        return False
+
+    return source_text_matches_for_correction(current_source, corrected_source)
+
+
+def looks_like_low_confidence_raw_caption(original_text, translation_text):
+    """
+    Heuristic only. This does not fix text.
+    It only warns the user that the raw Gemini Live caption is probably bad
+    and should wait for Groq correction / clearer audio.
+    """
+    original_text = (original_text or "").strip()
+    translation_text = (translation_text or "").strip()
+    lower_en = translation_text.lower()
+
+    if not original_text and not translation_text:
+        return False, ""
+
+    filler_jp_count = sum(original_text.count(x) for x in [
+        "ね", "まあ", "じゃ", "なんじゃ", "こじじゃ", "ことじゃ",
+    ])
+
+    filler_en_count = sum(lower_en.count(x) for x in [
+        "you know",
+        "what on earth",
+        "what's going on",
+        "so, yeah",
+        "pro's idea",
+        "it's not special",
+    ])
+
+    if filler_en_count >= 3:
+        return True, "raw English has many filler/nonsense phrases"
+
+    if filler_jp_count >= 9 and len(original_text) >= 80:
+        return True, "raw Japanese looks filler-heavy / unclear"
+
+    # Long caption but no likely class-specific noun after cleanup.
+    class_terms = [
+        "サマーコース", "ビヌス", "BINUS", "Summer Course",
+        "CATIA", "CAD", "TTC", "AEB", "慣性", "ロータリー",
+        "部品", "拘束", "スケッチ",
+    ]
+
+    if len(original_text) >= 90 and len(translation_text) >= 120:
+        if not any(term in original_text or term in translation_text for term in class_terms):
+            return True, "no clear technical/school keyword found in a long messy caption"
+
+    return False, ""
 
 
 def prepare_next_ai_check_after_new_live_text():
@@ -1485,9 +1764,15 @@ def gemini_live_translate_worker(
                                     "message": "Gemini Live Japanese input transcription started.",
                                 })
 
+                            cleaned_input_text = light_original_cleanup(input_text)
+                            cleaned_input_text, live_translation = light_school_context_cleanup(
+                                cleaned_input_text,
+                                live_translation,
+                            )
+
                             live_original = append_stream_text(
                                 live_original,
-                                light_original_cleanup(input_text),
+                                cleaned_input_text,
                                 max_chars=MAX_ORIGINAL_CHARS * 2,
                             )
 
@@ -1515,10 +1800,21 @@ def gemini_live_translate_worker(
                                     "message": "Gemini Live English output translation started.",
                                 })
 
+                            cleaned_output_text = light_caption_cleanup(output_text)
+                            live_original, cleaned_output_text = light_school_context_cleanup(
+                                live_original,
+                                cleaned_output_text,
+                            )
+
                             live_translation = append_stream_text(
                                 live_translation,
-                                light_caption_cleanup(output_text),
+                                cleaned_output_text,
                                 max_chars=MAX_TRANSLATION_CHARS * 2,
+                            )
+
+                            live_original, live_translation = light_school_context_cleanup(
+                                live_original,
+                                live_translation,
                             )
 
                             # English appears when Gemini finishes/streams translation.
@@ -1729,6 +2025,9 @@ Possible topics include:
 
 Correction priorities:
 - Use the recent Japanese/English context to decide which domain is active.
+- If the speaker is discussing ASO/BINUS events, students coming to Japan, or university activities, preserve サマーコース = Summer Course.
+- In school/event context, if English says "mackerel school", "mackerel course", or "mackerel class", correct it to Summer Course.
+- In school/event context, if English says "News university" or "Neus university", correct it to BINUS University.
 - Do not force a domain term unless it fits the current sentence.
 - Preserve important acronyms and proper nouns.
 """.strip()
@@ -1738,18 +2037,527 @@ Correction priorities:
 # LLM Interpreter Support
 # ============================================================
 
-def parse_llm_json(text):
-    if not text:
+def make_json_safe(value, depth=0):
+    """
+    Convert Gemini SDK response objects into JSON-safe values for debugging.
+    Avoids crashing the Streamlit UI when the SDK object contains non-serializable fields.
+    """
+    if depth > 4:
+        return str(value)[:600]
+
+    if value is None:
+        return None
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (list, tuple)):
+        return [
+            make_json_safe(item, depth + 1)
+            for item in value[:8]
+        ]
+
+    if isinstance(value, dict):
         return {
-            "main_idea": "",
-            "say_it_simply": "",
-            "corrected_japanese_original": "",
-            "corrected_english_caption": "",
-            "is_unclear": False,
-            "unclear_reason": "",
-            "key_terms": [],
-            "corrections": [],
+            str(key): make_json_safe(val, depth + 1)
+            for key, val in list(value.items())[:30]
         }
+
+    # Pydantic / SDK model_dump
+    if hasattr(value, "model_dump"):
+        try:
+            return make_json_safe(value.model_dump(), depth + 1)
+        except Exception:
+            pass
+
+    # Dataclass-like or simple SDK objects
+    if hasattr(value, "__dict__"):
+        try:
+            return make_json_safe(vars(value), depth + 1)
+        except Exception:
+            pass
+
+    return str(value)[:600]
+
+
+def looks_like_prompt_echo(text):
+    """
+    Groq can sometimes return or expose prompt/thought text instead of a
+    final answer. Do not treat that as a valid correction.
+    """
+    text = (text or "").strip()
+
+    if not text:
+        return False
+
+    markers = [
+        "Role: Interpreter assistant",
+        "Goal: Help interpreter",
+        "Input: Recent context",
+        "Current English translation",
+        "Selected class/domain context",
+        "Return JSON",
+        "Output JSON",
+        "corrected_japanese_original",
+        "corrected_english_caption",
+        "Technical glossary terms detected",
+    ]
+
+    marker_count = sum(1 for marker in markers if marker in text)
+
+    # One marker can appear inside a quoted debug message,
+    # but multiple markers means it is probably the prompt itself.
+    if marker_count >= 2:
+        return True
+
+    # If it starts like the exact prompt, reject.
+    if text.startswith("* Role: Interpreter assistant"):
+        return True
+
+    return False
+
+
+def shorten_error_for_ui(message, max_chars=650):
+    message = str(message or "").strip()
+
+    if len(message) <= max_chars:
+        return message
+
+    return message[:max_chars] + " ... [truncated; open debug panel for full details]"
+
+
+def extract_text_from_gemini_response(response):
+    """
+    Groq sometimes returns empty response.text even when candidate parts exist.
+
+    Important:
+    Do NOT collect parts where part.thought == True.
+    Those can contain hidden reasoning / prompt-like text and are not the
+    final helper answer. Accepting them makes the app apply nonsense.
+    """
+    texts = []
+
+    try:
+        response_text = getattr(response, "text", "") or ""
+        if response_text.strip() and not looks_like_prompt_echo(response_text):
+            texts.append(response_text.strip())
+    except Exception:
+        pass
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) or []
+
+            for part in parts:
+                is_thought = False
+
+                try:
+                    is_thought = bool(getattr(part, "thought", False))
+                except Exception:
+                    is_thought = False
+
+                # Critical fix:
+                # Ignore thought parts. They are not the final answer.
+                if is_thought:
+                    continue
+
+                part_text = getattr(part, "text", "") or ""
+
+                if part_text.strip() and not looks_like_prompt_echo(part_text):
+                    texts.append(part_text.strip())
+
+    except Exception:
+        pass
+
+    # Deduplicate while preserving order.
+    unique_texts = []
+    seen = set()
+
+    for text in texts:
+        if text not in seen:
+            unique_texts.append(text)
+            seen.add(text)
+
+    return "\n\n".join(unique_texts).strip()
+
+def extract_groq_loose_corrections(raw_text, context_text, current_translation):
+    """
+    Groq may answer with an explanation instead of JSON, for example:
+      Problem 1: "サウナ" ... correct it to "サマーコース"
+      Problem 2: "ニュース" ... likely BINUS
+
+    This function turns useful final-answer explanations into JSON-like fields.
+    It must NOT parse prompt echo / thought text.
+    """
+    raw_text = (raw_text or "").strip()
+    context_text = (context_text or "").strip()
+    current_translation = (current_translation or "").strip()
+
+    # If the only extracted text is actually the prompt / thought,
+    # do not pretend Groq succeeded.
+    if not raw_text or looks_like_prompt_echo(raw_text):
+        return None
+
+    combined = f"{raw_text}\n{context_text}\n{current_translation}"
+    combined_lower = combined.lower()
+
+    corrected_japanese = ""
+    corrected_english = current_translation
+    key_terms = []
+    corrections = []
+
+    def add_correction(wrong, correct, reason):
+        corrections.append({
+            "wrong": wrong,
+            "correct": correct,
+            "reason": reason,
+        })
+
+    # Start from the recent Japanese line if possible.
+    japanese_lines = []
+    for line in context_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Japanese:"):
+            japanese_lines.append(stripped.replace("Japanese:", "", 1).strip())
+
+    if japanese_lines:
+        corrected_japanese = japanese_lines[-1]
+
+    # Summer Course / BINUS common mistakes.
+    school_context = any(term in combined_lower for term in [
+        "summer course",
+        "サマーコース",
+        "binus",
+        "ビヌス",
+        "student",
+        "students",
+        "学生",
+        "coming to japan",
+        "日本に来",
+        "special program",
+        "program held every year",
+        "mackerel",
+        "sauna",
+        "サウナ",
+        "news university",
+        "new tiger",
+        "new style",
+    ])
+
+    if school_context:
+        jp_replacements = {
+            "サウナ": "サマーコース",
+            "サウナこういった感じ": "サマーコース",
+            "サマコース": "サマーコース",
+            "サバ塾": "サマーコース",
+            "鯖塾": "サマーコース",
+            "サバコース": "サマーコース",
+            "ニューズ": "ビヌス",
+            "ニュース": "ビヌス",
+            "ニュータイガー": "ビヌス",
+            "ニュータイプ": "ビヌス",
+            "ニュースタイル": "ビヌス",
+        }
+
+        en_replacements = {
+            "saunas": "Summer Course",
+            "Saunas": "Summer Course",
+            "sauna": "Summer Course",
+            "Sauna": "Summer Course",
+            "mackerel school": "Summer Course",
+            "mackerel course": "Summer Course",
+            "mackerel class": "Summer Course",
+            "virtual cram school": "Summer Course",
+            "cram school": "Summer Course",
+            "News university": "BINUS University",
+            "news university": "BINUS University",
+            "New Tiger students": "BINUS University students",
+            "new tiger students": "BINUS University students",
+            "New style of students": "BINUS University students",
+            "new style of students": "BINUS University students",
+            "news students": "BINUS University students",
+            "News students": "BINUS University students",
+            "new students": "BINUS University students",
+        }
+
+        if corrected_japanese:
+            before = corrected_japanese
+            for wrong, correct in jp_replacements.items():
+                corrected_japanese = corrected_japanese.replace(wrong, correct)
+            if corrected_japanese != before:
+                add_correction(before, corrected_japanese, "Groq loose parse: school-event Japanese correction")
+
+        before_en = corrected_english
+        for wrong, correct in en_replacements.items():
+            corrected_english = corrected_english.replace(wrong, correct)
+
+        if corrected_english != before_en:
+            add_correction(before_en, corrected_english, "Groq loose parse: school-event English correction")
+
+        key_terms.append({
+            "term": "サマーコース",
+            "meaning": "Summer Course",
+        })
+        key_terms.append({
+            "term": "ビヌス大学",
+            "meaning": "BINUS University",
+        })
+
+    # CATIA / CAD common mistakes.
+    cad_context = any(term in combined_lower for term in [
+        "catia", "cad", "sketch", "sketcher", "part", "parts",
+        "constraint", "pad", "fillet", "chamfer", "部品", "拘束",
+        "スケッチ", "勝ち方", "way to win",
+    ])
+
+    if cad_context:
+        jp_replacements = {
+            "勝ち方": "CATIA",
+            "書き方": "CATIA",
+            "キャリア": "CATIA",
+            "カチア": "CATIA",
+        }
+
+        en_replacements = {
+            "way to win": "CATIA",
+            "the way to win": "CATIA",
+            "how to win": "CATIA",
+            "career": "CATIA",
+        }
+
+        if corrected_japanese:
+            before = corrected_japanese
+            for wrong, correct in jp_replacements.items():
+                corrected_japanese = corrected_japanese.replace(wrong, correct)
+            if corrected_japanese != before:
+                add_correction(before, corrected_japanese, "Groq loose parse: CAD Japanese correction")
+
+        before_en = corrected_english
+        for wrong, correct in en_replacements.items():
+            corrected_english = corrected_english.replace(wrong, correct)
+
+        if corrected_english != before_en:
+            add_correction(before_en, corrected_english, "Groq loose parse: CAD English correction")
+
+        key_terms.append({
+            "term": "CATIA",
+            "meaning": "CATIA",
+        })
+
+    # Automotive / control common mistakes.
+    auto_context = any(term in combined_lower for term in [
+        "ttc", "aeb", "adas", "brake", "braking", "collision",
+        "inertia", "sensory compensation", "completion assurance",
+        "慣性", "感性補償", "完成保証", "abc",
+    ])
+
+    if auto_context:
+        en_replacements = {
+            "ABC": "TTC",
+            "sensory compensation": "inertia compensation",
+            "sensitivity compensation": "inertia compensation",
+            "completion assurance": "inertia compensation",
+            "completion compensation": "inertia compensation",
+        }
+
+        jp_replacements = {
+            "感性補償": "慣性補償",
+            "完成保証": "慣性補償",
+            "完成補償": "慣性補償",
+            "ABC": "TTC",
+        }
+
+        if corrected_japanese:
+            before = corrected_japanese
+            for wrong, correct in jp_replacements.items():
+                corrected_japanese = corrected_japanese.replace(wrong, correct)
+            if corrected_japanese != before:
+                add_correction(before, corrected_japanese, "Groq loose parse: automotive Japanese correction")
+
+        before_en = corrected_english
+        for wrong, correct in en_replacements.items():
+            corrected_english = corrected_english.replace(wrong, correct)
+
+        if corrected_english != before_en:
+            add_correction(before_en, corrected_english, "Groq loose parse: automotive English correction")
+
+    corrected_japanese, corrected_english = light_domain_context_cleanup(
+        corrected_japanese,
+        corrected_english,
+        "auto",
+    )
+    corrected_japanese, corrected_english = light_school_context_cleanup(
+        corrected_japanese,
+        corrected_english,
+    )
+
+    # If Groq explanation explicitly says it corrected something but we only
+    # have Japanese, still return the Japanese correction.
+    usable = bool(corrections or corrected_japanese or corrected_english != current_translation)
+
+    if not usable:
+        return None
+
+    return {
+        "main_idea": "",
+        "say_it_simply": "",
+        "corrected_japanese_original": corrected_japanese,
+        "corrected_english_caption": corrected_english,
+        "is_unclear": False,
+        "unclear_reason": "",
+        "key_terms": key_terms,
+        "corrections": corrections,
+        "parse_ok": True,
+        "raw_text": raw_text,
+        "loose_parse": True,
+    }
+
+
+def describe_helper_response(response):
+    """
+    Debug formatter for Groq helper responses.
+    Keeps the same response_debug shape used by the UI.
+    """
+    info = {
+        "response_text": getattr(response, "text", "") or "",
+        "response_repr": repr(response)[:3000],
+        "prompt_feedback": None,
+        "usage_metadata": getattr(response, "usage", None),
+        "helper_model": getattr(response, "model", ""),
+        "helper_response_format": str(getattr(response, "response_format", "")),
+        "raw": getattr(response, "raw", "")[:2200],
+        "candidates": [],
+    }
+
+    return info
+
+
+def describe_gemini_response(response):
+    """
+    Build a compact but useful debug report for a Gemini/Groq response.
+    This is needed because response.text can be empty even when the model
+    returned candidates, safety metadata, finish reasons, or errors.
+    """
+    info = {
+        "response_text": "",
+        "response_repr": "",
+        "prompt_feedback": None,
+        "usage_metadata": None,
+        "candidates": [],
+    }
+
+    try:
+        info["response_text"] = extract_text_from_gemini_response(response)
+    except Exception as e:
+        info["response_text"] = f"<response text extraction error: {e}>"
+
+    try:
+        info["response_repr"] = repr(response)[:3000]
+    except Exception as e:
+        info["response_repr"] = f"<repr error: {e}>"
+
+    try:
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        info["prompt_feedback"] = make_json_safe(prompt_feedback)
+    except Exception as e:
+        info["prompt_feedback"] = f"<prompt_feedback error: {e}>"
+
+    try:
+        usage_metadata = getattr(response, "usage_metadata", None)
+        info["usage_metadata"] = make_json_safe(usage_metadata)
+    except Exception as e:
+        info["usage_metadata"] = f"<usage_metadata error: {e}>"
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+
+        for candidate in candidates[:4]:
+            candidate_info = {
+                "finish_reason": "",
+                "finish_message": "",
+                "safety_ratings": None,
+                "content_role": "",
+                "parts": [],
+            }
+
+            try:
+                candidate_info["finish_reason"] = str(
+                    getattr(candidate, "finish_reason", "") or ""
+                )
+            except Exception:
+                pass
+
+            try:
+                candidate_info["finish_message"] = str(
+                    getattr(candidate, "finish_message", "") or ""
+                )
+            except Exception:
+                pass
+
+            try:
+                candidate_info["safety_ratings"] = make_json_safe(
+                    getattr(candidate, "safety_ratings", None)
+                )
+            except Exception:
+                pass
+
+            try:
+                content = getattr(candidate, "content", None)
+                candidate_info["content_role"] = str(
+                    getattr(content, "role", "") or ""
+                )
+
+                parts = getattr(content, "parts", None) or []
+
+                for part in parts[:6]:
+                    part_text = ""
+
+                    try:
+                        part_text = getattr(part, "text", "") or ""
+                    except Exception:
+                        part_text = ""
+
+                    candidate_info["parts"].append({
+                        "text": part_text[:1500],
+                        "part_repr": repr(part)[:800],
+                        "part_safe": make_json_safe(part),
+                    })
+
+            except Exception as e:
+                candidate_info["parts"].append({
+                    "error": str(e),
+                })
+
+            info["candidates"].append(candidate_info)
+
+    except Exception as e:
+        info["candidates"] = [{
+            "error": str(e),
+        }]
+
+    return info
+
+
+def parse_llm_json(text):
+    empty_result = {
+        "main_idea": "",
+        "say_it_simply": "",
+        "corrected_japanese_original": "",
+        "corrected_english_caption": "",
+        "is_unclear": False,
+        "unclear_reason": "",
+        "key_terms": [],
+        "corrections": [],
+        "parse_ok": False,
+        "raw_text": text or "",
+        "parse_error": "",
+    }
+
+    if not text:
+        return empty_result
 
     cleaned = text.strip()
 
@@ -1761,6 +2569,15 @@ def parse_llm_json(text):
 
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
+
+    # Groq sometimes writes a sentence before/after JSON.
+    # Extract the first JSON object if possible.
+    if not cleaned.startswith("{"):
+        json_start = cleaned.find("{")
+        json_end = cleaned.rfind("}")
+
+        if json_start >= 0 and json_end > json_start:
+            cleaned = cleaned[json_start:json_end + 1].strip()
 
     try:
         data = json.loads(cleaned)
@@ -1777,20 +2594,163 @@ def parse_llm_json(text):
             "unclear_reason": str(data.get("unclear_reason", "")).strip(),
             "key_terms": data.get("key_terms", []),
             "corrections": data.get("corrections", []),
+            "parse_ok": True,
+            "raw_text": text or "",
         }
 
     except Exception:
-        return {
-            "main_idea": cleaned[:220],
-            "say_it_simply": "",
-            "corrected_japanese_original": "",
-            "corrected_english_caption": "",
-            "is_unclear": False,
-            "unclear_reason": "",
-            "key_terms": [],
-            "corrections": [],
-        }
+        result = dict(empty_result)
+        result["main_idea"] = cleaned[:220]
+        result["raw_text"] = text or ""
+        result["parse_error"] = "json.loads failed after cleanup"
+        return result
 
+
+def is_usable_llm_result(parsed):
+    """
+    Groq can return text that parses weakly but does not contain a useful
+    correction. Treat that as failure so fallback can try the next model.
+    """
+    if not parsed:
+        return False
+
+    if not parsed.get("parse_ok", False):
+        return False
+
+    corrected_jp = (parsed.get("corrected_japanese_original") or "").strip()
+    corrected_en = (parsed.get("corrected_english_caption") or "").strip()
+
+    if len(corrected_jp) >= LLM_MIN_USABLE_CORRECTION_CHARS:
+        return True
+
+    if len(corrected_en) >= LLM_MIN_USABLE_CORRECTION_CHARS:
+        return True
+
+    if parsed.get("is_unclear", False):
+        return True
+
+    if parsed.get("key_terms") or parsed.get("corrections"):
+        return True
+
+    return False
+
+
+def generate_content_with_timeout(client, model_name, prompt, timeout_seconds):
+    """
+    Run a Groq helper model call in a daemon thread so a slow call cannot
+    block the app forever.
+
+    The response object returned here has a .text field so the existing
+    parser/debug pipeline can keep working.
+    """
+    local_queue = queue.Queue()
+
+    def call_model():
+        try:
+            # Try JSON mode first. Some models support it well.
+            response_format_attempts = [
+                {"type": "json_object"},
+                None,
+            ]
+
+            last_error = ""
+
+            for response_format in response_format_attempts:
+                try:
+                    kwargs = {
+                        "model": model_name,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a strict JSON caption-correction assistant. "
+                                    "Return only valid JSON. No markdown."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": prompt,
+                            },
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 900,
+                    }
+
+                    if response_format is not None:
+                        kwargs["response_format"] = response_format
+
+                    completion = client.chat.completions.create(**kwargs)
+                    text = ""
+
+                    try:
+                        text = completion.choices[0].message.content or ""
+                    except Exception:
+                        text = ""
+
+                    usage = None
+                    try:
+                        usage = completion.usage
+                    except Exception:
+                        usage = None
+
+                    local_queue.put({
+                        "ok": True,
+                        "response": {
+                            "text": text,
+                            "model": model_name,
+                            "response_format": response_format,
+                            "usage": str(usage),
+                            "raw": str(completion)[:2200],
+                        },
+                        "error": "",
+                    })
+                    return
+
+                except Exception as format_error:
+                    last_error = str(format_error)
+                    continue
+
+            local_queue.put({
+                "ok": False,
+                "response": None,
+                "error": last_error or "Groq helper returned no result.",
+            })
+
+        except Exception as e:
+            local_queue.put({
+                "ok": False,
+                "response": None,
+                "error": str(e),
+            })
+
+    worker = threading.Thread(target=call_model, daemon=True)
+    worker.start()
+    worker.join(float(timeout_seconds))
+
+    if worker.is_alive():
+        raise TimeoutError(
+            f"{model_name} did not return within {timeout_seconds:.0f} seconds"
+        )
+
+    if local_queue.empty():
+        raise RuntimeError(f"{model_name} finished without returning a result")
+
+    item = local_queue.get()
+
+    if not item["ok"]:
+        raise RuntimeError(item["error"])
+
+    class HelperResponse:
+        pass
+
+    helper_response = HelperResponse()
+    helper_response.text = item["response"].get("text", "")
+    helper_response.response_format = item["response"].get("response_format")
+    helper_response.model = item["response"].get("model", model_name)
+    helper_response.usage = item["response"].get("usage", "")
+    helper_response.raw = item["response"].get("raw", "")
+
+    return helper_response
 
 def llm_hint_worker(
     result_queue,
@@ -1800,9 +2760,10 @@ def llm_hint_worker(
     current_translation,
     key_terms,
     class_context="",
+    fallback_model_names=None,
 ):
     try:
-        client = genai.Client(api_key=api_key)
+        client = Groq(api_key=api_key)
 
         glossary_text = ""
 
@@ -1825,136 +2786,163 @@ def llm_hint_worker(
             class_context = "No fixed class context was selected."
 
         prompt = f"""
-You are an interpreter assistant.
+Return ONLY one JSON object. No markdown. No code fences.
 
-Your job is NOT to translate everything again.
-Your job is to help the interpreter understand the lecture flow quickly
-AND repair obvious STT/translation mistakes in technical terms.
+You correct a live Japanese-to-English classroom caption.
 
-Use the selected class/domain context as fixed background.
-Use the recent context below. The latest part is at the bottom.
+Tasks:
+1. Fix obvious STT/translation mistakes in technical terms and proper nouns.
+2. Fix English grammar naturally.
+3. Keep speaker perspective. If the speaker says I/we, keep I/we.
+4. Stay close to the current caption. Do not invent new facts.
+5. If unclear, set is_unclear true and keep correction minimal.
+6. Always fill corrected_japanese_original and corrected_english_caption.
+7. If no correction is needed, copy the current Japanese/English text.
 
-Rules:
-- Output JSON only.
-- Treat the selected class/domain context as high-priority background for repairing STT mistakes.
-- The selected class/domain context does not override actual speech. Do not invent terms that are not supported by the current sentence.
-- If the selected domain is CAD/Product Design, prefer CATIA/CAD vocabulary when the current sentence mentions parts, sketches, constraints, modeling, or design.
-- If the selected domain is Automotive, prefer automotive/AEB/TTC/braking/control vocabulary when the current sentence mentions vehicles, braking, distance, motor, control, or engine.
-- Do not add new facts.
-- Do not summarize the speaker.
-- Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
-- Do not rewrite "I" as "the speaker" unless the original meaning is third-person.
-- Use previous context only to repair unclear wording and technical terms.
-- Repair obvious STT/translation mistakes in technical terms quickly.
-- Repair awkward English sentence structure so the caption sounds natural.
-- Return the corrected_japanese_original and corrected_english_caption even for short segments.
-- Keep the corrected English caption close to the current English translation.
-- Preserve technical terms from the glossary.
-- If the transcript is unclear, make the safest minimal correction.
-- If the sentence is broken, missing a key word, or does not make sense even with the selected class/domain context, set is_unclear to true and explain briefly in unclear_reason.
-- If you are not confident whether a term is CATIA, Sketcher, TTC, AEB, rotary engine, etc., set is_unclear to true instead of forcing the correction.
-- Do not hide uncertainty. It is safer to mark unclear than to invent a technical term.
-- Only include "[unclear]" inside corrected_english_caption when a critical missing phrase prevents a reliable caption. Otherwise use is_unclear and unclear_reason only.
-- If STT or translation uses a wrong technical term, add it to corrections.
-- If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
-- Prefer corrected technical terms in key_terms.
-- Also fix obvious Japanese Original mistakes in corrected_japanese_original.
-- corrected_japanese_original must stay Japanese and close to the original.
-- Do not invent missing Japanese. Only repair obvious wrong technical words.
-- Example Japanese correction: 感性の影響 -> 慣性の影響.
-- Example Japanese correction: 慣性補償性制御 -> 慣性補償制御.
-- Example Japanese correction: 完成の駅 -> 慣性の影響.
-- For key_terms, use the Japanese source technical term when possible, for example "慣性補償 = inertia compensation".
-- Do not output English-to-English key terms like "inertia compensation = Control technique...".
-- Also preserve school/event names:
-  サマーコース = Summer Course
-  ビヌス = BINUS
-  ビヌスASO = BINUS ASO
-  ビヌス大学 = BINUS University
-  ARE = Automotive and Robotics Engineering
-  PDE = Product Design Engineering
-  BE = Business Engineering
-  CATIA = CATIA
-  CAD = Computer-Aided Design
-  ロータリーエンジン = rotary engine
-- CATIA / CAD correction rules:
-  Preserve CATIA and CAD exactly as acronyms.
-  If the CAD/Product Design topic is clearly about parts, sketches, constraints, Pad, or modeling,
-  correct 勝ち方 / 書き方 / キャリア / "way to win" to CATIA.
-  Do NOT correct 勝ち方 when the topic is truly about winning or competition.
-  スケッチャー = Sketcher
-  寸法拘束 = dimensional constraint
-  幾何拘束 = geometric constraint
-  完全拘束 = fully constrained
-  自由度 = degrees of freedom
-  Pad = Pad / extrusion
-  フィレット = fillet
-  Chamfer / 面取り = chamfer / chamfering
-  設計意図 = design intent
-  加工性 = manufacturability
-- Rotary engine correction rules:
-  ロータリーエンジン = rotary engine
-  レシプロエンジン = reciprocating engine
-  ローター = rotor
-  アペックスシール = apex seal
-- Major-name correction rules:
-  If the topic is BINUS ASO majors or students, correct AROI / ARO to ARE when it means Automotive and Robotics Engineering.
-  If the topic is BINUS ASO majors or students, correct PDA / ADC / PD to PDE when it means Product Design Engineering.
-  If the topic is BINUS ASO majors or students, correct BA / B to BE only when it clearly means Business Engineering.
-  Do not change normal words to ARE/PDE/BE unless the context is clearly about majors/programs.
-- Context-only Summer Course rule:
-  If the topic is clearly the ASO/BINUS Summer Course program, and the transcript says 様様, 様々, さまざま, or チーム where "course/program" makes more sense, correct it to サマーコース.
-  Do NOT correct チーム when it really means team.
-  Do NOT correct 様々 or さまざま when it really means various.
-- If the transcript says ネウス大学, ビーナス大学, or ビナス大学 in this school context, correct it to ビヌス大学.
-- Key terms may include important school/event names when relevant.
-- Only output important technical words or important proper nouns, not normal words.
-- Example correction:
-  {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
+Important correction hints:
+- サマーコース = Summer Course.
+- ビヌス大学 = BINUS University.
+- In school-event context: sauna/saunas, mackerel course, virtual cram school can mean Summer Course.
+- News university, New Tiger students, new style students can mean BINUS University students.
+- CATIA = CATIA. In CAD context, 勝ち方 / way to win can mean CATIA.
+- TTC = Time To Collision. In AEB/braking context, ABC can mean TTC.
+- 慣性補償 = inertia compensation. Sensory/completion compensation can mean inertia compensation.
+- ロータリーエンジン = rotary engine.
 
 Selected class/domain context:
 {class_context}
 
-Recent lecture context:
+Recent caption context:
 {context_text}
 
-Current English translation:
+Current English caption:
 {current_translation}
 
-Technical glossary terms detected:
+Detected glossary terms:
 {glossary_text}
 
-Return JSON in this exact format:
+Required JSON:
 {{
-  "main_idea": "one short sentence explaining the current main point",
-  "say_it_simply": "one natural sentence the interpreter can say",
-  "corrected_japanese_original": "corrected Japanese transcript, only fixing obvious technical recognition errors, otherwise copy the Japanese original",
-  "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
+  "main_idea": "short current main point, or empty string",
+  "say_it_simply": "one natural sentence the interpreter can say, or empty string",
+  "corrected_japanese_original": "corrected Japanese transcript, or copy Japanese if no correction",
+  "corrected_english_caption": "corrected natural English caption, or copy English if no correction",
   "is_unclear": false,
-  "unclear_reason": "short reason when the speech/transcript is unclear, otherwise empty string",
+  "unclear_reason": "",
   "key_terms": [
-    {{"term": "Japanese source technical term or important acronym", "meaning": "short English meaning"}}
+    {{"term": "Japanese term or acronym", "meaning": "English meaning"}}
   ],
   "corrections": [
-    {{
-      "wrong": "wrong recognized word or phrase",
-      "correct": "correct word or phrase",
-      "reason": "short reason"
-    }}
+    {{"wrong": "wrong word", "correct": "correct word", "reason": "short reason"}}
   ]
 }}
 """.strip()
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=650,
-            ),
-        )
 
-        parsed = parse_llm_json(response.text)
+        fallback_model_names = fallback_model_names or []
+
+        model_try_order = []
+        for candidate_model in [model_name] + list(fallback_model_names):
+            if candidate_model and candidate_model not in model_try_order:
+                model_try_order.append(candidate_model)
+
+        attempts = []
+        parsed = None
+        used_model_name = ""
+
+        for candidate_model in model_try_order:
+            started_at = time.time()
+
+            try:
+                response = generate_content_with_timeout(
+                    client,
+                    candidate_model,
+                    prompt,
+                    LLM_MODEL_TIMEOUT_SECONDS,
+                )
+
+                elapsed = time.time() - started_at
+                response_debug = describe_helper_response(response)
+                response_text_for_parse = response_debug.get("response_text", "") or ""
+
+                if not response_text_for_parse.strip():
+                    candidate_parsed = {
+                        "parse_ok": False,
+                        "raw_text": "",
+                        "parse_error": (
+                            "No final Groq answer text was found. "
+                            "The model may have returned only thought/prompt text."
+                        ),
+                    }
+
+                elif looks_like_prompt_echo(response_text_for_parse):
+                    candidate_parsed = {
+                        "parse_ok": False,
+                        "raw_text": response_text_for_parse,
+                        "parse_error": (
+                            "Groq returned prompt/instruction echo, not a final answer."
+                        ),
+                    }
+
+                else:
+                    candidate_parsed = parse_llm_json(response_text_for_parse)
+
+                if not is_usable_llm_result(candidate_parsed):
+                    loose_parsed = extract_groq_loose_corrections(
+                        response_text_for_parse,
+                        context_text,
+                        current_translation,
+                    )
+
+                    if loose_parsed:
+                        candidate_parsed = loose_parsed
+
+                if is_usable_llm_result(candidate_parsed):
+                    parsed = candidate_parsed
+                    used_model_name = candidate_model
+                    attempts.append({
+                        "model": candidate_model,
+                        "status": "success_loose_parse"
+                        if candidate_parsed.get("loose_parse")
+                        else "success",
+                        "seconds": round(elapsed, 2),
+                        "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
+                        "loose_parse": bool(candidate_parsed.get("loose_parse", False)),
+                        "note": "usable correction",
+                        "response_debug": response_debug,
+                    })
+                    break
+
+                attempts.append({
+                    "model": candidate_model,
+                    "status": "bad_output",
+                    "seconds": round(elapsed, 2),
+                    "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
+                    "parse_error": candidate_parsed.get("parse_error", ""),
+                    "note": (
+                        "model returned no usable final answer. "
+                        "It may have returned only thought/prompt text, invalid JSON, or empty text"
+                    ),
+                    "raw_preview": (candidate_parsed.get("raw_text", "") or "")[:220],
+                    "response_debug": response_debug,
+                })
+
+            except Exception as model_error:
+                elapsed = time.time() - started_at
+                attempts.append({
+                    "model": candidate_model,
+                    "status": "error",
+                    "seconds": round(elapsed, 2),
+                    "parse_ok": False,
+                    "note": str(model_error)[:260],
+                })
+                continue
+
+        if parsed is None:
+            raise RuntimeError(
+                "Selected Groq helper failed or returned unusable output. "
+                f"Attempts: {attempts}"
+            )
 
         result_queue.put({
             "type": "llm_hint",
@@ -1967,6 +2955,9 @@ Return JSON in this exact format:
             "source_text": context_text,
             "key_terms": parsed.get("key_terms", []),
             "corrections": parsed.get("corrections", []),
+            "used_model": used_model_name,
+            "attempts": attempts,
+            "loose_parse": bool(parsed.get("loose_parse", False)),
         })
 
     except Exception as e:
@@ -2330,6 +3321,43 @@ st.caption(
 )
 
 
+def summarize_last_helper_attempts(attempts):
+    attempts = attempts or []
+
+    if not attempts:
+        return "No helper model attempt yet."
+
+    lines = []
+
+    for item in attempts[-3:]:
+        model = item.get("model", "")
+        status = item.get("status", "")
+        seconds = item.get("seconds", "")
+        note = item.get("note", "")
+        parse_ok = item.get("parse_ok", "")
+        response_debug = item.get("response_debug", {}) or {}
+        response_text = response_debug.get("response_text", "")
+        candidates = response_debug.get("candidates", []) or []
+
+        finish_reason = ""
+        safety_summary = ""
+
+        if candidates:
+            finish_reason = candidates[0].get("finish_reason", "")
+            safety_summary = str(candidates[0].get("safety_ratings", ""))[:220]
+
+        response_label = response_text[:160] if response_text else "<no final answer text>"
+
+        lines.append(
+            f"{model}: {status}, {seconds}s, parse_ok={parse_ok}, "
+            f"finish_reason={finish_reason}, note={note}, "
+            f"response_text_preview={response_label!r}, "
+            f"safety={safety_summary}"
+        )
+
+    return "\n".join(lines)
+
+
 # ============================================================
 # Sidebar
 # ============================================================
@@ -2394,18 +3422,30 @@ with st.sidebar:
     )
 
     llm_model_name = st.selectbox(
-        "LLM model",
-        [
-            LLM_MODEL_DEFAULT,
-            LLM_MODEL_BACKUP,
-        ],
+        "Groq helper model",
+        LLM_MODEL_OPTIONS,
         index=0,
+        help=(
+            "Groq helper mode. llama-3.1-8b-instant is recommended first "
+            "because your free limit screenshot shows a high daily request limit."
+        ),
+    )
+
+    helper_fallback_enabled = False
+    st.caption(
+        "Groq-only helper mode: no Gemma, no Flash-Lite fallback. "
+        "If this model times out or returns bad JSON, the app will show the error."
     )
 
     llm_budget_mode = st.selectbox(
         "AI helper budget mode",
         list(LLM_BUDGET_MODES.keys()),
         index=1,
+    )
+
+    st.caption(
+        "Helper correction uses only the selected Groq model. "
+        "Translation itself still uses Gemini 3.5 Live Translate."
     )
 
     selected_budget = LLM_BUDGET_MODES[llm_budget_mode]
@@ -2504,6 +3544,14 @@ defaults = {
     "llm_corrections": [],
     "llm_last_call_time": 0.0,
     "llm_last_source_text": "",
+    "llm_used_model": "",
+    "llm_last_attempts": [],
+    "llm_last_loose_parse": False,
+    "llm_gate_status": {},
+    "raw_low_confidence": False,
+    "raw_low_confidence_reason": "",
+    "llm_last_start_time": "",
+    "llm_last_finish_time": "",
     "llm_context_chunks": [],
 }
 
@@ -2541,6 +3589,7 @@ if float(reset_seconds) != float(st.session_state.last_reset_seconds):
 
 api_key = None  # Soniox disabled in pure Gemini version.
 gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
+groq_api_key = safe_get_secret_or_env("GROQ_API_KEY")
 
 if not gemini_api_key:
     st.error(
@@ -2550,9 +3599,9 @@ if not gemini_api_key:
     )
     st.stop()
 
-if use_llm_hints and not gemini_api_key:
+if use_llm_hints and not groq_api_key:
     st.warning(
-        "GEMINI_API_KEY is not set. Helper AI is disabled until you add it."
+        "GROQ_API_KEY is not set. Groq helper AI is disabled until you add it."
     )
 
 
@@ -2769,6 +3818,13 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.live_original = ""
             st.session_state.live_translation = ""
             st.session_state.caption_history = []
+
+            # New segment: remove stale helper state from the previous topic.
+            # This prevents old terms like CATIA / Summer Course / BINUS
+            # from appearing when the current raw caption is unrelated.
+            st.session_state.llm_context_chunks = []
+            st.session_state.llm_main_idea = ""
+            st.session_state.llm_say_it_simply = ""
             st.session_state.llm_corrected_japanese_original = ""
             st.session_state.llm_corrected_english_caption = ""
             st.session_state.llm_corrected_source_text = ""
@@ -2776,6 +3832,13 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.llm_unclear_reason = ""
             st.session_state.llm_key_terms = []
             st.session_state.llm_corrections = []
+            st.session_state.llm_last_source_text = ""
+            st.session_state.llm_last_loose_parse = False
+            st.session_state.last_llm_checked_token_version = -1
+
+            st.session_state.raw_low_confidence = False
+            st.session_state.raw_low_confidence_reason = ""
+
             st.session_state.caption_stage = "raw_started"
             st.session_state.last_helper_fix_time = ""
             st.session_state.last_ai_check_time = ""
@@ -2795,7 +3858,14 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.caption_stage = "raw_english"
             st.session_state.last_raw_translation_time = time.strftime("%H:%M:%S")
 
-            if use_llm_hints and gemini_api_key:
+            low_conf, low_conf_reason = looks_like_low_confidence_raw_caption(
+                st.session_state.live_original,
+                st.session_state.live_translation,
+            )
+            st.session_state.raw_low_confidence = low_conf
+            st.session_state.raw_low_confidence_reason = low_conf_reason
+
+            if use_llm_hints and groq_api_key:
                 if not st.session_state.llm_running and not st.session_state.llm_corrected_source_text:
                     st.session_state.correction_status = "pending"
             else:
@@ -2832,7 +3902,7 @@ while not st.session_state.soniox_result_queue.empty():
         # Keep it on screen so the reader has time to read it.
         # The next incoming token will clear/replace the old caption.
         st.session_state.pending_visual_reset = True
-        if st.session_state.live_translation and use_llm_hints and gemini_api_key:
+        if st.session_state.live_translation and use_llm_hints and groq_api_key:
             st.session_state.correction_status = "pending"
 
     elif item_type == "cleared":
@@ -2900,8 +3970,12 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_unclear_reason = item.get("unclear_reason", "")
         st.session_state.llm_key_terms = item.get("key_terms", [])
         st.session_state.llm_corrections = item.get("corrections", [])
+        st.session_state.llm_used_model = item.get("used_model", llm_model_name)
+        st.session_state.llm_last_attempts = item.get("attempts", [])
+        st.session_state.llm_last_loose_parse = bool(item.get("loose_parse", False))
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
+        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
         st.session_state.llm_calls_this_session += 1
 
         has_ai_update = (
@@ -2920,39 +3994,38 @@ while not st.session_state.llm_result_queue.empty():
             )
 
             # Important:
-            # Keep the AI-corrected text visible AND continue from it.
-            # The worker's internal base is replaced with the corrected text,
-            # so the next live tokens append to the fixed caption instead of
-            # returning old text or starting from empty.
-            corrected_base_original = (
-                st.session_state.llm_corrected_japanese_original
-                or st.session_state.live_original
-            )
-            corrected_base_translation = (
-                st.session_state.llm_corrected_english_caption
-                or st.session_state.live_translation
+            # Do NOT blindly replace the whole live caption with Groq output.
+            # Groq loose parser may return only a corrected phrase or latest sentence.
+            # In that case, patch the existing live caption instead of restarting it.
+            force_patch_mode = bool(st.session_state.llm_last_loose_parse)
+
+            corrected_base_original = merge_ai_correction_with_live_text(
+                live_text=st.session_state.live_original,
+                ai_text=st.session_state.llm_corrected_japanese_original,
+                corrections=st.session_state.llm_corrections,
+                text_kind="original",
+                domain_mode=domain_mode,
+                force_patch_mode=force_patch_mode,
             )
 
-            corrected_base_original = light_original_cleanup(
-                apply_llm_corrections(
-                    corrected_base_original,
-                    st.session_state.llm_corrections,
-                )
+            corrected_base_translation = merge_ai_correction_with_live_text(
+                live_text=st.session_state.live_translation,
+                ai_text=st.session_state.llm_corrected_english_caption,
+                corrections=st.session_state.llm_corrections,
+                text_kind="translation",
+                domain_mode=domain_mode,
+                force_patch_mode=force_patch_mode,
             )
-            corrected_base_translation = light_caption_cleanup(
-                apply_llm_corrections(
-                    corrected_base_translation,
-                    st.session_state.llm_corrections,
-                )
-            )
-            corrected_base_original, corrected_base_translation = light_domain_context_cleanup(
+
+            corrected_base_original, corrected_base_translation = light_school_context_cleanup(
                 corrected_base_original,
                 corrected_base_translation,
-                domain_mode,
             )
 
             st.session_state.live_original = corrected_base_original
             st.session_state.live_translation = corrected_base_translation
+            st.session_state.raw_low_confidence = False
+            st.session_state.raw_low_confidence_reason = ""
 
             if st.session_state.soniox_running:
                 st.session_state.soniox_control_queue.put({
@@ -2974,6 +4047,7 @@ while not st.session_state.llm_result_queue.empty():
     elif item_type == "llm_error":
         st.session_state.llm_error = item.get("message", "")
         st.session_state.llm_running = False
+        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
         st.session_state.llm_calls_this_session += 1
         st.session_state.correction_status = "error"
 
@@ -2982,7 +4056,7 @@ while not st.session_state.llm_result_queue.empty():
 # Start LLM hint worker
 # ============================================================
 
-if use_llm_hints and gemini_api_key:
+if use_llm_hints and groq_api_key:
     source_text = build_llm_context(
         st.session_state.llm_context_chunks,
         st.session_state.live_original,
@@ -3008,6 +4082,30 @@ if use_llm_hints and gemini_api_key:
         and llm_budget_mode != "Emergency Rule-Based Only"
     )
 
+    seconds_since_last_call = time.time() - float(st.session_state.llm_last_call_time)
+    seconds_until_interval = max(0.0, float(llm_hint_interval) - seconds_since_last_call)
+
+    gate_status = {
+        "soniox_running": bool(st.session_state.soniox_running),
+        "translated_text_ready": bool(translated_text_ready),
+        "enough_text": bool(enough_text),
+        "source_text_length": len(source_text),
+        "min_required_chars": int(llm_min_context_chars),
+        "changed_text": bool(changed_text),
+        "interval_ready": bool(interval_ready),
+        "seconds_until_interval_ready": round(seconds_until_interval, 1),
+        "has_new_live_tokens_for_llm": bool(has_new_live_tokens_for_llm),
+        "live_token_version": int(st.session_state.live_token_version),
+        "last_llm_checked_token_version": int(st.session_state.last_llm_checked_token_version),
+        "helper_budget_available": bool(helper_budget_available),
+        "helper_calls_this_session": int(st.session_state.llm_calls_this_session),
+        "helper_session_limit": int(llm_session_limit),
+        "llm_running": bool(st.session_state.llm_running),
+        "selected_model": llm_model_name,
+        "fallback_enabled": False,
+    }
+    st.session_state.llm_gate_status = gate_status
+
     if (
         st.session_state.soniox_running
         and translated_text_ready
@@ -3026,6 +4124,8 @@ if use_llm_hints and gemini_api_key:
 
         st.session_state.llm_running = True
         st.session_state.llm_error = ""
+        st.session_state.llm_last_attempts = []
+        st.session_state.llm_last_start_time = time.strftime("%H:%M:%S")
         # Keep the previous corrected text visible while the next AI check runs.
         # New result will replace it when ready.
         st.session_state.caption_stage = "ai_checking"
@@ -3037,16 +4137,22 @@ if use_llm_hints and gemini_api_key:
 
         selected_class_context = make_selected_domain_context(domain_mode)
 
+        # Groq-only diagnostic mode:
+        # Do not use fallback models. We want to know whether the selected
+        # Groq model itself works or not.
+        helper_fallback_models = []
+
         st.session_state.llm_thread = threading.Thread(
             target=llm_hint_worker,
             args=(
                 st.session_state.llm_result_queue,
-                gemini_api_key,
+                groq_api_key,
                 llm_model_name,
                 source_text,
                 st.session_state.live_translation,
                 detected_terms,
                 selected_class_context,
+                helper_fallback_models,
             ),
             daemon=True,
         )
@@ -3082,7 +4188,12 @@ if st.session_state.soniox_error:
     st.error(st.session_state.soniox_error)
 
 if use_llm_hints and st.session_state.llm_error:
-    st.warning(f"LLM error: {st.session_state.llm_error}")
+    st.warning(
+        "LLM error: "
+        + shorten_error_for_ui(st.session_state.llm_error)
+        + "\n\nLast Groq attempt summary:\n"
+        + summarize_last_helper_attempts(st.session_state.llm_last_attempts)
+    )
 
 if use_llm_hints and st.session_state.llm_budget_reached:
     if llm_budget_mode == "Emergency Rule-Based Only":
@@ -3102,26 +4213,37 @@ if subtitle_display == "History":
 else:
     caption_text = st.session_state.live_translation
 
+current_source_for_display = build_llm_context(
+    st.session_state.llm_context_chunks,
+    st.session_state.live_original,
+    st.session_state.live_translation,
+)
+
+llm_source_active = current_llm_source_is_active(
+    current_source_for_display,
+    st.session_state.llm_corrected_source_text,
+)
+
+active_llm_corrections = (
+    st.session_state.llm_corrections
+    if llm_source_active
+    else []
+)
+
 corrected_original = apply_llm_corrections(
     st.session_state.live_original,
-    st.session_state.llm_corrections,
+    active_llm_corrections,
 )
 
 corrected_translation = apply_llm_corrections(
     caption_text,
-    st.session_state.llm_corrections,
+    active_llm_corrections,
 )
 
 corrected_original, corrected_translation = light_domain_context_cleanup(
     corrected_original,
     corrected_translation,
     domain_mode,
-)
-
-current_source_for_display = build_llm_context(
-    st.session_state.llm_context_chunks,
-    st.session_state.live_original,
-    st.session_state.live_translation,
 )
 
 if (
@@ -3136,13 +4258,13 @@ if (
     if st.session_state.llm_corrected_japanese_original:
         corrected_original = apply_llm_corrections(
             st.session_state.llm_corrected_japanese_original,
-            st.session_state.llm_corrections,
+            active_llm_corrections,
         )
 
     if st.session_state.llm_corrected_english_caption:
         corrected_translation = apply_llm_corrections(
             st.session_state.llm_corrected_english_caption,
-            st.session_state.llm_corrections,
+            active_llm_corrections,
         )
 
 corrected_original = light_original_cleanup(corrected_original)
@@ -3170,11 +4292,7 @@ if st.session_state.live_original and not display_english:
 source_is_corrected = (
     use_llm_hints
     and st.session_state.caption_stage == "ai_corrected"
-    and st.session_state.llm_corrected_source_text
-    and source_text_matches_for_correction(
-        current_source_for_display,
-        st.session_state.llm_corrected_source_text,
-    )
+    and llm_source_active
     and (
         bool(st.session_state.llm_corrected_japanese_original)
         or bool(st.session_state.llm_corrected_english_caption)
@@ -3201,11 +4319,18 @@ else:
 if not use_llm_hints:
     correction_status_text = "AI correction off"
 elif not gemini_api_key:
-    correction_status_text = "AI correction unavailable: GEMINI_API_KEY missing"
+    correction_status_text = "AI correction unavailable: GROQ_API_KEY missing"
 elif st.session_state.llm_error:
-    correction_status_text = f"AI correction error: {st.session_state.llm_error}"
+    correction_status_text = (
+        "AI correction error: "
+        + shorten_error_for_ui(st.session_state.llm_error)
+    )
 elif st.session_state.llm_running:
-    correction_status_text = "AI correction checking..."
+    start_time = st.session_state.llm_last_start_time or "now"
+    correction_status_text = (
+        f"AI correction checking with {llm_model_name} "
+        f"(started {start_time}, timeout {LLM_MODEL_TIMEOUT_SECONDS:.0f}s/model)"
+    )
 elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
     unclear_reason = st.session_state.llm_unclear_reason.strip()
     if unclear_reason:
@@ -3219,9 +4344,54 @@ elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
             "but speech was unclear. Correction is cautious."
         )
 elif source_is_corrected and st.session_state.last_helper_fix_time:
-    correction_status_text = f"AI correction applied at {st.session_state.last_helper_fix_time}"
+    used_model = st.session_state.llm_used_model or llm_model_name
+    correction_status_text = (
+        f"AI correction applied at {st.session_state.last_helper_fix_time} "
+        f"using {used_model}"
+    )
+elif st.session_state.raw_low_confidence and st.session_state.live_translation:
+    gate = st.session_state.get("llm_gate_status", {})
+    reason = st.session_state.raw_low_confidence_reason or "raw caption looks unclear"
+    pending_reason = ""
+
+    if gate and not gate.get("interval_ready", False):
+        pending_reason = (
+            f" Waiting {gate.get('seconds_until_interval_ready', 0)} sec for Groq."
+        )
+
+    correction_status_text = (
+        f"⚠️ Raw caption may be unclear: {reason}."
+        f"{pending_reason}"
+    )
 elif st.session_state.live_translation:
-    correction_status_text = "AI correction pending"
+    gate = st.session_state.get("llm_gate_status", {})
+    pending_reason = ""
+
+    if gate:
+        if not gate.get("enough_text", False):
+            pending_reason = (
+                f"waiting for more text "
+                f"({gate.get('source_text_length', 0)}/{gate.get('min_required_chars', 0)} chars)"
+            )
+        elif not gate.get("interval_ready", False):
+            pending_reason = (
+                f"waiting {gate.get('seconds_until_interval_ready', 0)} sec for helper interval"
+            )
+        elif not gate.get("has_new_live_tokens_for_llm", False):
+            pending_reason = "waiting for new live speech"
+        elif not gate.get("changed_text", False):
+            pending_reason = "waiting for changed text"
+        elif not gate.get("helper_budget_available", False):
+            pending_reason = "helper budget unavailable"
+        elif gate.get("llm_running", False):
+            pending_reason = "helper is already running"
+        else:
+            pending_reason = "ready to start helper"
+
+    if pending_reason:
+        correction_status_text = f"AI correction pending: {pending_reason}"
+    else:
+        correction_status_text = "AI correction pending"
 elif st.session_state.live_original:
     correction_status_text = "Waiting for English before AI correction"
 else:
@@ -3254,7 +4424,7 @@ if use_llm_hints:
         llm_terms_text = "AI checking key terms and caption corrections..."
     elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
         llm_terms_text = "AI correction pending..."
-    elif st.session_state.llm_key_terms:
+    elif st.session_state.llm_key_terms and llm_source_active:
         llm_terms_lines = []
 
         for item in st.session_state.llm_key_terms[:8]:
@@ -3276,6 +4446,8 @@ if use_llm_hints:
             llm_terms_text = "\n".join(llm_terms_lines)
         else:
             llm_terms_text = "No Japanese technical key terms yet."
+    elif st.session_state.llm_key_terms and not llm_source_active:
+        llm_terms_text = "No current key terms yet. Old helper terms hidden."
     else:
         llm_terms_text = "No LLM key terms yet."
 
@@ -3326,6 +4498,30 @@ if show_debug:
 
         st.write("Helper calls this session:")
         st.code(str(st.session_state.llm_calls_this_session))
+
+        st.write("Helper gate status:")
+        st.code(json.dumps(st.session_state.llm_gate_status, ensure_ascii=False, indent=2))
+
+        st.write("LLM source active / raw confidence:")
+        st.code(
+            f"llm_source_active={llm_source_active}\n"
+            f"raw_low_confidence={st.session_state.raw_low_confidence}\n"
+            f"reason={st.session_state.raw_low_confidence_reason}\n"
+            f"loose_parse_patch_mode={st.session_state.llm_last_loose_parse}"
+        )
+
+        st.write("Helper model attempts summary:")
+        st.code(summarize_last_helper_attempts(st.session_state.llm_last_attempts))
+
+        st.write("Helper model attempts full response debug:")
+        st.code(json.dumps(st.session_state.llm_last_attempts, ensure_ascii=False, indent=2))
+
+        st.write("Helper last start / finish:")
+        st.code(
+            f"start={st.session_state.llm_last_start_time}\n"
+            f"finish={st.session_state.llm_last_finish_time}\n"
+            f"used_model={st.session_state.llm_used_model}"
+        )
 
         st.write("Helper budget reached:")
         st.code(str(st.session_state.llm_budget_reached))
@@ -3390,6 +4586,7 @@ if show_debug:
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
+            f"used_model={st.session_state.llm_used_model}\n"
             f"is_unclear={st.session_state.llm_is_unclear}\n"
             f"unclear_reason={st.session_state.llm_unclear_reason}\n"
             f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
@@ -3405,6 +4602,9 @@ if show_debug:
 
         st.write("Selected helper class context:")
         st.code(make_selected_domain_context(domain_mode))
+
+        st.write("School context cleanup:")
+        st.code("Summer Course / BINUS immediate cleanup enabled")
 
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))

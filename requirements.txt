@@ -5,3 +5,4 @@ websocket-client
 av
 numpy
 google-genai
+groq
