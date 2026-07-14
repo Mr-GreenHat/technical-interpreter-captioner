@@ -1654,6 +1654,87 @@ def build_llm_context(context_chunks, current_original, current_translation):
 
 
 # ============================================================
+# Selected domain context for Gemini helper
+# ============================================================
+
+def make_selected_domain_context(domain_mode):
+    """
+    Fixed background context sent to Gemini 3.1 helper AI.
+    This makes the sidebar Technical domain actually guide correction,
+    not only rule-based cleanup.
+    """
+    domain = (domain_mode or "auto").lower()
+
+    if domain == "cad":
+        return """
+Selected technical domain: CAD / CATIA classroom.
+
+The speaker is probably explaining CAD/CATIA operations such as:
+- CATIA, CAD, Sketcher, part file, XY plane
+- sketch, line, circle, rectangle, profile
+- dimensional constraint, geometric constraint, fully constrained sketch
+- degrees of freedom, origin, horizontal, vertical, center alignment
+- Pad, extrusion, Pocket, Hole, Fillet, Chamfer, chamfering
+- design intent, dimensions, shape, modeling, 3D model, manufacturability
+
+Correction priorities:
+- If the Japanese sounds like 勝ち方 / 書き方 / キャリア in a CAD sentence, it is probably CATIA.
+- If English says "way to win" in a CAD sentence, it is probably CATIA.
+- If English says "line enters" or similar when Japanese mentions スケッチャー, it probably means "enter Sketcher".
+- Do not force CATIA when the sentence is really about winning, writing method, or career.
+""".strip()
+
+    if domain == "product design":
+        return """
+Selected technical domain: Product Design Engineering / CAD modeling classroom.
+
+The speaker is probably explaining:
+- Product Design Engineering, product design process, design intent
+- CATIA, CAD modeling, Sketcher, dimensions, constraints
+- usability, strength, material, cost, manufacturability
+- prototype, product development, shape, part design
+- Pad, extrusion, Fillet, Chamfer, Hole, assembly basics
+
+Correction priorities:
+- Preserve Product Design Engineering as a program/major name when relevant.
+- If the lecture mentions CAD, parts, sketching, or modeling, CATIA-related terms are likely.
+- Do not replace normal business/design words unless the current sentence clearly supports it.
+""".strip()
+
+    if domain == "automotive":
+        return """
+Selected technical domain: Automotive engineering classroom.
+
+The speaker is probably explaining:
+- vehicle systems, braking system, drivetrain, steering, suspension
+- AEB, ADAS, TTC, Time To Collision, distance estimation
+- servo motor, brake wire, braking force, emergency braking
+- inertia, inertia compensation, control, motor, sensor
+- rotary engine, reciprocating engine, rotor, apex seal
+
+Correction priorities:
+- If the caption says ABC in AEB/TTC context, correct it to TTC.
+- Preserve AEB, ADAS, TTC, ECU, CAN, PWM, PID as technical acronyms.
+- If the lecture mentions rotary engine, preserve ロータリーエンジン, ローター, アペックスシール.
+""".strip()
+
+    return """
+Selected technical domain: mixed Japanese technical classroom.
+
+Possible topics include:
+- automotive engineering, AEB, TTC, braking systems, inertia compensation
+- CAD/CATIA, Sketcher, dimensional constraints, geometric constraints
+- Product Design Engineering, design intent, manufacturability
+- BINUS ASO, BINUS University, Summer Course, ARE, PDE, BE
+
+Correction priorities:
+- Use the recent Japanese/English context to decide which domain is active.
+- Do not force a domain term unless it fits the current sentence.
+- Preserve important acronyms and proper nouns.
+""".strip()
+
+
+# ============================================================
 # LLM Interpreter Support
 # ============================================================
 
@@ -1664,6 +1745,8 @@ def parse_llm_json(text):
             "say_it_simply": "",
             "corrected_japanese_original": "",
             "corrected_english_caption": "",
+            "is_unclear": False,
+            "unclear_reason": "",
             "key_terms": [],
             "corrections": [],
         }
@@ -1687,6 +1770,11 @@ def parse_llm_json(text):
             "say_it_simply": str(data.get("say_it_simply", "")).strip(),
             "corrected_japanese_original": str(data.get("corrected_japanese_original", "")).strip(),
             "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
+            "is_unclear": (
+                str(data.get("is_unclear", False)).strip().lower()
+                in ["true", "1", "yes", "y"]
+            ),
+            "unclear_reason": str(data.get("unclear_reason", "")).strip(),
             "key_terms": data.get("key_terms", []),
             "corrections": data.get("corrections", []),
         }
@@ -1697,6 +1785,8 @@ def parse_llm_json(text):
             "say_it_simply": "",
             "corrected_japanese_original": "",
             "corrected_english_caption": "",
+            "is_unclear": False,
+            "unclear_reason": "",
             "key_terms": [],
             "corrections": [],
         }
@@ -1709,6 +1799,7 @@ def llm_hint_worker(
     context_text,
     current_translation,
     key_terms,
+    class_context="",
 ):
     try:
         client = genai.Client(api_key=api_key)
@@ -1730,6 +1821,9 @@ def llm_hint_worker(
 
             glossary_text = "\n".join(glossary_lines)
 
+        if not class_context:
+            class_context = "No fixed class context was selected."
+
         prompt = f"""
 You are an interpreter assistant.
 
@@ -1737,10 +1831,15 @@ Your job is NOT to translate everything again.
 Your job is to help the interpreter understand the lecture flow quickly
 AND repair obvious STT/translation mistakes in technical terms.
 
+Use the selected class/domain context as fixed background.
 Use the recent context below. The latest part is at the bottom.
 
 Rules:
 - Output JSON only.
+- Treat the selected class/domain context as high-priority background for repairing STT mistakes.
+- The selected class/domain context does not override actual speech. Do not invent terms that are not supported by the current sentence.
+- If the selected domain is CAD/Product Design, prefer CATIA/CAD vocabulary when the current sentence mentions parts, sketches, constraints, modeling, or design.
+- If the selected domain is Automotive, prefer automotive/AEB/TTC/braking/control vocabulary when the current sentence mentions vehicles, braking, distance, motor, control, or engine.
 - Do not add new facts.
 - Do not summarize the speaker.
 - Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
@@ -1752,6 +1851,10 @@ Rules:
 - Keep the corrected English caption close to the current English translation.
 - Preserve technical terms from the glossary.
 - If the transcript is unclear, make the safest minimal correction.
+- If the sentence is broken, missing a key word, or does not make sense even with the selected class/domain context, set is_unclear to true and explain briefly in unclear_reason.
+- If you are not confident whether a term is CATIA, Sketcher, TTC, AEB, rotary engine, etc., set is_unclear to true instead of forcing the correction.
+- Do not hide uncertainty. It is safer to mark unclear than to invent a technical term.
+- Only include "[unclear]" inside corrected_english_caption when a critical missing phrase prevents a reliable caption. Otherwise use is_unclear and unclear_reason only.
 - If STT or translation uses a wrong technical term, add it to corrections.
 - If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
 - Prefer corrected technical terms in key_terms.
@@ -1809,6 +1912,9 @@ Rules:
 - Example correction:
   {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
 
+Selected class/domain context:
+{class_context}
+
 Recent lecture context:
 {context_text}
 
@@ -1824,6 +1930,8 @@ Return JSON in this exact format:
   "say_it_simply": "one natural sentence the interpreter can say",
   "corrected_japanese_original": "corrected Japanese transcript, only fixing obvious technical recognition errors, otherwise copy the Japanese original",
   "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
+  "is_unclear": false,
+  "unclear_reason": "short reason when the speech/transcript is unclear, otherwise empty string",
   "key_terms": [
     {{"term": "Japanese source technical term or important acronym", "meaning": "short English meaning"}}
   ],
@@ -1854,6 +1962,8 @@ Return JSON in this exact format:
             "say_it_simply": parsed.get("say_it_simply", ""),
             "corrected_japanese_original": parsed.get("corrected_japanese_original", ""),
             "corrected_english_caption": parsed.get("corrected_english_caption", ""),
+            "is_unclear": bool(parsed.get("is_unclear", False)),
+            "unclear_reason": parsed.get("unclear_reason", ""),
             "source_text": context_text,
             "key_terms": parsed.get("key_terms", []),
             "corrections": parsed.get("corrections", []),
@@ -2237,6 +2347,7 @@ with st.sidebar:
         index=0,
         help="For CATIA classes, choose 'cad' or 'product design' so CATIA is not misheard as 勝ち方 / way to win.",
     )
+    st.caption(f"Helper AI fixed context: {domain_mode}")
 
     subtitle_display = st.radio(
         "Caption display",
@@ -2387,6 +2498,8 @@ defaults = {
     "llm_corrected_japanese_original": "",
     "llm_corrected_english_caption": "",
     "llm_corrected_source_text": "",
+    "llm_is_unclear": False,
+    "llm_unclear_reason": "",
     "llm_key_terms": [],
     "llm_corrections": [],
     "llm_last_call_time": 0.0,
@@ -2545,6 +2658,8 @@ if clear_clicked:
     st.session_state.llm_corrected_japanese_original = ""
     st.session_state.llm_corrected_english_caption = ""
     st.session_state.llm_corrected_source_text = ""
+    st.session_state.llm_is_unclear = False
+    st.session_state.llm_unclear_reason = ""
     st.session_state.llm_key_terms = []
     st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
@@ -2593,6 +2708,8 @@ if (
     st.session_state.llm_corrected_japanese_original = ""
     st.session_state.llm_corrected_english_caption = ""
     st.session_state.llm_corrected_source_text = ""
+    st.session_state.llm_is_unclear = False
+    st.session_state.llm_unclear_reason = ""
     st.session_state.llm_key_terms = []
     st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
@@ -2644,6 +2761,9 @@ while not st.session_state.soniox_result_queue.empty():
         if original or translation:
             st.session_state.live_token_version += 1
             prepare_next_ai_check_after_new_live_text()
+            # New live speech means the previous unclear warning may be stale.
+            st.session_state.llm_is_unclear = False
+            st.session_state.llm_unclear_reason = ""
 
         if st.session_state.pending_visual_reset and (original or translation):
             st.session_state.live_original = ""
@@ -2652,6 +2772,8 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.llm_corrected_japanese_original = ""
             st.session_state.llm_corrected_english_caption = ""
             st.session_state.llm_corrected_source_text = ""
+            st.session_state.llm_is_unclear = False
+            st.session_state.llm_unclear_reason = ""
             st.session_state.llm_key_terms = []
             st.session_state.llm_corrections = []
             st.session_state.caption_stage = "raw_started"
@@ -2774,6 +2896,8 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrected_japanese_original = item.get("corrected_japanese_original", "")
         st.session_state.llm_corrected_english_caption = item.get("corrected_english_caption", "")
         st.session_state.llm_corrected_source_text = item.get("source_text", "")
+        st.session_state.llm_is_unclear = bool(item.get("is_unclear", False))
+        st.session_state.llm_unclear_reason = item.get("unclear_reason", "")
         st.session_state.llm_key_terms = item.get("key_terms", [])
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
@@ -2789,7 +2913,11 @@ while not st.session_state.llm_result_queue.empty():
 
         if has_ai_update:
             st.session_state.caption_stage = "ai_corrected"
-            st.session_state.correction_status = "applied"
+            st.session_state.correction_status = (
+                "unclear_applied"
+                if st.session_state.llm_is_unclear
+                else "applied"
+            )
 
             # Important:
             # Keep the AI-corrected text visible AND continue from it.
@@ -2835,7 +2963,11 @@ while not st.session_state.llm_result_queue.empty():
 
         else:
             st.session_state.caption_stage = "raw_english"
-            st.session_state.correction_status = "no_change"
+            st.session_state.correction_status = (
+                "unclear"
+                if st.session_state.llm_is_unclear
+                else "no_change"
+            )
 
         st.session_state.last_helper_fix_time = time.strftime("%H:%M:%S")
 
@@ -2903,6 +3035,8 @@ if use_llm_hints and gemini_api_key:
         st.session_state.llm_last_source_text = source_text
         st.session_state.last_llm_checked_token_version = st.session_state.live_token_version
 
+        selected_class_context = make_selected_domain_context(domain_mode)
+
         st.session_state.llm_thread = threading.Thread(
             target=llm_hint_worker,
             args=(
@@ -2912,6 +3046,7 @@ if use_llm_hints and gemini_api_key:
                 source_text,
                 st.session_state.live_translation,
                 detected_terms,
+                selected_class_context,
             ),
             daemon=True,
         )
@@ -3071,6 +3206,18 @@ elif st.session_state.llm_error:
     correction_status_text = f"AI correction error: {st.session_state.llm_error}"
 elif st.session_state.llm_running:
     correction_status_text = "AI correction checking..."
+elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
+    unclear_reason = st.session_state.llm_unclear_reason.strip()
+    if unclear_reason:
+        correction_status_text = (
+            f"⚠️ AI checked at {st.session_state.last_helper_fix_time}, "
+            f"but speech was unclear: {unclear_reason}"
+        )
+    else:
+        correction_status_text = (
+            f"⚠️ AI checked at {st.session_state.last_helper_fix_time}, "
+            "but speech was unclear. Correction is cautious."
+        )
 elif source_is_corrected and st.session_state.last_helper_fix_time:
     correction_status_text = f"AI correction applied at {st.session_state.last_helper_fix_time}"
 elif st.session_state.live_translation:
@@ -3243,6 +3390,8 @@ if show_debug:
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
+            f"is_unclear={st.session_state.llm_is_unclear}\n"
+            f"unclear_reason={st.session_state.llm_unclear_reason}\n"
             f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
             f"corrections={st.session_state.llm_corrections}\n"
             f"error={st.session_state.llm_error}"
@@ -3253,6 +3402,9 @@ if show_debug:
 
         st.write("Japanese-only mode:")
         st.code(str(JAPANESE_ONLY_MODE))
+
+        st.write("Selected helper class context:")
+        st.code(make_selected_domain_context(domain_mode))
 
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
@@ -3304,7 +3456,7 @@ caption_html = f"""
     background-color: #EFF6FF;
     color: #1E3A8A;
     min-height: 42px;
-    max-height: 80px;
+    max-height: 105px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #60A5FA;
