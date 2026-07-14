@@ -1164,22 +1164,16 @@ def merge_ai_correction_with_live_text(
     live_text = (live_text or "").strip()
     ai_text = (ai_text or "").strip()
 
-    # 1) Always try to patch the existing live caption first.
     patched_text = apply_llm_corrections(live_text, corrections)
 
-    # 2) If AI returned a full caption and this is not loose/partial mode,
-    #    allow replacement.
     if (
         not force_patch_mode
         and ai_text_is_full_enough(live_text, ai_text)
     ):
         merged_text = ai_text
     else:
-        # Patch mode. Keep previous text.
         merged_text = patched_text or live_text
 
-        # If there was no useful patch and the live caption is empty,
-        # use AI text as fallback.
         if not merged_text and ai_text:
             merged_text = ai_text
 
@@ -1202,6 +1196,63 @@ def merge_ai_correction_with_live_text(
         return merged_text.strip()
 
     return merged_text.strip()
+
+
+def current_llm_source_is_active(current_source, corrected_source):
+    """
+    Prevent stale LLM corrections/key terms from an old topic from affecting
+    the current live caption.
+    """
+    if not current_source or not corrected_source:
+        return False
+
+    return source_text_matches_for_correction(current_source, corrected_source)
+
+
+def looks_like_low_confidence_raw_caption(original_text, translation_text):
+    """
+    Heuristic only. This does not fix text.
+    It only warns the user that the raw Gemini Live caption is probably bad
+    and should wait for Gemma correction / clearer audio.
+    """
+    original_text = (original_text or "").strip()
+    translation_text = (translation_text or "").strip()
+    lower_en = translation_text.lower()
+
+    if not original_text and not translation_text:
+        return False, ""
+
+    filler_jp_count = sum(original_text.count(x) for x in [
+        "ね", "まあ", "じゃ", "なんじゃ", "こじじゃ", "ことじゃ",
+    ])
+
+    filler_en_count = sum(lower_en.count(x) for x in [
+        "you know",
+        "what on earth",
+        "what's going on",
+        "so, yeah",
+        "pro's idea",
+        "it's not special",
+    ])
+
+    if filler_en_count >= 3:
+        return True, "raw English has many filler/nonsense phrases"
+
+    if filler_jp_count >= 9 and len(original_text) >= 80:
+        return True, "raw Japanese looks filler-heavy / unclear"
+
+    # Long caption but no likely class-specific noun after cleanup.
+    class_terms = [
+        "サマーコース", "ビヌス", "BINUS", "Summer Course",
+        "CATIA", "CAD", "TTC", "AEB", "慣性", "ロータリー",
+        "部品", "拘束", "スケッチ",
+    ]
+
+    if len(original_text) >= 90 and len(translation_text) >= 120:
+        if not any(term in original_text or term in translation_text for term in class_terms):
+            return True, "no clear technical/school keyword found in a long messy caption"
+
+    return False, ""
 
 
 def prepare_next_ai_check_after_new_live_text():
@@ -3389,6 +3440,8 @@ defaults = {
     "llm_last_attempts": [],
     "llm_last_loose_parse": False,
     "llm_gate_status": {},
+    "raw_low_confidence": False,
+    "raw_low_confidence_reason": "",
     "llm_last_start_time": "",
     "llm_last_finish_time": "",
     "llm_context_chunks": [],
@@ -3656,6 +3709,13 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.live_original = ""
             st.session_state.live_translation = ""
             st.session_state.caption_history = []
+
+            # New segment: remove stale helper state from the previous topic.
+            # This prevents old terms like CATIA / Summer Course / BINUS
+            # from appearing when the current raw caption is unrelated.
+            st.session_state.llm_context_chunks = []
+            st.session_state.llm_main_idea = ""
+            st.session_state.llm_say_it_simply = ""
             st.session_state.llm_corrected_japanese_original = ""
             st.session_state.llm_corrected_english_caption = ""
             st.session_state.llm_corrected_source_text = ""
@@ -3663,6 +3723,13 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.llm_unclear_reason = ""
             st.session_state.llm_key_terms = []
             st.session_state.llm_corrections = []
+            st.session_state.llm_last_source_text = ""
+            st.session_state.llm_last_loose_parse = False
+            st.session_state.last_llm_checked_token_version = -1
+
+            st.session_state.raw_low_confidence = False
+            st.session_state.raw_low_confidence_reason = ""
+
             st.session_state.caption_stage = "raw_started"
             st.session_state.last_helper_fix_time = ""
             st.session_state.last_ai_check_time = ""
@@ -3681,6 +3748,13 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.live_translation = translation
             st.session_state.caption_stage = "raw_english"
             st.session_state.last_raw_translation_time = time.strftime("%H:%M:%S")
+
+            low_conf, low_conf_reason = looks_like_low_confidence_raw_caption(
+                st.session_state.live_original,
+                st.session_state.live_translation,
+            )
+            st.session_state.raw_low_confidence = low_conf
+            st.session_state.raw_low_confidence_reason = low_conf_reason
 
             if use_llm_hints and gemini_api_key:
                 if not st.session_state.llm_running and not st.session_state.llm_corrected_source_text:
@@ -3841,6 +3915,8 @@ while not st.session_state.llm_result_queue.empty():
 
             st.session_state.live_original = corrected_base_original
             st.session_state.live_translation = corrected_base_translation
+            st.session_state.raw_low_confidence = False
+            st.session_state.raw_low_confidence_reason = ""
 
             if st.session_state.soniox_running:
                 st.session_state.soniox_control_queue.put({
@@ -4028,26 +4104,37 @@ if subtitle_display == "History":
 else:
     caption_text = st.session_state.live_translation
 
+current_source_for_display = build_llm_context(
+    st.session_state.llm_context_chunks,
+    st.session_state.live_original,
+    st.session_state.live_translation,
+)
+
+llm_source_active = current_llm_source_is_active(
+    current_source_for_display,
+    st.session_state.llm_corrected_source_text,
+)
+
+active_llm_corrections = (
+    st.session_state.llm_corrections
+    if llm_source_active
+    else []
+)
+
 corrected_original = apply_llm_corrections(
     st.session_state.live_original,
-    st.session_state.llm_corrections,
+    active_llm_corrections,
 )
 
 corrected_translation = apply_llm_corrections(
     caption_text,
-    st.session_state.llm_corrections,
+    active_llm_corrections,
 )
 
 corrected_original, corrected_translation = light_domain_context_cleanup(
     corrected_original,
     corrected_translation,
     domain_mode,
-)
-
-current_source_for_display = build_llm_context(
-    st.session_state.llm_context_chunks,
-    st.session_state.live_original,
-    st.session_state.live_translation,
 )
 
 if (
@@ -4062,13 +4149,13 @@ if (
     if st.session_state.llm_corrected_japanese_original:
         corrected_original = apply_llm_corrections(
             st.session_state.llm_corrected_japanese_original,
-            st.session_state.llm_corrections,
+            active_llm_corrections,
         )
 
     if st.session_state.llm_corrected_english_caption:
         corrected_translation = apply_llm_corrections(
             st.session_state.llm_corrected_english_caption,
-            st.session_state.llm_corrections,
+            active_llm_corrections,
         )
 
 corrected_original = light_original_cleanup(corrected_original)
@@ -4096,11 +4183,7 @@ if st.session_state.live_original and not display_english:
 source_is_corrected = (
     use_llm_hints
     and st.session_state.caption_stage == "ai_corrected"
-    and st.session_state.llm_corrected_source_text
-    and source_text_matches_for_correction(
-        current_source_for_display,
-        st.session_state.llm_corrected_source_text,
-    )
+    and llm_source_active
     and (
         bool(st.session_state.llm_corrected_japanese_original)
         or bool(st.session_state.llm_corrected_english_caption)
@@ -4150,10 +4233,23 @@ elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
         )
 elif source_is_corrected and st.session_state.last_helper_fix_time:
     used_model = st.session_state.llm_used_model or llm_model_name
-    patch_note = " / patch mode" if st.session_state.llm_last_loose_parse else ""
     correction_status_text = (
         f"AI correction applied at {st.session_state.last_helper_fix_time} "
-        f"using {used_model}{patch_note}"
+        f"using {used_model}"
+    )
+elif st.session_state.raw_low_confidence and st.session_state.live_translation:
+    gate = st.session_state.get("llm_gate_status", {})
+    reason = st.session_state.raw_low_confidence_reason or "raw caption looks unclear"
+    pending_reason = ""
+
+    if gate and not gate.get("interval_ready", False):
+        pending_reason = (
+            f" Waiting {gate.get('seconds_until_interval_ready', 0)} sec for Gemma."
+        )
+
+    correction_status_text = (
+        f"⚠️ Raw caption may be unclear: {reason}."
+        f"{pending_reason}"
     )
 elif st.session_state.live_translation:
     gate = st.session_state.get("llm_gate_status", {})
@@ -4216,7 +4312,7 @@ if use_llm_hints:
         llm_terms_text = "AI checking key terms and caption corrections..."
     elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
         llm_terms_text = "AI correction pending..."
-    elif st.session_state.llm_key_terms:
+    elif st.session_state.llm_key_terms and llm_source_active:
         llm_terms_lines = []
 
         for item in st.session_state.llm_key_terms[:8]:
@@ -4238,6 +4334,8 @@ if use_llm_hints:
             llm_terms_text = "\n".join(llm_terms_lines)
         else:
             llm_terms_text = "No Japanese technical key terms yet."
+    elif st.session_state.llm_key_terms and not llm_source_active:
+        llm_terms_text = "No current key terms yet. Old helper terms hidden."
     else:
         llm_terms_text = "No LLM key terms yet."
 
@@ -4291,6 +4389,14 @@ if show_debug:
 
         st.write("Helper gate status:")
         st.code(json.dumps(st.session_state.llm_gate_status, ensure_ascii=False, indent=2))
+
+        st.write("LLM source active / raw confidence:")
+        st.code(
+            f"llm_source_active={llm_source_active}\n"
+            f"raw_low_confidence={st.session_state.raw_low_confidence}\n"
+            f"reason={st.session_state.raw_low_confidence_reason}\n"
+            f"loose_parse_patch_mode={st.session_state.llm_last_loose_parse}"
+        )
 
         st.write("Helper model attempts summary:")
         st.code(summarize_last_helper_attempts(st.session_state.llm_last_attempts))
@@ -4369,7 +4475,6 @@ if show_debug:
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
             f"used_model={st.session_state.llm_used_model}\n"
-            f"loose_parse_patch_mode={st.session_state.llm_last_loose_parse}\n"
             f"is_unclear={st.session_state.llm_is_unclear}\n"
             f"unclear_reason={st.session_state.llm_unclear_reason}\n"
             f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
