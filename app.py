@@ -79,28 +79,28 @@ MAX_LLM_CONTEXT_CHUNKS = 6
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
     "High Accuracy": {
-        "interval": 20.0,
-        "min_chars": 120,
-        "session_limit": 120,
-        "description": "More frequent helper AI checks. Use only for short important demos.",
+        "interval": 10.0,
+        "min_chars": 60,
+        "session_limit": 500,
+        "description": "Fast Gemma helper checks. Use for short important demos when quota is available.",
     },
     "Balanced": {
-        "interval": 45.0,
-        "min_chars": 180,
-        "session_limit": 80,
-        "description": "Recommended default for normal classes.",
+        "interval": 20.0,
+        "min_chars": 100,
+        "session_limit": 300,
+        "description": "Recommended default when Gemma quota is around 1500 requests/day.",
     },
     "Saver": {
-        "interval": 90.0,
-        "min_chars": 260,
-        "session_limit": 40,
-        "description": "Safer for multiple classes per day.",
+        "interval": 45.0,
+        "min_chars": 180,
+        "session_limit": 120,
+        "description": "Safer for longer classes or when quota is getting low.",
     },
     "Emergency Rule-Based Only": {
         "interval": 999999.0,
         "min_chars": 999999,
         "session_limit": 0,
-        "description": "No Gemini 3.1 helper calls. Built-in glossary cleanup only.",
+        "description": "No helper AI calls. Built-in glossary cleanup only.",
     },
 }
 
@@ -1913,6 +1913,278 @@ def make_json_safe(value, depth=0):
     return str(value)[:600]
 
 
+def extract_text_from_gemini_response(response):
+    """
+    Gemma sometimes returns empty response.text even when the actual output
+    is inside candidates[0].content.parts[0].text. This collects all text
+    from response.text and candidate parts.
+    """
+    texts = []
+
+    try:
+        response_text = getattr(response, "text", "") or ""
+        if response_text.strip():
+            texts.append(response_text.strip())
+    except Exception:
+        pass
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) or []
+
+            for part in parts:
+                part_text = getattr(part, "text", "") or ""
+
+                if part_text.strip():
+                    texts.append(part_text.strip())
+
+    except Exception:
+        pass
+
+    # Deduplicate while preserving order.
+    unique_texts = []
+    seen = set()
+
+    for text in texts:
+        if text not in seen:
+            unique_texts.append(text)
+            seen.add(text)
+
+    return "\n\n".join(unique_texts).strip()
+
+
+def extract_gemma_loose_corrections(raw_text, context_text, current_translation):
+    """
+    Gemma may answer with an explanation instead of JSON, for example:
+      Problem 1: "サウナ" ... correct it to "サマーコース"
+      Problem 2: "ニュース" ... likely BINUS
+
+    This function turns those useful explanations into the JSON-like fields
+    our app needs. It does not try to be magic; it only handles repeated
+    known classroom correction patterns.
+    """
+    raw_text = (raw_text or "").strip()
+    context_text = (context_text or "").strip()
+    current_translation = (current_translation or "").strip()
+
+    combined = f"{raw_text}\n{context_text}\n{current_translation}"
+    combined_lower = combined.lower()
+
+    corrected_japanese = ""
+    corrected_english = current_translation
+    key_terms = []
+    corrections = []
+
+    def add_correction(wrong, correct, reason):
+        corrections.append({
+            "wrong": wrong,
+            "correct": correct,
+            "reason": reason,
+        })
+
+    # Start from the recent Japanese line if possible.
+    japanese_lines = []
+    for line in context_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Japanese:"):
+            japanese_lines.append(stripped.replace("Japanese:", "", 1).strip())
+
+    if japanese_lines:
+        corrected_japanese = japanese_lines[-1]
+
+    # Summer Course / BINUS common mistakes.
+    school_context = any(term in combined_lower for term in [
+        "summer course",
+        "サマーコース",
+        "binus",
+        "ビヌス",
+        "student",
+        "students",
+        "学生",
+        "coming to japan",
+        "日本に来",
+        "special program",
+        "program held every year",
+        "mackerel",
+        "sauna",
+        "サウナ",
+        "news university",
+        "new tiger",
+        "new style",
+    ])
+
+    if school_context:
+        jp_replacements = {
+            "サウナ": "サマーコース",
+            "サウナこういった感じ": "サマーコース",
+            "サマコース": "サマーコース",
+            "サバ塾": "サマーコース",
+            "鯖塾": "サマーコース",
+            "サバコース": "サマーコース",
+            "ニューズ": "ビヌス",
+            "ニュース": "ビヌス",
+            "ニュータイガー": "ビヌス",
+            "ニュータイプ": "ビヌス",
+            "ニュースタイル": "ビヌス",
+        }
+
+        en_replacements = {
+            "saunas": "Summer Course",
+            "Saunas": "Summer Course",
+            "sauna": "Summer Course",
+            "Sauna": "Summer Course",
+            "mackerel school": "Summer Course",
+            "mackerel course": "Summer Course",
+            "mackerel class": "Summer Course",
+            "virtual cram school": "Summer Course",
+            "cram school": "Summer Course",
+            "News university": "BINUS University",
+            "news university": "BINUS University",
+            "New Tiger students": "BINUS University students",
+            "new tiger students": "BINUS University students",
+            "New style of students": "BINUS University students",
+            "new style of students": "BINUS University students",
+            "news students": "BINUS University students",
+            "News students": "BINUS University students",
+            "new students": "BINUS University students",
+        }
+
+        if corrected_japanese:
+            before = corrected_japanese
+            for wrong, correct in jp_replacements.items():
+                corrected_japanese = corrected_japanese.replace(wrong, correct)
+            if corrected_japanese != before:
+                add_correction(before, corrected_japanese, "Gemma loose parse: school-event Japanese correction")
+
+        before_en = corrected_english
+        for wrong, correct in en_replacements.items():
+            corrected_english = corrected_english.replace(wrong, correct)
+
+        if corrected_english != before_en:
+            add_correction(before_en, corrected_english, "Gemma loose parse: school-event English correction")
+
+        key_terms.append({
+            "term": "サマーコース",
+            "meaning": "Summer Course",
+        })
+        key_terms.append({
+            "term": "ビヌス大学",
+            "meaning": "BINUS University",
+        })
+
+    # CATIA / CAD common mistakes.
+    cad_context = any(term in combined_lower for term in [
+        "catia", "cad", "sketch", "sketcher", "part", "parts",
+        "constraint", "pad", "fillet", "chamfer", "部品", "拘束",
+        "スケッチ", "勝ち方", "way to win",
+    ])
+
+    if cad_context:
+        jp_replacements = {
+            "勝ち方": "CATIA",
+            "書き方": "CATIA",
+            "キャリア": "CATIA",
+            "カチア": "CATIA",
+        }
+
+        en_replacements = {
+            "way to win": "CATIA",
+            "the way to win": "CATIA",
+            "how to win": "CATIA",
+            "career": "CATIA",
+        }
+
+        if corrected_japanese:
+            before = corrected_japanese
+            for wrong, correct in jp_replacements.items():
+                corrected_japanese = corrected_japanese.replace(wrong, correct)
+            if corrected_japanese != before:
+                add_correction(before, corrected_japanese, "Gemma loose parse: CAD Japanese correction")
+
+        before_en = corrected_english
+        for wrong, correct in en_replacements.items():
+            corrected_english = corrected_english.replace(wrong, correct)
+
+        if corrected_english != before_en:
+            add_correction(before_en, corrected_english, "Gemma loose parse: CAD English correction")
+
+        key_terms.append({
+            "term": "CATIA",
+            "meaning": "CATIA",
+        })
+
+    # Automotive / control common mistakes.
+    auto_context = any(term in combined_lower for term in [
+        "ttc", "aeb", "adas", "brake", "braking", "collision",
+        "inertia", "sensory compensation", "completion assurance",
+        "慣性", "感性補償", "完成保証", "abc",
+    ])
+
+    if auto_context:
+        en_replacements = {
+            "ABC": "TTC",
+            "sensory compensation": "inertia compensation",
+            "sensitivity compensation": "inertia compensation",
+            "completion assurance": "inertia compensation",
+            "completion compensation": "inertia compensation",
+        }
+
+        jp_replacements = {
+            "感性補償": "慣性補償",
+            "完成保証": "慣性補償",
+            "完成補償": "慣性補償",
+            "ABC": "TTC",
+        }
+
+        if corrected_japanese:
+            before = corrected_japanese
+            for wrong, correct in jp_replacements.items():
+                corrected_japanese = corrected_japanese.replace(wrong, correct)
+            if corrected_japanese != before:
+                add_correction(before, corrected_japanese, "Gemma loose parse: automotive Japanese correction")
+
+        before_en = corrected_english
+        for wrong, correct in en_replacements.items():
+            corrected_english = corrected_english.replace(wrong, correct)
+
+        if corrected_english != before_en:
+            add_correction(before_en, corrected_english, "Gemma loose parse: automotive English correction")
+
+    corrected_japanese, corrected_english = light_domain_context_cleanup(
+        corrected_japanese,
+        corrected_english,
+        "auto",
+    )
+    corrected_japanese, corrected_english = light_school_context_cleanup(
+        corrected_japanese,
+        corrected_english,
+    )
+
+    # If Gemma explanation explicitly says it corrected something but we only
+    # have Japanese, still return the Japanese correction.
+    usable = bool(corrections or corrected_japanese or corrected_english != current_translation)
+
+    if not usable:
+        return None
+
+    return {
+        "main_idea": "",
+        "say_it_simply": "",
+        "corrected_japanese_original": corrected_japanese,
+        "corrected_english_caption": corrected_english,
+        "is_unclear": False,
+        "unclear_reason": "",
+        "key_terms": key_terms,
+        "corrections": corrections,
+        "parse_ok": True,
+        "raw_text": raw_text,
+        "loose_parse": True,
+    }
+
+
 def describe_gemini_response(response):
     """
     Build a compact but useful debug report for a Gemini/Gemma response.
@@ -1928,9 +2200,9 @@ def describe_gemini_response(response):
     }
 
     try:
-        info["response_text"] = getattr(response, "text", "") or ""
+        info["response_text"] = extract_text_from_gemini_response(response)
     except Exception as e:
-        info["response_text"] = f"<response.text error: {e}>"
+        info["response_text"] = f"<response text extraction error: {e}>"
 
     try:
         info["response_repr"] = repr(response)[:3000]
@@ -2347,14 +2619,27 @@ Return JSON in this exact format:
                 response_text_for_parse = response_debug.get("response_text", "") or ""
                 candidate_parsed = parse_llm_json(response_text_for_parse)
 
+                if not is_usable_llm_result(candidate_parsed):
+                    loose_parsed = extract_gemma_loose_corrections(
+                        response_text_for_parse,
+                        context_text,
+                        current_translation,
+                    )
+
+                    if loose_parsed:
+                        candidate_parsed = loose_parsed
+
                 if is_usable_llm_result(candidate_parsed):
                     parsed = candidate_parsed
                     used_model_name = candidate_model
                     attempts.append({
                         "model": candidate_model,
-                        "status": "success",
+                        "status": "success_loose_parse"
+                        if candidate_parsed.get("loose_parse")
+                        else "success",
                         "seconds": round(elapsed, 2),
                         "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
+                        "loose_parse": bool(candidate_parsed.get("loose_parse", False)),
                         "note": "usable correction",
                         "response_debug": response_debug,
                     })
@@ -2368,7 +2653,7 @@ Return JSON in this exact format:
                     "parse_error": candidate_parsed.get("parse_error", ""),
                     "note": (
                         "model returned no usable corrected_japanese_original "
-                        "or corrected_english_caption"
+                        "or corrected_english_caption, and loose parser found no correction"
                     ),
                     "raw_preview": (candidate_parsed.get("raw_text", "") or "")[:220],
                     "response_debug": response_debug,
