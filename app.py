@@ -1093,6 +1093,117 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
 
 
 
+def text_char_overlap_ratio(shorter_text, longer_text):
+    shorter_text = (shorter_text or "").strip()
+    longer_text = (longer_text or "").strip()
+
+    if not shorter_text or not longer_text:
+        return 0.0
+
+    shorter_set = set(shorter_text)
+    longer_set = set(longer_text)
+
+    if not shorter_set:
+        return 0.0
+
+    return len(shorter_set & longer_set) / max(1, len(shorter_set))
+
+
+def ai_text_is_full_enough(live_text, ai_text, min_ratio=0.72):
+    """
+    True when the AI text looks like a full corrected caption, not just
+    a short correction phrase.
+
+    This prevents:
+        long live caption -> "サマーコース"
+    from replacing the whole caption and making it look like the caption restarted.
+    """
+    live_text = (live_text or "").strip()
+    ai_text = (ai_text or "").strip()
+
+    if not ai_text:
+        return False
+
+    if not live_text:
+        return True
+
+    live_len = len(live_text)
+    ai_len = len(ai_text)
+
+    if ai_len >= live_len * min_ratio:
+        return True
+
+    if live_text in ai_text:
+        return True
+
+    if ai_len >= 40 and text_char_overlap_ratio(ai_text, live_text) >= 0.85:
+        return True
+
+    return False
+
+
+def merge_ai_correction_with_live_text(
+    live_text,
+    ai_text,
+    corrections,
+    text_kind,
+    domain_mode,
+    force_patch_mode=False,
+):
+    """
+    Merge helper AI correction without deleting previous live caption.
+
+    Full replace mode:
+        Used only when AI text appears to be a full corrected caption.
+
+    Patch mode:
+        Used for Gemma loose parser / partial corrections.
+        It applies correction pairs to the existing live caption and then
+        runs cleanup rules, keeping the previous text.
+    """
+    live_text = (live_text or "").strip()
+    ai_text = (ai_text or "").strip()
+
+    # 1) Always try to patch the existing live caption first.
+    patched_text = apply_llm_corrections(live_text, corrections)
+
+    # 2) If AI returned a full caption and this is not loose/partial mode,
+    #    allow replacement.
+    if (
+        not force_patch_mode
+        and ai_text_is_full_enough(live_text, ai_text)
+    ):
+        merged_text = ai_text
+    else:
+        # Patch mode. Keep previous text.
+        merged_text = patched_text or live_text
+
+        # If there was no useful patch and the live caption is empty,
+        # use AI text as fallback.
+        if not merged_text and ai_text:
+            merged_text = ai_text
+
+    if text_kind == "original":
+        merged_text = light_original_cleanup(merged_text)
+        merged_text, _ = light_domain_context_cleanup(
+            merged_text,
+            "",
+            domain_mode,
+        )
+        return merged_text.strip()
+
+    if text_kind == "translation":
+        merged_text = light_caption_cleanup(merged_text)
+        _, merged_text = light_domain_context_cleanup(
+            "",
+            merged_text,
+            domain_mode,
+        )
+        return merged_text.strip()
+
+    return merged_text.strip()
+
+
 def prepare_next_ai_check_after_new_live_text():
     """
     When new live speech arrives after an AI-corrected segment, keep the
@@ -2689,6 +2800,7 @@ Return JSON in this exact format:
             "corrections": parsed.get("corrections", []),
             "used_model": used_model_name,
             "attempts": attempts,
+            "loose_parse": bool(parsed.get("loose_parse", False)),
         })
 
     except Exception as e:
@@ -3275,6 +3387,7 @@ defaults = {
     "llm_last_source_text": "",
     "llm_used_model": "",
     "llm_last_attempts": [],
+    "llm_last_loose_parse": False,
     "llm_gate_status": {},
     "llm_last_start_time": "",
     "llm_last_finish_time": "",
@@ -3676,6 +3789,7 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_used_model = item.get("used_model", llm_model_name)
         st.session_state.llm_last_attempts = item.get("attempts", [])
+        st.session_state.llm_last_loose_parse = bool(item.get("loose_parse", False))
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
         st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
@@ -3697,35 +3811,32 @@ while not st.session_state.llm_result_queue.empty():
             )
 
             # Important:
-            # Keep the AI-corrected text visible AND continue from it.
-            # The worker's internal base is replaced with the corrected text,
-            # so the next live tokens append to the fixed caption instead of
-            # returning old text or starting from empty.
-            corrected_base_original = (
-                st.session_state.llm_corrected_japanese_original
-                or st.session_state.live_original
-            )
-            corrected_base_translation = (
-                st.session_state.llm_corrected_english_caption
-                or st.session_state.live_translation
+            # Do NOT blindly replace the whole live caption with Gemma output.
+            # Gemma loose parser may return only a corrected phrase or latest sentence.
+            # In that case, patch the existing live caption instead of restarting it.
+            force_patch_mode = bool(st.session_state.llm_last_loose_parse)
+
+            corrected_base_original = merge_ai_correction_with_live_text(
+                live_text=st.session_state.live_original,
+                ai_text=st.session_state.llm_corrected_japanese_original,
+                corrections=st.session_state.llm_corrections,
+                text_kind="original",
+                domain_mode=domain_mode,
+                force_patch_mode=force_patch_mode,
             )
 
-            corrected_base_original = light_original_cleanup(
-                apply_llm_corrections(
-                    corrected_base_original,
-                    st.session_state.llm_corrections,
-                )
+            corrected_base_translation = merge_ai_correction_with_live_text(
+                live_text=st.session_state.live_translation,
+                ai_text=st.session_state.llm_corrected_english_caption,
+                corrections=st.session_state.llm_corrections,
+                text_kind="translation",
+                domain_mode=domain_mode,
+                force_patch_mode=force_patch_mode,
             )
-            corrected_base_translation = light_caption_cleanup(
-                apply_llm_corrections(
-                    corrected_base_translation,
-                    st.session_state.llm_corrections,
-                )
-            )
-            corrected_base_original, corrected_base_translation = light_domain_context_cleanup(
+
+            corrected_base_original, corrected_base_translation = light_school_context_cleanup(
                 corrected_base_original,
                 corrected_base_translation,
-                domain_mode,
             )
 
             st.session_state.live_original = corrected_base_original
@@ -4039,9 +4150,10 @@ elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
         )
 elif source_is_corrected and st.session_state.last_helper_fix_time:
     used_model = st.session_state.llm_used_model or llm_model_name
+    patch_note = " / patch mode" if st.session_state.llm_last_loose_parse else ""
     correction_status_text = (
         f"AI correction applied at {st.session_state.last_helper_fix_time} "
-        f"using {used_model}"
+        f"using {used_model}{patch_note}"
     )
 elif st.session_state.live_translation:
     gate = st.session_state.get("llm_gate_status", {})
@@ -4257,6 +4369,7 @@ if show_debug:
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
             f"used_model={st.session_state.llm_used_model}\n"
+            f"loose_parse_patch_mode={st.session_state.llm_last_loose_parse}\n"
             f"is_unclear={st.session_state.llm_is_unclear}\n"
             f"unclear_reason={st.session_state.llm_unclear_reason}\n"
             f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
