@@ -48,12 +48,11 @@ GEMMA_HELPER_31B = "gemma-4-31b-it"
 GEMINI_HELPER_FLASH_LITE = "gemini-3.1-flash-lite"
 
 LLM_MODEL_DEFAULT = GEMMA_HELPER_26B
-LLM_MODEL_BACKUP = GEMINI_HELPER_FLASH_LITE
+LLM_MODEL_BACKUP = GEMMA_HELPER_31B
 
 LLM_MODEL_OPTIONS = [
     GEMMA_HELPER_26B,
     GEMMA_HELPER_31B,
-    GEMINI_HELPER_FLASH_LITE,
 ]
 
 # Helper model robustness.
@@ -2232,7 +2231,7 @@ Return JSON in this exact format:
 
         if parsed is None:
             raise RuntimeError(
-                "All helper models failed or returned unusable output. "
+                "Selected Gemma helper failed or returned unusable output. "
                 f"Attempts: {attempts}"
             )
 
@@ -2676,21 +2675,19 @@ with st.sidebar:
     )
 
     llm_model_name = st.selectbox(
-        "Helper AI model",
+        "Gemma helper model",
         LLM_MODEL_OPTIONS,
         index=0,
         help=(
-            "Gemma 4 models use the Gemini API too. "
-            "26B is usually the safer first Gemma option; 31B is larger but may hit limits/errors more often."
+            "Gemma-only test mode. The app will call only this selected Gemma model "
+            "for helper correction. No fallback model will be used."
         ),
     )
 
-    helper_fallback_enabled = st.checkbox(
-        "Use helper fallback models",
-        value=True,
-        help=(
-            "If the selected helper model fails or hits quota, try the other helper models before giving up."
-        ),
+    helper_fallback_enabled = False
+    st.caption(
+        "Gemma-only diagnostic mode: no Gemini Flash-Lite fallback. "
+        "If this model times out or returns bad JSON, the app will show the error."
     )
 
     llm_budget_mode = st.selectbox(
@@ -2700,7 +2697,7 @@ with st.sidebar:
     )
 
     st.caption(
-        "Helper correction can use Gemma 4. "
+        "Helper correction uses only the selected Gemma model. "
         "Translation itself still uses Gemini 3.5 Live Translate."
     )
 
@@ -3333,7 +3330,7 @@ if use_llm_hints and gemini_api_key:
         "helper_session_limit": int(llm_session_limit),
         "llm_running": bool(st.session_state.llm_running),
         "selected_model": llm_model_name,
-        "fallback_enabled": bool(helper_fallback_enabled),
+        "fallback_enabled": False,
     }
     st.session_state.llm_gate_status = gate_status
 
@@ -3368,14 +3365,10 @@ if use_llm_hints and gemini_api_key:
 
         selected_class_context = make_selected_domain_context(domain_mode)
 
+        # Gemma-only diagnostic mode:
+        # Do not use fallback models. We want to know whether the selected
+        # Gemma model itself works or not.
         helper_fallback_models = []
-
-        if helper_fallback_enabled:
-            helper_fallback_models = [
-                model
-                for model in LLM_MODEL_OPTIONS
-                if model != llm_model_name
-            ]
 
         st.session_state.llm_thread = threading.Thread(
             target=llm_hint_worker,
