@@ -56,6 +56,11 @@ LLM_MODEL_OPTIONS = [
     GEMINI_HELPER_FLASH_LITE,
 ]
 
+# Helper model robustness.
+# If Gemma hangs or is slow, do not let the app wait forever.
+LLM_MODEL_TIMEOUT_SECONDS = 18.0
+LLM_MIN_USABLE_CORRECTION_CHARS = 5
+
 # Translation model for Gemini Live Translate mode
 GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
 GEMINI_LIVE_WS_URL = (
@@ -1867,17 +1872,21 @@ Correction priorities:
 # ============================================================
 
 def parse_llm_json(text):
+    empty_result = {
+        "main_idea": "",
+        "say_it_simply": "",
+        "corrected_japanese_original": "",
+        "corrected_english_caption": "",
+        "is_unclear": False,
+        "unclear_reason": "",
+        "key_terms": [],
+        "corrections": [],
+        "parse_ok": False,
+        "raw_text": text or "",
+    }
+
     if not text:
-        return {
-            "main_idea": "",
-            "say_it_simply": "",
-            "corrected_japanese_original": "",
-            "corrected_english_caption": "",
-            "is_unclear": False,
-            "unclear_reason": "",
-            "key_terms": [],
-            "corrections": [],
-        }
+        return empty_result
 
     cleaned = text.strip()
 
@@ -1889,6 +1898,15 @@ def parse_llm_json(text):
 
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
+
+    # Gemma sometimes writes a sentence before/after JSON.
+    # Extract the first JSON object if possible.
+    if not cleaned.startswith("{"):
+        json_start = cleaned.find("{")
+        json_end = cleaned.rfind("}")
+
+        if json_start >= 0 and json_end > json_start:
+            cleaned = cleaned[json_start:json_end + 1].strip()
 
     try:
         data = json.loads(cleaned)
@@ -1905,20 +1923,94 @@ def parse_llm_json(text):
             "unclear_reason": str(data.get("unclear_reason", "")).strip(),
             "key_terms": data.get("key_terms", []),
             "corrections": data.get("corrections", []),
+            "parse_ok": True,
+            "raw_text": text or "",
         }
 
     except Exception:
-        return {
-            "main_idea": cleaned[:220],
-            "say_it_simply": "",
-            "corrected_japanese_original": "",
-            "corrected_english_caption": "",
-            "is_unclear": False,
-            "unclear_reason": "",
-            "key_terms": [],
-            "corrections": [],
-        }
+        result = dict(empty_result)
+        result["main_idea"] = cleaned[:220]
+        result["raw_text"] = text or ""
+        return result
 
+
+def is_usable_llm_result(parsed):
+    """
+    Gemma can return text that parses weakly but does not contain a useful
+    correction. Treat that as failure so fallback can try the next model.
+    """
+    if not parsed:
+        return False
+
+    if not parsed.get("parse_ok", False):
+        return False
+
+    corrected_jp = (parsed.get("corrected_japanese_original") or "").strip()
+    corrected_en = (parsed.get("corrected_english_caption") or "").strip()
+
+    if len(corrected_jp) >= LLM_MIN_USABLE_CORRECTION_CHARS:
+        return True
+
+    if len(corrected_en) >= LLM_MIN_USABLE_CORRECTION_CHARS:
+        return True
+
+    if parsed.get("is_unclear", False):
+        return True
+
+    if parsed.get("key_terms") or parsed.get("corrections"):
+        return True
+
+    return False
+
+
+def generate_content_with_timeout(client, model_name, prompt, timeout_seconds):
+    """
+    Run a helper model call in a daemon thread so a slow Gemma call cannot
+    block the app forever. If it times out, fallback can try another model.
+    """
+    local_queue = queue.Queue()
+
+    def call_model():
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=650,
+                ),
+            )
+            local_queue.put({
+                "ok": True,
+                "response": response,
+                "error": "",
+            })
+
+        except Exception as e:
+            local_queue.put({
+                "ok": False,
+                "response": None,
+                "error": str(e),
+            })
+
+    worker = threading.Thread(target=call_model, daemon=True)
+    worker.start()
+    worker.join(float(timeout_seconds))
+
+    if worker.is_alive():
+        raise TimeoutError(
+            f"{model_name} did not return within {timeout_seconds:.0f} seconds"
+        )
+
+    if local_queue.empty():
+        raise RuntimeError(f"{model_name} finished without returning a result")
+
+    item = local_queue.get()
+
+    if not item["ok"]:
+        raise RuntimeError(item["error"])
+
+    return item["response"]
 
 def llm_hint_worker(
     result_queue,
@@ -1964,7 +2056,9 @@ Use the selected class/domain context as fixed background.
 Use the recent context below. The latest part is at the bottom.
 
 Rules:
-- Output JSON only.
+- Output JSON only. Do not use markdown. Do not use code fences.
+- The first character of your response must be {{ and the last character must be }}.
+- You must fill corrected_japanese_original and corrected_english_caption.
 - Treat the selected class/domain context as high-priority background for repairing STT mistakes.
 - The selected class/domain context does not override actual speech. Do not invent terms that are not supported by the current sentence.
 - If the selected domain is CAD/Product Design, prefer CATIA/CAD vocabulary when the current sentence mentions parts, sketches, constraints, modeling, or design.
@@ -2083,34 +2177,64 @@ Return JSON in this exact format:
             if candidate_model and candidate_model not in model_try_order:
                 model_try_order.append(candidate_model)
 
-        last_model_error = None
-        response = None
+        attempts = []
+        parsed = None
         used_model_name = ""
 
         for candidate_model in model_try_order:
+            started_at = time.time()
+
             try:
-                response = client.models.generate_content(
-                    model=candidate_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        max_output_tokens=650,
-                    ),
+                response = generate_content_with_timeout(
+                    client,
+                    candidate_model,
+                    prompt,
+                    LLM_MODEL_TIMEOUT_SECONDS,
                 )
-                used_model_name = candidate_model
-                last_model_error = None
-                break
+
+                elapsed = time.time() - started_at
+                candidate_parsed = parse_llm_json(response.text)
+
+                if is_usable_llm_result(candidate_parsed):
+                    parsed = candidate_parsed
+                    used_model_name = candidate_model
+                    attempts.append({
+                        "model": candidate_model,
+                        "status": "success",
+                        "seconds": round(elapsed, 2),
+                        "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
+                        "note": "usable correction",
+                    })
+                    break
+
+                attempts.append({
+                    "model": candidate_model,
+                    "status": "bad_output",
+                    "seconds": round(elapsed, 2),
+                    "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
+                    "note": (
+                        "model returned no usable corrected_japanese_original "
+                        "or corrected_english_caption"
+                    ),
+                    "raw_preview": (candidate_parsed.get("raw_text", "") or "")[:220],
+                })
 
             except Exception as model_error:
-                last_model_error = model_error
+                elapsed = time.time() - started_at
+                attempts.append({
+                    "model": candidate_model,
+                    "status": "error",
+                    "seconds": round(elapsed, 2),
+                    "parse_ok": False,
+                    "note": str(model_error)[:260],
+                })
                 continue
 
-        if response is None:
+        if parsed is None:
             raise RuntimeError(
-                f"All helper models failed. Last error: {last_model_error}"
+                "All helper models failed or returned unusable output. "
+                f"Attempts: {attempts}"
             )
-
-        parsed = parse_llm_json(response.text)
 
         result_queue.put({
             "type": "llm_hint",
@@ -2124,6 +2248,7 @@ Return JSON in this exact format:
             "key_terms": parsed.get("key_terms", []),
             "corrections": parsed.get("corrections", []),
             "used_model": used_model_name,
+            "attempts": attempts,
         })
 
     except Exception as e:
@@ -2676,6 +2801,10 @@ defaults = {
     "llm_last_call_time": 0.0,
     "llm_last_source_text": "",
     "llm_used_model": "",
+    "llm_last_attempts": [],
+    "llm_gate_status": {},
+    "llm_last_start_time": "",
+    "llm_last_finish_time": "",
     "llm_context_chunks": [],
 }
 
@@ -3073,8 +3202,10 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_key_terms = item.get("key_terms", [])
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_used_model = item.get("used_model", llm_model_name)
+        st.session_state.llm_last_attempts = item.get("attempts", [])
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
+        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
         st.session_state.llm_calls_this_session += 1
 
         has_ai_update = (
@@ -3147,6 +3278,7 @@ while not st.session_state.llm_result_queue.empty():
     elif item_type == "llm_error":
         st.session_state.llm_error = item.get("message", "")
         st.session_state.llm_running = False
+        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
         st.session_state.llm_calls_this_session += 1
         st.session_state.correction_status = "error"
 
@@ -3181,6 +3313,30 @@ if use_llm_hints and gemini_api_key:
         and llm_budget_mode != "Emergency Rule-Based Only"
     )
 
+    seconds_since_last_call = time.time() - float(st.session_state.llm_last_call_time)
+    seconds_until_interval = max(0.0, float(llm_hint_interval) - seconds_since_last_call)
+
+    gate_status = {
+        "soniox_running": bool(st.session_state.soniox_running),
+        "translated_text_ready": bool(translated_text_ready),
+        "enough_text": bool(enough_text),
+        "source_text_length": len(source_text),
+        "min_required_chars": int(llm_min_context_chars),
+        "changed_text": bool(changed_text),
+        "interval_ready": bool(interval_ready),
+        "seconds_until_interval_ready": round(seconds_until_interval, 1),
+        "has_new_live_tokens_for_llm": bool(has_new_live_tokens_for_llm),
+        "live_token_version": int(st.session_state.live_token_version),
+        "last_llm_checked_token_version": int(st.session_state.last_llm_checked_token_version),
+        "helper_budget_available": bool(helper_budget_available),
+        "helper_calls_this_session": int(st.session_state.llm_calls_this_session),
+        "helper_session_limit": int(llm_session_limit),
+        "llm_running": bool(st.session_state.llm_running),
+        "selected_model": llm_model_name,
+        "fallback_enabled": bool(helper_fallback_enabled),
+    }
+    st.session_state.llm_gate_status = gate_status
+
     if (
         st.session_state.soniox_running
         and translated_text_ready
@@ -3199,6 +3355,8 @@ if use_llm_hints and gemini_api_key:
 
         st.session_state.llm_running = True
         st.session_state.llm_error = ""
+        st.session_state.llm_last_attempts = []
+        st.session_state.llm_last_start_time = time.strftime("%H:%M:%S")
         # Keep the previous corrected text visible while the next AI check runs.
         # New result will replace it when ready.
         st.session_state.caption_stage = "ai_checking"
@@ -3388,7 +3546,11 @@ elif not gemini_api_key:
 elif st.session_state.llm_error:
     correction_status_text = f"AI correction error: {st.session_state.llm_error}"
 elif st.session_state.llm_running:
-    correction_status_text = "AI correction checking..."
+    start_time = st.session_state.llm_last_start_time or "now"
+    correction_status_text = (
+        f"AI correction checking with {llm_model_name} "
+        f"(started {start_time}, timeout {LLM_MODEL_TIMEOUT_SECONDS:.0f}s/model)"
+    )
 elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
     unclear_reason = st.session_state.llm_unclear_reason.strip()
     if unclear_reason:
@@ -3408,7 +3570,34 @@ elif source_is_corrected and st.session_state.last_helper_fix_time:
         f"using {used_model}"
     )
 elif st.session_state.live_translation:
-    correction_status_text = "AI correction pending"
+    gate = st.session_state.get("llm_gate_status", {})
+    pending_reason = ""
+
+    if gate:
+        if not gate.get("enough_text", False):
+            pending_reason = (
+                f"waiting for more text "
+                f"({gate.get('source_text_length', 0)}/{gate.get('min_required_chars', 0)} chars)"
+            )
+        elif not gate.get("interval_ready", False):
+            pending_reason = (
+                f"waiting {gate.get('seconds_until_interval_ready', 0)} sec for helper interval"
+            )
+        elif not gate.get("has_new_live_tokens_for_llm", False):
+            pending_reason = "waiting for new live speech"
+        elif not gate.get("changed_text", False):
+            pending_reason = "waiting for changed text"
+        elif not gate.get("helper_budget_available", False):
+            pending_reason = "helper budget unavailable"
+        elif gate.get("llm_running", False):
+            pending_reason = "helper is already running"
+        else:
+            pending_reason = "ready to start helper"
+
+    if pending_reason:
+        correction_status_text = f"AI correction pending: {pending_reason}"
+    else:
+        correction_status_text = "AI correction pending"
 elif st.session_state.live_original:
     correction_status_text = "Waiting for English before AI correction"
 else:
@@ -3513,6 +3702,19 @@ if show_debug:
 
         st.write("Helper calls this session:")
         st.code(str(st.session_state.llm_calls_this_session))
+
+        st.write("Helper gate status:")
+        st.code(json.dumps(st.session_state.llm_gate_status, ensure_ascii=False, indent=2))
+
+        st.write("Helper model attempts:")
+        st.code(json.dumps(st.session_state.llm_last_attempts, ensure_ascii=False, indent=2))
+
+        st.write("Helper last start / finish:")
+        st.code(
+            f"start={st.session_state.llm_last_start_time}\n"
+            f"finish={st.session_state.llm_last_finish_time}\n"
+            f"used_model={st.session_state.llm_used_model}"
+        )
 
         st.write("Helper budget reached:")
         st.code(str(st.session_state.llm_budget_reached))
