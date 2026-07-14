@@ -2082,12 +2082,20 @@ def make_json_safe(value, depth=0):
 
 def looks_like_prompt_echo(text):
     """
-    Groq can sometimes return or expose prompt/thought text instead of a
-    final answer. Do not treat that as a valid correction.
+    Reject prompt/instruction echo, but do NOT reject valid JSON.
+
+    The old version treated JSON field names such as
+    corrected_japanese_original / corrected_english_caption as prompt markers.
+    That was wrong because real JSON must contain those keys.
     """
     text = (text or "").strip()
 
     if not text:
+        return False
+
+    # Valid helper output should start with JSON.
+    # Never call JSON-shaped text a prompt echo just because it contains keys.
+    if text.startswith("{"):
         return False
 
     markers = [
@@ -2098,19 +2106,16 @@ def looks_like_prompt_echo(text):
         "Selected class/domain context",
         "Return JSON",
         "Output JSON",
-        "corrected_japanese_original",
-        "corrected_english_caption",
         "Technical glossary terms detected",
+        "You correct a live Japanese-to-English classroom caption",
+        "Required JSON",
     ]
 
     marker_count = sum(1 for marker in markers if marker in text)
 
-    # One marker can appear inside a quoted debug message,
-    # but multiple markers means it is probably the prompt itself.
     if marker_count >= 2:
         return True
 
-    # If it starts like the exact prompt, reject.
     if text.startswith("* Role: Interpreter assistant"):
         return True
 
@@ -2572,12 +2577,11 @@ def parse_llm_json(text):
 
     # Groq sometimes writes a sentence before/after JSON.
     # Extract the first JSON object if possible.
-    if not cleaned.startswith("{"):
-        json_start = cleaned.find("{")
-        json_end = cleaned.rfind("}")
+    json_start = cleaned.find("{")
+    json_end = cleaned.rfind("}")
 
-        if json_start >= 0 and json_end > json_start:
-            cleaned = cleaned[json_start:json_end + 1].strip()
+    if json_start >= 0 and json_end > json_start:
+        cleaned = cleaned[json_start:json_end + 1].strip()
 
     try:
         data = json.loads(cleaned)
@@ -2762,6 +2766,8 @@ def llm_hint_worker(
     class_context="",
     fallback_model_names=None,
 ):
+    attempts = []
+
     try:
         client = Groq(api_key=api_key)
 
@@ -2869,23 +2875,27 @@ Required JSON:
                     candidate_parsed = {
                         "parse_ok": False,
                         "raw_text": "",
-                        "parse_error": (
-                            "No final Groq answer text was found. "
-                            "The model may have returned only thought/prompt text."
-                        ),
-                    }
-
-                elif looks_like_prompt_echo(response_text_for_parse):
-                    candidate_parsed = {
-                        "parse_ok": False,
-                        "raw_text": response_text_for_parse,
-                        "parse_error": (
-                            "Groq returned prompt/instruction echo, not a final answer."
-                        ),
+                        "parse_error": "Groq returned empty final answer text.",
                     }
 
                 else:
+                    # Critical fix:
+                    # Try parsing JSON FIRST. A valid JSON helper response
+                    # naturally contains keys like corrected_english_caption,
+                    # so checking prompt echo first can reject good responses.
                     candidate_parsed = parse_llm_json(response_text_for_parse)
+
+                    if (
+                        not is_usable_llm_result(candidate_parsed)
+                        and looks_like_prompt_echo(response_text_for_parse)
+                    ):
+                        candidate_parsed = {
+                            "parse_ok": False,
+                            "raw_text": response_text_for_parse,
+                            "parse_error": (
+                                "Groq returned prompt/instruction echo, not a final answer."
+                            ),
+                        }
 
                 if not is_usable_llm_result(candidate_parsed):
                     loose_parsed = extract_groq_loose_corrections(
@@ -2964,6 +2974,7 @@ Required JSON:
         result_queue.put({
             "type": "llm_error",
             "message": str(e),
+            "attempts": attempts,
         })
 
 
@@ -4046,6 +4057,10 @@ while not st.session_state.llm_result_queue.empty():
 
     elif item_type == "llm_error":
         st.session_state.llm_error = item.get("message", "")
+        st.session_state.llm_last_attempts = item.get(
+            "attempts",
+            st.session_state.llm_last_attempts,
+        )
         st.session_state.llm_running = False
         st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
         st.session_state.llm_calls_this_session += 1
