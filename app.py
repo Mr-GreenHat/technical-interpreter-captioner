@@ -1870,6 +1870,155 @@ Correction priorities:
 # LLM Interpreter Support
 # ============================================================
 
+def make_json_safe(value, depth=0):
+    """
+    Convert Gemini SDK response objects into JSON-safe values for debugging.
+    Avoids crashing the Streamlit UI when the SDK object contains non-serializable fields.
+    """
+    if depth > 4:
+        return str(value)[:600]
+
+    if value is None:
+        return None
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (list, tuple)):
+        return [
+            make_json_safe(item, depth + 1)
+            for item in value[:8]
+        ]
+
+    if isinstance(value, dict):
+        return {
+            str(key): make_json_safe(val, depth + 1)
+            for key, val in list(value.items())[:30]
+        }
+
+    # Pydantic / SDK model_dump
+    if hasattr(value, "model_dump"):
+        try:
+            return make_json_safe(value.model_dump(), depth + 1)
+        except Exception:
+            pass
+
+    # Dataclass-like or simple SDK objects
+    if hasattr(value, "__dict__"):
+        try:
+            return make_json_safe(vars(value), depth + 1)
+        except Exception:
+            pass
+
+    return str(value)[:600]
+
+
+def describe_gemini_response(response):
+    """
+    Build a compact but useful debug report for a Gemini/Gemma response.
+    This is needed because response.text can be empty even when the model
+    returned candidates, safety metadata, finish reasons, or errors.
+    """
+    info = {
+        "response_text": "",
+        "response_repr": "",
+        "prompt_feedback": None,
+        "usage_metadata": None,
+        "candidates": [],
+    }
+
+    try:
+        info["response_text"] = getattr(response, "text", "") or ""
+    except Exception as e:
+        info["response_text"] = f"<response.text error: {e}>"
+
+    try:
+        info["response_repr"] = repr(response)[:3000]
+    except Exception as e:
+        info["response_repr"] = f"<repr error: {e}>"
+
+    try:
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        info["prompt_feedback"] = make_json_safe(prompt_feedback)
+    except Exception as e:
+        info["prompt_feedback"] = f"<prompt_feedback error: {e}>"
+
+    try:
+        usage_metadata = getattr(response, "usage_metadata", None)
+        info["usage_metadata"] = make_json_safe(usage_metadata)
+    except Exception as e:
+        info["usage_metadata"] = f"<usage_metadata error: {e}>"
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+
+        for candidate in candidates[:4]:
+            candidate_info = {
+                "finish_reason": "",
+                "finish_message": "",
+                "safety_ratings": None,
+                "content_role": "",
+                "parts": [],
+            }
+
+            try:
+                candidate_info["finish_reason"] = str(
+                    getattr(candidate, "finish_reason", "") or ""
+                )
+            except Exception:
+                pass
+
+            try:
+                candidate_info["finish_message"] = str(
+                    getattr(candidate, "finish_message", "") or ""
+                )
+            except Exception:
+                pass
+
+            try:
+                candidate_info["safety_ratings"] = make_json_safe(
+                    getattr(candidate, "safety_ratings", None)
+                )
+            except Exception:
+                pass
+
+            try:
+                content = getattr(candidate, "content", None)
+                candidate_info["content_role"] = str(
+                    getattr(content, "role", "") or ""
+                )
+
+                parts = getattr(content, "parts", None) or []
+
+                for part in parts[:6]:
+                    part_text = ""
+
+                    try:
+                        part_text = getattr(part, "text", "") or ""
+                    except Exception:
+                        part_text = ""
+
+                    candidate_info["parts"].append({
+                        "text": part_text[:1500],
+                        "part_repr": repr(part)[:800],
+                        "part_safe": make_json_safe(part),
+                    })
+
+            except Exception as e:
+                candidate_info["parts"].append({
+                    "error": str(e),
+                })
+
+            info["candidates"].append(candidate_info)
+
+    except Exception as e:
+        info["candidates"] = [{
+            "error": str(e),
+        }]
+
+    return info
+
+
 def parse_llm_json(text):
     empty_result = {
         "main_idea": "",
@@ -1882,6 +2031,7 @@ def parse_llm_json(text):
         "corrections": [],
         "parse_ok": False,
         "raw_text": text or "",
+        "parse_error": "",
     }
 
     if not text:
@@ -1930,6 +2080,7 @@ def parse_llm_json(text):
         result = dict(empty_result)
         result["main_idea"] = cleaned[:220]
         result["raw_text"] = text or ""
+        result["parse_error"] = "json.loads failed after cleanup"
         return result
 
 
@@ -2192,7 +2343,9 @@ Return JSON in this exact format:
                 )
 
                 elapsed = time.time() - started_at
-                candidate_parsed = parse_llm_json(response.text)
+                response_debug = describe_gemini_response(response)
+                response_text_for_parse = response_debug.get("response_text", "") or ""
+                candidate_parsed = parse_llm_json(response_text_for_parse)
 
                 if is_usable_llm_result(candidate_parsed):
                     parsed = candidate_parsed
@@ -2203,6 +2356,7 @@ Return JSON in this exact format:
                         "seconds": round(elapsed, 2),
                         "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
                         "note": "usable correction",
+                        "response_debug": response_debug,
                     })
                     break
 
@@ -2211,11 +2365,13 @@ Return JSON in this exact format:
                     "status": "bad_output",
                     "seconds": round(elapsed, 2),
                     "parse_ok": bool(candidate_parsed.get("parse_ok", False)),
+                    "parse_error": candidate_parsed.get("parse_error", ""),
                     "note": (
                         "model returned no usable corrected_japanese_original "
                         "or corrected_english_caption"
                     ),
                     "raw_preview": (candidate_parsed.get("raw_text", "") or "")[:220],
+                    "response_debug": response_debug,
                 })
 
             except Exception as model_error:
@@ -2609,6 +2765,41 @@ st.caption(
     "Japanese → English live captions using Gemini 3.5 Live Translate, "
     "with Gemini 3.1 Flash-Lite as the optional helper/correction AI."
 )
+
+
+def summarize_last_helper_attempts(attempts):
+    attempts = attempts or []
+
+    if not attempts:
+        return "No helper model attempt yet."
+
+    lines = []
+
+    for item in attempts[-3:]:
+        model = item.get("model", "")
+        status = item.get("status", "")
+        seconds = item.get("seconds", "")
+        note = item.get("note", "")
+        parse_ok = item.get("parse_ok", "")
+        response_debug = item.get("response_debug", {}) or {}
+        response_text = response_debug.get("response_text", "")
+        candidates = response_debug.get("candidates", []) or []
+
+        finish_reason = ""
+        safety_summary = ""
+
+        if candidates:
+            finish_reason = candidates[0].get("finish_reason", "")
+            safety_summary = str(candidates[0].get("safety_ratings", ""))[:220]
+
+        lines.append(
+            f"{model}: {status}, {seconds}s, parse_ok={parse_ok}, "
+            f"finish_reason={finish_reason}, note={note}, "
+            f"response_text_preview={response_text[:160]!r}, "
+            f"safety={safety_summary}"
+        )
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -3416,7 +3607,12 @@ if st.session_state.soniox_error:
     st.error(st.session_state.soniox_error)
 
 if use_llm_hints and st.session_state.llm_error:
-    st.warning(f"LLM error: {st.session_state.llm_error}")
+    st.warning(
+        "LLM error: "
+        + st.session_state.llm_error
+        + "\n\nLast Gemma attempt summary:\n"
+        + summarize_last_helper_attempts(st.session_state.llm_last_attempts)
+    )
 
 if use_llm_hints and st.session_state.llm_budget_reached:
     if llm_budget_mode == "Emergency Rule-Based Only":
@@ -3699,7 +3895,10 @@ if show_debug:
         st.write("Helper gate status:")
         st.code(json.dumps(st.session_state.llm_gate_status, ensure_ascii=False, indent=2))
 
-        st.write("Helper model attempts:")
+        st.write("Helper model attempts summary:")
+        st.code(summarize_last_helper_attempts(st.session_state.llm_last_attempts))
+
+        st.write("Helper model attempts full response debug:")
         st.code(json.dumps(st.session_state.llm_last_attempts, ensure_ascii=False, indent=2))
 
         st.write("Helper last start / finish:")
