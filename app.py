@@ -41,8 +41,20 @@ GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
 GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
 
 # Helper / correction AI
-LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
-LLM_MODEL_BACKUP = "gemini-3.1-flash-lite"
+# Gemma 4 is available through the Gemini API and uses the same GEMINI_API_KEY.
+# Good for backup/helper correction when Gemini Flash-Lite quota is tight.
+GEMMA_HELPER_26B = "gemma-4-26b-a4b-it"
+GEMMA_HELPER_31B = "gemma-4-31b-it"
+GEMINI_HELPER_FLASH_LITE = "gemini-3.1-flash-lite"
+
+LLM_MODEL_DEFAULT = GEMMA_HELPER_26B
+LLM_MODEL_BACKUP = GEMINI_HELPER_FLASH_LITE
+
+LLM_MODEL_OPTIONS = [
+    GEMMA_HELPER_26B,
+    GEMMA_HELPER_31B,
+    GEMINI_HELPER_FLASH_LITE,
+]
 
 # Translation model for Gemini Live Translate mode
 GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
@@ -886,6 +898,97 @@ def light_original_cleanup(text):
     return cleaned.strip()
 
 
+def light_school_context_cleanup(original_text, translation_text):
+    """
+    Context-sensitive cleanup for ASO/BINUS Summer Course speech.
+
+    Gemini Live Translate can mishear サマーコース as unrelated English like
+    "mackerel school/course". The helper AI can repair it later, but this
+    fixes obvious school-context mistakes immediately in the raw caption.
+    """
+    original_text = (original_text or "").strip()
+    translation_text = (translation_text or "").strip()
+
+    combined_lower = f"{original_text}\n{translation_text}".lower()
+
+    summer_context_terms = [
+        "サマーコース",
+        "サマコース",
+        "summer course",
+        "binus",
+        "ビヌス",
+        "aso",
+        "麻生",
+        "学生",
+        "student",
+        "students",
+        "大学",
+        "university",
+        "日本に来",
+        "coming to japan",
+    ]
+
+    has_summer_context = any(
+        term.lower() in combined_lower
+        for term in summer_context_terms
+    )
+
+    if has_summer_context:
+        original_replacements = {
+            "サマコース": "サマーコース",
+            "サマー講座": "サマーコース",
+            "サバ塾": "サマーコース",
+            "鯖塾": "サマーコース",
+            "さば塾": "サマーコース",
+            "サバジュク": "サマーコース",
+            "さばじゅく": "サマーコース",
+            "サバ学校": "サマーコース",
+            "鯖学校": "サマーコース",
+            "サバコース": "サマーコース",
+            "鯖コース": "サマーコース",
+        }
+
+        translation_replacements = {
+            "Mackerel School": "Summer Course",
+            "mackerel school": "Summer Course",
+            "Mackerel school": "Summer Course",
+            "mackerel School": "Summer Course",
+            "Mackerel Course": "Summer Course",
+            "mackerel course": "Summer Course",
+            "Mackerel course": "Summer Course",
+            "mackerel class": "Summer Course",
+            "Mackerel class": "Summer Course",
+            "mackerel program": "Summer Course",
+            "Mackerel program": "Summer Course",
+            "saba school": "Summer Course",
+            "Saba school": "Summer Course",
+            "saba course": "Summer Course",
+            "Saba course": "Summer Course",
+
+            "News university": "BINUS University",
+            "news university": "BINUS University",
+            "Neus university": "BINUS University",
+            "neus university": "BINUS University",
+            "Venus university": "BINUS University",
+            "venus university": "BINUS University",
+
+            "special promenade": "special program",
+            "Special promenade": "Special program",
+            "the promenade": "the program",
+            "The promenade": "The program",
+            "promenade is": "program is",
+            "promenade will": "program will",
+        }
+
+        for wrong, correct in original_replacements.items():
+            original_text = original_text.replace(wrong, correct)
+
+        for wrong, correct in translation_replacements.items():
+            translation_text = translation_text.replace(wrong, correct)
+
+    return original_text.strip(), translation_text.strip()
+
+
 def light_domain_context_cleanup(original_text, translation_text, domain_mode):
     """
     Context-sensitive cleanup for terms that are dangerous to replace globally.
@@ -899,6 +1002,11 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
     original_text = (original_text or "").strip()
     translation_text = (translation_text or "").strip()
     domain = (domain_mode or "auto").lower()
+
+    original_text, translation_text = light_school_context_cleanup(
+        original_text,
+        translation_text,
+    )
 
     combined = f"{original_text}\n{translation_text}".lower()
 
@@ -1485,9 +1593,15 @@ def gemini_live_translate_worker(
                                     "message": "Gemini Live Japanese input transcription started.",
                                 })
 
+                            cleaned_input_text = light_original_cleanup(input_text)
+                            cleaned_input_text, live_translation = light_school_context_cleanup(
+                                cleaned_input_text,
+                                live_translation,
+                            )
+
                             live_original = append_stream_text(
                                 live_original,
-                                light_original_cleanup(input_text),
+                                cleaned_input_text,
                                 max_chars=MAX_ORIGINAL_CHARS * 2,
                             )
 
@@ -1515,10 +1629,21 @@ def gemini_live_translate_worker(
                                     "message": "Gemini Live English output translation started.",
                                 })
 
+                            cleaned_output_text = light_caption_cleanup(output_text)
+                            live_original, cleaned_output_text = light_school_context_cleanup(
+                                live_original,
+                                cleaned_output_text,
+                            )
+
                             live_translation = append_stream_text(
                                 live_translation,
-                                light_caption_cleanup(output_text),
+                                cleaned_output_text,
                                 max_chars=MAX_TRANSLATION_CHARS * 2,
+                            )
+
+                            live_original, live_translation = light_school_context_cleanup(
+                                live_original,
+                                live_translation,
                             )
 
                             # English appears when Gemini finishes/streams translation.
@@ -1729,6 +1854,9 @@ Possible topics include:
 
 Correction priorities:
 - Use the recent Japanese/English context to decide which domain is active.
+- If the speaker is discussing ASO/BINUS events, students coming to Japan, or university activities, preserve サマーコース = Summer Course.
+- In school/event context, if English says "mackerel school", "mackerel course", or "mackerel class", correct it to Summer Course.
+- In school/event context, if English says "News university" or "Neus university", correct it to BINUS University.
 - Do not force a domain term unless it fits the current sentence.
 - Preserve important acronyms and proper nouns.
 """.strip()
@@ -1800,6 +1928,7 @@ def llm_hint_worker(
     current_translation,
     key_terms,
     class_context="",
+    fallback_model_names=None,
 ):
     try:
         client = genai.Client(api_key=api_key)
@@ -1907,6 +2036,8 @@ Rules:
   Do NOT correct チーム when it really means team.
   Do NOT correct 様々 or さまざま when it really means various.
 - If the transcript says ネウス大学, ビーナス大学, or ビナス大学 in this school context, correct it to ビヌス大学.
+- In ASO/BINUS school-event context, if English says "mackerel school", "mackerel course", or "mackerel class", correct it to Summer Course.
+- In ASO/BINUS school-event context, if Japanese says サバ塾, 鯖塾, サバ学校, or サバコース, correct it to サマーコース.
 - Key terms may include important school/event names when relevant.
 - Only output important technical words or important proper nouns, not normal words.
 - Example correction:
@@ -1945,14 +2076,39 @@ Return JSON in this exact format:
 }}
 """.strip()
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=650,
-            ),
-        )
+        fallback_model_names = fallback_model_names or []
+
+        model_try_order = []
+        for candidate_model in [model_name] + list(fallback_model_names):
+            if candidate_model and candidate_model not in model_try_order:
+                model_try_order.append(candidate_model)
+
+        last_model_error = None
+        response = None
+        used_model_name = ""
+
+        for candidate_model in model_try_order:
+            try:
+                response = client.models.generate_content(
+                    model=candidate_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        max_output_tokens=650,
+                    ),
+                )
+                used_model_name = candidate_model
+                last_model_error = None
+                break
+
+            except Exception as model_error:
+                last_model_error = model_error
+                continue
+
+        if response is None:
+            raise RuntimeError(
+                f"All helper models failed. Last error: {last_model_error}"
+            )
 
         parsed = parse_llm_json(response.text)
 
@@ -1967,6 +2123,7 @@ Return JSON in this exact format:
             "source_text": context_text,
             "key_terms": parsed.get("key_terms", []),
             "corrections": parsed.get("corrections", []),
+            "used_model": used_model_name,
         })
 
     except Exception as e:
@@ -2394,18 +2551,32 @@ with st.sidebar:
     )
 
     llm_model_name = st.selectbox(
-        "LLM model",
-        [
-            LLM_MODEL_DEFAULT,
-            LLM_MODEL_BACKUP,
-        ],
+        "Helper AI model",
+        LLM_MODEL_OPTIONS,
         index=0,
+        help=(
+            "Gemma 4 models use the Gemini API too. "
+            "26B is usually the safer first Gemma option; 31B is larger but may hit limits/errors more often."
+        ),
+    )
+
+    helper_fallback_enabled = st.checkbox(
+        "Use helper fallback models",
+        value=True,
+        help=(
+            "If the selected helper model fails or hits quota, try the other helper models before giving up."
+        ),
     )
 
     llm_budget_mode = st.selectbox(
         "AI helper budget mode",
         list(LLM_BUDGET_MODES.keys()),
         index=1,
+    )
+
+    st.caption(
+        "Helper correction can use Gemma 4. "
+        "Translation itself still uses Gemini 3.5 Live Translate."
     )
 
     selected_budget = LLM_BUDGET_MODES[llm_budget_mode]
@@ -2504,6 +2675,7 @@ defaults = {
     "llm_corrections": [],
     "llm_last_call_time": 0.0,
     "llm_last_source_text": "",
+    "llm_used_model": "",
     "llm_context_chunks": [],
 }
 
@@ -2900,6 +3072,7 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_unclear_reason = item.get("unclear_reason", "")
         st.session_state.llm_key_terms = item.get("key_terms", [])
         st.session_state.llm_corrections = item.get("corrections", [])
+        st.session_state.llm_used_model = item.get("used_model", llm_model_name)
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
         st.session_state.llm_calls_this_session += 1
@@ -3037,6 +3210,15 @@ if use_llm_hints and gemini_api_key:
 
         selected_class_context = make_selected_domain_context(domain_mode)
 
+        helper_fallback_models = []
+
+        if helper_fallback_enabled:
+            helper_fallback_models = [
+                model
+                for model in LLM_MODEL_OPTIONS
+                if model != llm_model_name
+            ]
+
         st.session_state.llm_thread = threading.Thread(
             target=llm_hint_worker,
             args=(
@@ -3047,6 +3229,7 @@ if use_llm_hints and gemini_api_key:
                 st.session_state.live_translation,
                 detected_terms,
                 selected_class_context,
+                helper_fallback_models,
             ),
             daemon=True,
         )
@@ -3219,7 +3402,11 @@ elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
             "but speech was unclear. Correction is cautious."
         )
 elif source_is_corrected and st.session_state.last_helper_fix_time:
-    correction_status_text = f"AI correction applied at {st.session_state.last_helper_fix_time}"
+    used_model = st.session_state.llm_used_model or llm_model_name
+    correction_status_text = (
+        f"AI correction applied at {st.session_state.last_helper_fix_time} "
+        f"using {used_model}"
+    )
 elif st.session_state.live_translation:
     correction_status_text = "AI correction pending"
 elif st.session_state.live_original:
@@ -3390,6 +3577,7 @@ if show_debug:
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
+            f"used_model={st.session_state.llm_used_model}\n"
             f"is_unclear={st.session_state.llm_is_unclear}\n"
             f"unclear_reason={st.session_state.llm_unclear_reason}\n"
             f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
@@ -3405,6 +3593,9 @@ if show_debug:
 
         st.write("Selected helper class context:")
         st.code(make_selected_domain_context(domain_mode))
+
+        st.write("School context cleanup:")
+        st.code("Summer Course / BINUS immediate cleanup enabled")
 
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
