@@ -16,6 +16,7 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 from google import genai
 from google.genai import types
+from groq import Groq
 
 
 # ============================================================
@@ -41,8 +42,19 @@ GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
 GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
 
 # Helper / correction AI
-LLM_MODEL_DEFAULT = "gemini-3.1-flash-lite"
-LLM_MODEL_BACKUP = "gemini-3.1-flash-lite"
+# Main transcription/translation returns to Soniox.
+# Second AI correction/cleanup uses Groq because it is fast and has a usable free tier.
+GROQ_HELPER_FAST = "llama-3.1-8b-instant"
+GROQ_HELPER_QWEN = "qwen/qwen3-32b"
+GROQ_HELPER_70B = "llama-3.3-70b-versatile"
+
+LLM_MODEL_DEFAULT = GROQ_HELPER_FAST
+LLM_MODEL_BACKUP = GROQ_HELPER_QWEN
+LLM_MODEL_OPTIONS = [
+    GROQ_HELPER_FAST,
+    GROQ_HELPER_QWEN,
+    GROQ_HELPER_70B,
+]
 
 # Translation model for Gemini Live Translate mode
 GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
@@ -51,8 +63,8 @@ GEMINI_LIVE_WS_URL = (
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 )
 
-ENGINE_GEMINI_LIVE = "Gemini Mode - Gemini 3.5 Live Translate + Gemini 3.1 correction"
-ENGINE_SONIOX = ENGINE_GEMINI_LIVE  # compatibility only; Soniox is disabled in this version
+ENGINE_GEMINI_LIVE = "Gemini Mode - Gemini 3.5 Live Translate + helper correction"  # kept for compatibility
+ENGINE_SONIOX = "Soniox STT + Soniox translation + Groq correction"
 
 DEFAULT_LLM_HINT_INTERVAL = 45.0
 MIN_LLM_CONTEXT_CHARS = 180
@@ -63,28 +75,28 @@ MAX_LLM_CONTEXT_CHUNKS = 6
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
     "High Accuracy": {
-        "interval": 20.0,
-        "min_chars": 120,
-        "session_limit": 120,
-        "description": "More frequent helper AI checks. Use only for short important demos.",
+        "interval": 10.0,
+        "min_chars": 60,
+        "session_limit": 500,
+        "description": "Fast Groq helper checks. Use for short important demos.",
     },
     "Balanced": {
-        "interval": 45.0,
-        "min_chars": 180,
-        "session_limit": 80,
-        "description": "Recommended default for normal classes.",
+        "interval": 20.0,
+        "min_chars": 100,
+        "session_limit": 300,
+        "description": "Recommended default for Soniox + Groq live captions.",
     },
     "Saver": {
-        "interval": 90.0,
-        "min_chars": 260,
-        "session_limit": 40,
-        "description": "Safer for multiple classes per day.",
+        "interval": 45.0,
+        "min_chars": 180,
+        "session_limit": 120,
+        "description": "Safer for longer classes or low Groq quota.",
     },
     "Emergency Rule-Based Only": {
         "interval": 999999.0,
         "min_chars": 999999,
         "session_limit": 0,
-        "description": "No Gemini 3.1 helper calls. Built-in glossary cleanup only.",
+        "description": "No helper AI calls. Built-in glossary cleanup only.",
     },
 }
 
@@ -1735,23 +1747,27 @@ Correction priorities:
 
 
 # ============================================================
-# LLM Interpreter Support
+# LLM Interpreter Support - Groq second AI
 # ============================================================
 
 def parse_llm_json(text):
-    if not text:
-        return {
-            "main_idea": "",
-            "say_it_simply": "",
-            "corrected_japanese_original": "",
-            "corrected_english_caption": "",
-            "is_unclear": False,
-            "unclear_reason": "",
-            "key_terms": [],
-            "corrections": [],
-        }
+    empty = {
+        "main_idea": "",
+        "say_it_simply": "",
+        "corrected_japanese_original": "",
+        "corrected_english_caption": "",
+        "is_unclear": False,
+        "unclear_reason": "",
+        "key_terms": [],
+        "corrections": [],
+        "parse_ok": False,
+        "raw_text": text or "",
+    }
 
-    cleaned = text.strip()
+    if not text:
+        return empty
+
+    cleaned = str(text).strip()
 
     if cleaned.startswith("```json"):
         cleaned = cleaned.replace("```json", "", 1).strip()
@@ -1761,6 +1777,12 @@ def parse_llm_json(text):
 
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
+
+    start_idx = cleaned.find("{")
+    end_idx = cleaned.rfind("}")
+
+    if start_idx >= 0 and end_idx > start_idx:
+        cleaned = cleaned[start_idx:end_idx + 1].strip()
 
     try:
         data = json.loads(cleaned)
@@ -1777,19 +1799,12 @@ def parse_llm_json(text):
             "unclear_reason": str(data.get("unclear_reason", "")).strip(),
             "key_terms": data.get("key_terms", []),
             "corrections": data.get("corrections", []),
+            "parse_ok": True,
+            "raw_text": text or "",
         }
 
     except Exception:
-        return {
-            "main_idea": cleaned[:220],
-            "say_it_simply": "",
-            "corrected_japanese_original": "",
-            "corrected_english_caption": "",
-            "is_unclear": False,
-            "unclear_reason": "",
-            "key_terms": [],
-            "corrections": [],
-        }
+        return empty
 
 
 def llm_hint_worker(
@@ -1802,14 +1817,14 @@ def llm_hint_worker(
     class_context="",
 ):
     try:
-        client = genai.Client(api_key=api_key)
+        client = Groq(api_key=api_key)
 
         glossary_text = ""
 
         if key_terms:
             glossary_lines = []
 
-            for item in key_terms:
+            for item in key_terms[:8]:
                 jp = item.get("jp", "")
                 en = item.get("en", "")
                 notes = item.get("notes", "")
@@ -1825,136 +1840,111 @@ def llm_hint_worker(
             class_context = "No fixed class context was selected."
 
         prompt = f"""
-You are an interpreter assistant.
+Return ONLY one JSON object. No markdown. No code fences.
 
-Your job is NOT to translate everything again.
-Your job is to help the interpreter understand the lecture flow quickly
-AND repair obvious STT/translation mistakes in technical terms.
+You are the second AI after Soniox.
+Soniox already transcribed Japanese and translated it to English.
+Your job is to repair the caption, not invent a new lecture.
 
-Use the selected class/domain context as fixed background.
-Use the recent context below. The latest part is at the bottom.
+Tasks:
+1. Fix obvious Japanese STT mistakes in technical terms/proper nouns.
+2. Fix English grammar naturally.
+3. Keep speaker perspective. If speaker says I/we, keep I/we.
+4. Stay close to the current caption. Do not add new facts.
+5. If unclear, set is_unclear true and keep correction minimal.
+6. Always fill corrected_japanese_original and corrected_english_caption.
+7. If no correction is needed, copy the current Japanese/English text.
 
-Rules:
-- Output JSON only.
-- Treat the selected class/domain context as high-priority background for repairing STT mistakes.
-- The selected class/domain context does not override actual speech. Do not invent terms that are not supported by the current sentence.
-- If the selected domain is CAD/Product Design, prefer CATIA/CAD vocabulary when the current sentence mentions parts, sketches, constraints, modeling, or design.
-- If the selected domain is Automotive, prefer automotive/AEB/TTC/braking/control vocabulary when the current sentence mentions vehicles, braking, distance, motor, control, or engine.
-- Do not add new facts.
-- Do not summarize the speaker.
-- Keep the speaker's perspective. If the speaker says "I" or "we", keep "I" or "we".
-- Do not rewrite "I" as "the speaker" unless the original meaning is third-person.
-- Use previous context only to repair unclear wording and technical terms.
-- Repair obvious STT/translation mistakes in technical terms quickly.
-- Repair awkward English sentence structure so the caption sounds natural.
-- Return the corrected_japanese_original and corrected_english_caption even for short segments.
-- Keep the corrected English caption close to the current English translation.
-- Preserve technical terms from the glossary.
-- If the transcript is unclear, make the safest minimal correction.
-- If the sentence is broken, missing a key word, or does not make sense even with the selected class/domain context, set is_unclear to true and explain briefly in unclear_reason.
-- If you are not confident whether a term is CATIA, Sketcher, TTC, AEB, rotary engine, etc., set is_unclear to true instead of forcing the correction.
-- Do not hide uncertainty. It is safer to mark unclear than to invent a technical term.
-- Only include "[unclear]" inside corrected_english_caption when a critical missing phrase prevents a reliable caption. Otherwise use is_unclear and unclear_reason only.
-- If STT or translation uses a wrong technical term, add it to corrections.
-- If the caption says ABC but the context means TTC / Time To Collision, correct ABC to TTC.
-- Prefer corrected technical terms in key_terms.
-- Also fix obvious Japanese Original mistakes in corrected_japanese_original.
-- corrected_japanese_original must stay Japanese and close to the original.
-- Do not invent missing Japanese. Only repair obvious wrong technical words.
-- Example Japanese correction: 感性の影響 -> 慣性の影響.
-- Example Japanese correction: 慣性補償性制御 -> 慣性補償制御.
-- Example Japanese correction: 完成の駅 -> 慣性の影響.
-- For key_terms, use the Japanese source technical term when possible, for example "慣性補償 = inertia compensation".
-- Do not output English-to-English key terms like "inertia compensation = Control technique...".
-- Also preserve school/event names:
-  サマーコース = Summer Course
-  ビヌス = BINUS
-  ビヌスASO = BINUS ASO
-  ビヌス大学 = BINUS University
-  ARE = Automotive and Robotics Engineering
-  PDE = Product Design Engineering
-  BE = Business Engineering
-  CATIA = CATIA
-  CAD = Computer-Aided Design
-  ロータリーエンジン = rotary engine
-- CATIA / CAD correction rules:
-  Preserve CATIA and CAD exactly as acronyms.
-  If the CAD/Product Design topic is clearly about parts, sketches, constraints, Pad, or modeling,
-  correct 勝ち方 / 書き方 / キャリア / "way to win" to CATIA.
-  Do NOT correct 勝ち方 when the topic is truly about winning or competition.
-  スケッチャー = Sketcher
-  寸法拘束 = dimensional constraint
-  幾何拘束 = geometric constraint
-  完全拘束 = fully constrained
-  自由度 = degrees of freedom
-  Pad = Pad / extrusion
-  フィレット = fillet
-  Chamfer / 面取り = chamfer / chamfering
-  設計意図 = design intent
-  加工性 = manufacturability
-- Rotary engine correction rules:
-  ロータリーエンジン = rotary engine
-  レシプロエンジン = reciprocating engine
-  ローター = rotor
-  アペックスシール = apex seal
-- Major-name correction rules:
-  If the topic is BINUS ASO majors or students, correct AROI / ARO to ARE when it means Automotive and Robotics Engineering.
-  If the topic is BINUS ASO majors or students, correct PDA / ADC / PD to PDE when it means Product Design Engineering.
-  If the topic is BINUS ASO majors or students, correct BA / B to BE only when it clearly means Business Engineering.
-  Do not change normal words to ARE/PDE/BE unless the context is clearly about majors/programs.
-- Context-only Summer Course rule:
-  If the topic is clearly the ASO/BINUS Summer Course program, and the transcript says 様様, 様々, さまざま, or チーム where "course/program" makes more sense, correct it to サマーコース.
-  Do NOT correct チーム when it really means team.
-  Do NOT correct 様々 or さまざま when it really means various.
-- If the transcript says ネウス大学, ビーナス大学, or ビナス大学 in this school context, correct it to ビヌス大学.
-- Key terms may include important school/event names when relevant.
-- Only output important technical words or important proper nouns, not normal words.
-- Example correction:
-  {{"wrong": "ABC", "correct": "TTC", "reason": "TTC means Time To Collision in AEB context"}}
+Important hints:
+- サマーコース = Summer Course.
+- ビヌス大学 = BINUS University.
+- In school-event context: sauna/saunas, mackerel course, virtual cram school can mean Summer Course.
+- News university, New Tiger students, new style students can mean BINUS University students.
+- CATIA = CATIA. In CAD context, 勝ち方 / way to win can mean CATIA.
+- TTC = Time To Collision. In AEB/braking context, ABC can mean TTC.
+- 慣性補償 = inertia compensation. Sensory/completion compensation can mean inertia compensation.
+- ロータリーエンジン = rotary engine.
 
 Selected class/domain context:
 {class_context}
 
-Recent lecture context:
+Recent caption context:
 {context_text}
 
-Current English translation:
+Current English caption:
 {current_translation}
 
-Technical glossary terms detected:
+Detected glossary terms:
 {glossary_text}
 
-Return JSON in this exact format:
+Required JSON:
 {{
-  "main_idea": "one short sentence explaining the current main point",
-  "say_it_simply": "one natural sentence the interpreter can say",
-  "corrected_japanese_original": "corrected Japanese transcript, only fixing obvious technical recognition errors, otherwise copy the Japanese original",
-  "corrected_english_caption": "corrected natural English version of the current English translation, keeping speaker perspective and not summarizing",
+  "main_idea": "short current main point, or empty string",
+  "say_it_simply": "one natural sentence the interpreter can say, or empty string",
+  "corrected_japanese_original": "corrected Japanese transcript, or copy Japanese if no correction",
+  "corrected_english_caption": "corrected natural English caption, or copy English if no correction",
   "is_unclear": false,
-  "unclear_reason": "short reason when the speech/transcript is unclear, otherwise empty string",
+  "unclear_reason": "",
   "key_terms": [
-    {{"term": "Japanese source technical term or important acronym", "meaning": "short English meaning"}}
+    {{"term": "Japanese term or acronym", "meaning": "English meaning"}}
   ],
   "corrections": [
-    {{
-      "wrong": "wrong recognized word or phrase",
-      "correct": "correct word or phrase",
-      "reason": "short reason"
-    }}
+    {{"wrong": "wrong word", "correct": "correct word", "reason": "short reason"}}
   ]
 }}
 """.strip()
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=650,
-            ),
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a strict JSON caption correction assistant. Return only valid JSON.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ]
 
-        parsed = parse_llm_json(response.text)
+        text = ""
+        last_error = ""
+
+        # JSON mode first, plain mode second because not every Groq model supports JSON mode equally.
+        for response_format in [{"type": "json_object"}, None]:
+            try:
+                kwargs = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": 0.0,
+                    "max_tokens": 900,
+                }
+
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+
+                completion = client.chat.completions.create(**kwargs)
+                text = completion.choices[0].message.content or ""
+
+                if text.strip():
+                    break
+
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        if not text.strip():
+            raise RuntimeError(last_error or "Groq returned empty text")
+
+        parsed = parse_llm_json(text)
+
+        # If Groq gave non-JSON, do not destroy captions. Return minimal safe copy.
+        if not parsed.get("parse_ok"):
+            parsed["corrected_english_caption"] = current_translation or ""
+            parsed["corrected_japanese_original"] = ""
+            parsed["is_unclear"] = True
+            parsed["unclear_reason"] = "Groq helper returned non-JSON output. Raw caption kept."
+
+        if not parsed.get("corrected_english_caption"):
+            parsed["corrected_english_caption"] = current_translation or ""
 
         result_queue.put({
             "type": "llm_hint",
@@ -1967,6 +1957,8 @@ Return JSON in this exact format:
             "source_text": context_text,
             "key_terms": parsed.get("key_terms", []),
             "corrections": parsed.get("corrections", []),
+            "used_model": model_name,
+            "raw_response_preview": text[:500],
         })
 
     except Exception as e:
@@ -2126,6 +2118,7 @@ def soniox_live_worker(
         }
 
         ws = websocket.create_connection(SONIOX_WS_URL, timeout=10)
+        ws.settimeout(0.5)
         ws.send(json.dumps(config))
 
         result_queue.put({
@@ -2137,6 +2130,7 @@ def soniox_live_worker(
         final_translation = ""
         last_token_time = time.time()
         current_reset_seconds = float(caption_reset_seconds)
+        reset_sent = False
 
         def send_audio():
             while not stop_event.is_set():
@@ -2175,6 +2169,7 @@ def soniox_live_worker(
                         final_original = ""
                         final_translation = ""
                         last_token_time = time.time()
+                        reset_sent = False
                         result_queue.put({"type": "cleared"})
 
                     elif isinstance(command, dict) and command.get("type") == "set_base_caption":
@@ -2184,6 +2179,7 @@ def soniox_live_worker(
                         final_original = command.get("original", "") or final_original
                         final_translation = command.get("translation", "") or final_translation
                         last_token_time = time.time()
+                        reset_sent = False
                         result_queue.put({
                             "type": "debug",
                             "message": "Soniox worker base updated after AI correction.",
@@ -2206,6 +2202,13 @@ def soniox_live_worker(
                 msg = ws.recv()
 
             except websocket.WebSocketTimeoutException:
+                if (
+                    (final_original or final_translation)
+                    and not reset_sent
+                    and time.time() - last_token_time > current_reset_seconds
+                ):
+                    result_queue.put({"type": "page_reset"})
+                    reset_sent = True
                 continue
 
             except Exception as e:
@@ -2249,6 +2252,7 @@ def soniox_live_worker(
                     final_translation = ""
                     result_queue.put({"type": "page_reset"})
 
+                reset_sent = False
                 last_token_time = now
 
             non_final_original = ""
@@ -2325,8 +2329,8 @@ st.set_page_config(
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English live captions using Gemini 3.5 Live Translate, "
-    "with Gemini 3.1 Flash-Lite as the optional helper/correction AI."
+    "Japanese → English live captions using Soniox STT/translation, "
+    "with Groq as the optional second AI for correction."
 )
 
 
@@ -2337,9 +2341,9 @@ st.caption(
 with st.sidebar:
     st.header("Settings")
 
-    translation_engine = ENGINE_GEMINI_LIVE
-    st.info("Translation engine: Gemini 3.5 Live Translate")
-    st.caption("Language filter: Japanese only")
+    translation_engine = ENGINE_SONIOX
+    st.info("Translation engine: Soniox STT + translation")
+    st.caption("Second AI helper: Groq correction")
 
     domain_mode = st.selectbox(
         "Technical domain",
@@ -2359,7 +2363,7 @@ with st.sidebar:
         "English caption font size",
         min_value=16,
         max_value=38,
-        value=22,
+        value=18,
         step=2,
     )
 
@@ -2367,7 +2371,7 @@ with st.sidebar:
         "Japanese original font size",
         min_value=14,
         max_value=34,
-        value=19,
+        value=15,
         step=1,
     )
 
@@ -2394,12 +2398,10 @@ with st.sidebar:
     )
 
     llm_model_name = st.selectbox(
-        "LLM model",
-        [
-            LLM_MODEL_DEFAULT,
-            LLM_MODEL_BACKUP,
-        ],
+        "Groq helper model",
+        LLM_MODEL_OPTIONS,
         index=0,
+        help="Use llama-3.1-8b-instant first. It is the fastest/free-friendly helper model.",
     )
 
     llm_budget_mode = st.selectbox(
@@ -2522,7 +2524,7 @@ if st.session_state.current_engine and st.session_state.current_engine != transl
     st.rerun()
 
 if not st.session_state.current_engine:
-    st.session_state.current_engine = ENGINE_GEMINI_LIVE
+    st.session_state.current_engine = ENGINE_SONIOX
 
 
 if float(reset_seconds) != float(st.session_state.last_reset_seconds):
@@ -2539,20 +2541,20 @@ if float(reset_seconds) != float(st.session_state.last_reset_seconds):
 # API keys
 # ============================================================
 
-api_key = None  # Soniox disabled in pure Gemini version.
-gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
+api_key = safe_get_secret_or_env("SONIOX_API_KEY")
+groq_api_key = safe_get_secret_or_env("GROQ_API_KEY")
 
-if not gemini_api_key:
+if not api_key:
     st.error(
-        "GEMINI_API_KEY is not set.\n\n"
-        "Gemini Mode needs Gemini 3.5 Live Translate. For Streamlit Cloud, add this in Secrets:\n\n"
-        'GEMINI_API_KEY = "your_gemini_api_key_here"'
+        "SONIOX_API_KEY is not set.\n\n"
+        "Soniox mode needs Soniox for Japanese STT/translation. For Streamlit Cloud, add this in Secrets:\n\n"
+        'SONIOX_API_KEY = "your_soniox_api_key_here"'
     )
     st.stop()
 
-if use_llm_hints and not gemini_api_key:
+if use_llm_hints and not groq_api_key:
     st.warning(
-        "GEMINI_API_KEY is not set. Helper AI is disabled until you add it."
+        "GROQ_API_KEY is not set. Second AI correction is disabled until you add it."
     )
 
 
@@ -2623,11 +2625,18 @@ if toggle_clicked:
         st.session_state.pending_start_translation = False
         st.session_state.soniox_running = False
         st.session_state.soniox_stop_event.set()
+        st.session_state.soniox_result_queue = queue.Queue()
+        st.session_state.soniox_control_queue = queue.Queue()
+        st.session_state.soniox_thread = None
         st.session_state.mic_instance_id += 1
 
         st.rerun()
 
     else:
+        st.session_state.soniox_stop_event = threading.Event()
+        st.session_state.soniox_result_queue = queue.Queue()
+        st.session_state.soniox_control_queue = queue.Queue()
+        st.session_state.soniox_thread = None
         st.session_state.app_active = True
         st.session_state.pending_start_translation = True
         st.session_state.soniox_error = ""
@@ -2721,14 +2730,15 @@ if (
     st.session_state.soniox_running = True
     st.session_state.pending_start_translation = False
 
-    worker_target = gemini_live_translate_worker
+    worker_target = soniox_live_worker
     worker_args = (
         processor.audio_queue,
         st.session_state.soniox_result_queue,
         st.session_state.soniox_stop_event,
         st.session_state.soniox_control_queue,
-        gemini_api_key,
-        "en",
+        api_key,
+        terms_file,
+        domain_mode,
         float(reset_seconds),
     )
 
@@ -2795,7 +2805,7 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.caption_stage = "raw_english"
             st.session_state.last_raw_translation_time = time.strftime("%H:%M:%S")
 
-            if use_llm_hints and gemini_api_key:
+            if use_llm_hints and groq_api_key:
                 if not st.session_state.llm_running and not st.session_state.llm_corrected_source_text:
                     st.session_state.correction_status = "pending"
             else:
@@ -2832,7 +2842,7 @@ while not st.session_state.soniox_result_queue.empty():
         # Keep it on screen so the reader has time to read it.
         # The next incoming token will clear/replace the old caption.
         st.session_state.pending_visual_reset = True
-        if st.session_state.live_translation and use_llm_hints and gemini_api_key:
+        if st.session_state.live_translation and use_llm_hints and groq_api_key:
             st.session_state.correction_status = "pending"
 
     elif item_type == "cleared":
@@ -2982,7 +2992,7 @@ while not st.session_state.llm_result_queue.empty():
 # Start LLM hint worker
 # ============================================================
 
-if use_llm_hints and gemini_api_key:
+if use_llm_hints and groq_api_key:
     source_text = build_llm_context(
         st.session_state.llm_context_chunks,
         st.session_state.live_original,
@@ -3041,7 +3051,7 @@ if use_llm_hints and gemini_api_key:
             target=llm_hint_worker,
             args=(
                 st.session_state.llm_result_queue,
-                gemini_api_key,
+                groq_api_key,
                 llm_model_name,
                 source_text,
                 st.session_state.live_translation,
@@ -3072,9 +3082,9 @@ if use_llm_hints:
 # ============================================================
 
 if st.session_state.soniox_running:
-    st.success("Gemini 3.5 Live Translate running.")
+    st.success("Soniox STT/translation running.")
 elif st.session_state.app_active:
-    st.info("Starting Gemini Live Translate...")
+    st.info("Starting Soniox STT/translation...")
 else:
     st.info("Live translation stopped.")
 
@@ -3200,8 +3210,8 @@ else:
 
 if not use_llm_hints:
     correction_status_text = "AI correction off"
-elif not gemini_api_key:
-    correction_status_text = "AI correction unavailable: GEMINI_API_KEY missing"
+elif not groq_api_key:
+    correction_status_text = "AI correction unavailable: GROQ_API_KEY missing"
 elif st.session_state.llm_error:
     correction_status_text = f"AI correction error: {st.session_state.llm_error}"
 elif st.session_state.llm_running:
@@ -3523,10 +3533,10 @@ caption_html = f"""
 
     .jp-caption-box {{
         font-size: {jp_font_size}px;
-        line-height: 1.35;
-        padding: 9px;
-        min-height: 70px;
-        max-height: 150px;
+        line-height: 1.25;
+        padding: 7px;
+        min-height: 52px;
+        max-height: 125px;
     }}
 
 
@@ -3548,10 +3558,48 @@ caption_html = f"""
 
     .en-caption-box {{
         font-size: {font_size}px;
-        line-height: 1.25;
-        padding: 12px;
-        min-height: 115px;
-        max-height: 235px;
+        line-height: 1.18;
+        padding: 9px;
+        min-height: 85px;
+        max-height: 190px;
+    }}
+}}
+
+@media (max-width: 768px) {{
+    .caption-wrapper {{
+        gap: 8px;
+    }}
+    .caption-label {{
+        font-size: 11px;
+        margin-bottom: 3px;
+    }}
+    .jp-caption-box {{
+        font-size: min({jp_font_size}px, 15px);
+        line-height: 1.22;
+        padding: 7px;
+        min-height: 48px;
+        max-height: 115px;
+    }}
+    .correction-status-box {{
+        font-size: 12px;
+        line-height: 1.2;
+        padding: 7px;
+        min-height: 32px;
+        max-height: 55px;
+    }}
+    .llm-terms-box {{
+        font-size: 12px;
+        line-height: 1.2;
+        padding: 7px;
+        min-height: 38px;
+        max-height: 70px;
+    }}
+    .en-caption-box {{
+        font-size: min({font_size}px, 18px);
+        line-height: 1.18;
+        padding: 8px;
+        min-height: 80px;
+        max-height: 180px;
     }}
 }}
 </style>
