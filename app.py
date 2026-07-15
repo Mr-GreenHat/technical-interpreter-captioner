@@ -1649,6 +1649,202 @@ def source_text_matches_for_correction(current_source, corrected_source):
     return overlap_a >= 0.90 and overlap_b >= 0.80
 
 
+def extract_latest_pair_from_llm_source(source_text):
+    """
+    Source text is built like:
+        Japanese: ...
+        English: ...
+
+        ---
+
+        Japanese: latest...
+        English: latest...
+
+    Return the latest Japanese/English pair the AI actually saw.
+    """
+    source_text = (source_text or "").strip()
+
+    if not source_text:
+        return "", ""
+
+    chunks = [
+        chunk.strip()
+        for chunk in source_text.split("\n\n---\n\n")
+        if chunk.strip()
+    ]
+
+    if not chunks:
+        chunks = [source_text]
+
+    latest = chunks[-1]
+    latest_japanese = ""
+    latest_english = ""
+
+    lines = latest.splitlines()
+    current_label = None
+    jp_lines = []
+    en_lines = []
+
+    for line in lines:
+        if line.startswith("Japanese:"):
+            current_label = "jp"
+            value = line.replace("Japanese:", "", 1).strip()
+            if value:
+                jp_lines.append(value)
+            continue
+
+        if line.startswith("English:"):
+            current_label = "en"
+            value = line.replace("English:", "", 1).strip()
+            if value:
+                en_lines.append(value)
+            continue
+
+        if current_label == "jp":
+            jp_lines.append(line.strip())
+        elif current_label == "en":
+            en_lines.append(line.strip())
+
+    latest_japanese = " ".join([x for x in jp_lines if x]).strip()
+    latest_english = " ".join([x for x in en_lines if x]).strip()
+
+    return latest_japanese, latest_english
+
+
+def text_char_overlap_ratio(shorter_text, longer_text):
+    shorter_text = (shorter_text or "").strip()
+    longer_text = (longer_text or "").strip()
+
+    if not shorter_text or not longer_text:
+        return 0.0
+
+    shorter_set = set(shorter_text)
+    longer_set = set(longer_text)
+
+    if not shorter_set:
+        return 0.0
+
+    return len(shorter_set & longer_set) / max(1, len(shorter_set))
+
+
+def ai_text_is_full_enough(live_text, ai_text, min_ratio=0.72):
+    """
+    True when the AI text looks like a full corrected caption, not just
+    a short correction phrase.
+    """
+    live_text = (live_text or "").strip()
+    ai_text = (ai_text or "").strip()
+
+    if not ai_text:
+        return False
+
+    if not live_text:
+        return True
+
+    live_len = len(live_text)
+    ai_len = len(ai_text)
+
+    if ai_len >= live_len * min_ratio:
+        return True
+
+    if live_text in ai_text:
+        return True
+
+    if ai_len >= 40 and text_char_overlap_ratio(ai_text, live_text) >= 0.85:
+        return True
+
+    return False
+
+
+def merge_ai_text_preserve_current(
+    current_text,
+    ai_source_text,
+    ai_corrected_text,
+    corrections,
+    text_kind,
+    domain_mode,
+):
+    """
+    Patch the current live caption without deleting newer text.
+
+    Priority:
+    1. Apply correction pairs to the current caption.
+    2. If the AI source text is inside the current caption, replace ONLY
+       that old source segment with the corrected segment.
+    3. If AI corrected text looks like a full caption, allow full replace.
+    4. Otherwise keep the patched current caption.
+    """
+    current_text = (current_text or "").strip()
+    ai_source_text = (ai_source_text or "").strip()
+    ai_corrected_text = (ai_corrected_text or "").strip()
+
+    patched_current = apply_llm_corrections(current_text, corrections)
+
+    if ai_source_text and ai_corrected_text and ai_source_text in patched_current:
+        merged = patched_current.replace(ai_source_text, ai_corrected_text, 1)
+
+    elif ai_corrected_text and ai_text_is_full_enough(patched_current, ai_corrected_text):
+        merged = ai_corrected_text
+
+    else:
+        merged = patched_current
+
+    if text_kind == "original":
+        merged = light_original_cleanup(merged)
+        merged, _ = light_domain_context_cleanup(
+            merged,
+            "",
+            domain_mode,
+        )
+        return merged.strip()
+
+    if text_kind == "translation":
+        merged = light_caption_cleanup(merged)
+        _, merged = light_domain_context_cleanup(
+            "",
+            merged,
+            domain_mode,
+        )
+        return merged.strip()
+
+    return merged.strip()
+
+
+def merge_ai_result_into_live_caption(
+    live_original,
+    live_translation,
+    ai_source_text,
+    ai_corrected_original,
+    ai_corrected_translation,
+    corrections,
+    domain_mode,
+):
+    """
+    Merge the second AI result into the current live caption safely.
+    """
+    source_original, source_translation = extract_latest_pair_from_llm_source(ai_source_text)
+
+    merged_original = merge_ai_text_preserve_current(
+        current_text=live_original,
+        ai_source_text=source_original,
+        ai_corrected_text=ai_corrected_original,
+        corrections=corrections,
+        text_kind="original",
+        domain_mode=domain_mode,
+    )
+
+    merged_translation = merge_ai_text_preserve_current(
+        current_text=live_translation,
+        ai_source_text=source_translation,
+        ai_corrected_text=ai_corrected_translation,
+        corrections=corrections,
+        text_kind="translation",
+        domain_mode=domain_mode,
+    )
+
+    return merged_original, merged_translation
+
+
 def build_llm_context(context_chunks, current_original, current_translation):
     chunks = list(context_chunks or [])
 
@@ -2930,35 +3126,17 @@ while not st.session_state.llm_result_queue.empty():
             )
 
             # Important:
-            # Keep the AI-corrected text visible AND continue from it.
-            # The worker's internal base is replaced with the corrected text,
-            # so the next live tokens append to the fixed caption instead of
-            # returning old text or starting from empty.
-            corrected_base_original = (
-                st.session_state.llm_corrected_japanese_original
-                or st.session_state.live_original
-            )
-            corrected_base_translation = (
-                st.session_state.llm_corrected_english_caption
-                or st.session_state.live_translation
-            )
-
-            corrected_base_original = light_original_cleanup(
-                apply_llm_corrections(
-                    corrected_base_original,
-                    st.session_state.llm_corrections,
-                )
-            )
-            corrected_base_translation = light_caption_cleanup(
-                apply_llm_corrections(
-                    corrected_base_translation,
-                    st.session_state.llm_corrections,
-                )
-            )
-            corrected_base_original, corrected_base_translation = light_domain_context_cleanup(
-                corrected_base_original,
-                corrected_base_translation,
-                domain_mode,
+            # Do NOT replace the whole live caption with the second-AI answer.
+            # The second AI may have corrected an older segment while new Soniox
+            # text has already arrived. Patch only the source segment the AI saw.
+            corrected_base_original, corrected_base_translation = merge_ai_result_into_live_caption(
+                live_original=st.session_state.live_original,
+                live_translation=st.session_state.live_translation,
+                ai_source_text=st.session_state.llm_corrected_source_text,
+                ai_corrected_original=st.session_state.llm_corrected_japanese_original,
+                ai_corrected_translation=st.session_state.llm_corrected_english_caption,
+                corrections=st.session_state.llm_corrections,
+                domain_mode=domain_mode,
             )
 
             st.session_state.live_original = corrected_base_original
@@ -3143,17 +3321,15 @@ if (
         st.session_state.llm_corrected_source_text,
     )
 ):
-    if st.session_state.llm_corrected_japanese_original:
-        corrected_original = apply_llm_corrections(
-            st.session_state.llm_corrected_japanese_original,
-            st.session_state.llm_corrections,
-        )
-
-    if st.session_state.llm_corrected_english_caption:
-        corrected_translation = apply_llm_corrections(
-            st.session_state.llm_corrected_english_caption,
-            st.session_state.llm_corrections,
-        )
+    corrected_original, corrected_translation = merge_ai_result_into_live_caption(
+        live_original=st.session_state.live_original,
+        live_translation=caption_text,
+        ai_source_text=st.session_state.llm_corrected_source_text,
+        ai_corrected_original=st.session_state.llm_corrected_japanese_original,
+        ai_corrected_translation=st.session_state.llm_corrected_english_caption,
+        corrections=st.session_state.llm_corrections,
+        domain_mode=domain_mode,
+    )
 
 corrected_original = light_original_cleanup(corrected_original)
 corrected_translation = light_caption_cleanup(corrected_translation)
@@ -3400,6 +3576,7 @@ if show_debug:
             f"say_it_simply={st.session_state.llm_say_it_simply}\n"
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
+            f"ai_patch_source_latest={extract_latest_pair_from_llm_source(st.session_state.llm_corrected_source_text)}\n"
             f"is_unclear={st.session_state.llm_is_unclear}\n"
             f"unclear_reason={st.session_state.llm_unclear_reason}\n"
             f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
