@@ -84,7 +84,7 @@ LLM_BUDGET_MODES = {
         "description": "Fast Groq helper checks. Use for short important demos.",
     },
     "Balanced": {
-        "interval": 15.0,
+        "interval": 20.0,
         "min_chars": 60,
         "session_limit": 300,
         "description": "Recommended default for Soniox + Groq key-term support.",
@@ -3126,7 +3126,7 @@ with st.sidebar:
 
     st.caption(selected_budget["description"])
     st.caption(
-        f"Helper interval: {int(llm_hint_interval)} sec | "
+        f"Helper interval after finish: {int(llm_hint_interval)} sec | "
         f"Min new context: {llm_min_context_chars} chars | "
         f"Session limit: {llm_session_limit} calls"
     )
@@ -3214,6 +3214,8 @@ defaults = {
     "llm_key_terms": [],
     "llm_corrections": [],
     "llm_last_call_time": 0.0,
+    "llm_cooldown_until": 0.0,
+    "llm_last_finish_time": "",
     "llm_last_source_text": "",
     "llm_context_chunks": [],
 
@@ -3393,6 +3395,8 @@ if clear_clicked:
     st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
     st.session_state.llm_last_source_text = ""
+    st.session_state.llm_cooldown_until = 0.0
+    st.session_state.llm_last_finish_time = ""
     st.session_state.ask_ai_question = ""
     st.session_state.ask_ai_answer = ""
     st.session_state.ask_ai_terms = []
@@ -3551,6 +3555,8 @@ if (
     st.session_state.llm_error = ""
     st.session_state.llm_last_source_text = ""
     st.session_state.llm_last_call_time = 0.0
+    st.session_state.llm_cooldown_until = 0.0
+    st.session_state.llm_last_finish_time = ""
     st.session_state.ask_ai_answer = ""
     st.session_state.ask_ai_terms = []
     st.session_state.ask_ai_error = ""
@@ -3757,6 +3763,10 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
+        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
+        # Cooldown starts AFTER the helper finishes, not when it starts.
+        # This prevents rapid back-to-back Groq calls that can trigger TPM/rate errors.
+        st.session_state.llm_cooldown_until = time.time() + float(llm_hint_interval)
         st.session_state.llm_calls_this_session += 1
 
         has_ai_update = (
@@ -3811,6 +3821,10 @@ while not st.session_state.llm_result_queue.empty():
     elif item_type == "llm_error":
         st.session_state.llm_error = item.get("message", "")
         st.session_state.llm_running = False
+        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
+        # Error cooldown is longer because Groq TPM/rate errors often happen
+        # when the next request starts too soon.
+        st.session_state.llm_cooldown_until = time.time() + max(float(llm_hint_interval), 30.0)
         st.session_state.llm_calls_this_session += 1
         st.session_state.correction_status = "error"
 
@@ -3854,10 +3868,9 @@ if use_llm_hints and groq_api_key:
 
     enough_text = len(source_text) >= int(llm_min_context_chars)
     changed_text = source_text != st.session_state.llm_last_source_text
-    interval_ready = (
-        time.time() - float(st.session_state.llm_last_call_time)
-        >= float(llm_hint_interval)
-    )
+    now_for_llm = time.time()
+    cooldown_until = float(st.session_state.get("llm_cooldown_until", 0.0) or 0.0)
+    interval_ready = now_for_llm >= cooldown_until
 
     translated_text_ready = bool(st.session_state.live_translation.strip())
     has_new_live_tokens_for_llm = (
@@ -4314,7 +4327,10 @@ if show_debug:
             f"unclear_reason={st.session_state.llm_unclear_reason}\n"
             f"source_match_for_correction={source_text_matches_for_correction(current_source_for_display, st.session_state.llm_corrected_source_text)}\n"
             f"corrections={st.session_state.llm_corrections}\n"
-            f"error={st.session_state.llm_error}"
+            f"error={st.session_state.llm_error}\n"
+            f"cooldown_until={st.session_state.get('llm_cooldown_until', 0.0)}\n"
+            f"cooldown_remaining={max(0.0, st.session_state.get('llm_cooldown_until', 0.0) - time.time()):.1f}s\n"
+            f"last_finish={st.session_state.get('llm_last_finish_time', '')}"
         )
 
         st.write("Gemini audio chunk bytes:")
@@ -4349,6 +4365,26 @@ if show_debug:
 # ============================================================
 # Caption display
 # ============================================================
+
+jp_section_html = ""
+
+if show_captions_in_ui:
+    jp_section_html = f"""
+    <div>
+        <div class="caption-label">Japanese Original <span class="caption-status">{safe_jp_status}</span></div>
+        <div class="jp-caption-box">{safe_original}</div>
+    </div>
+    """
+
+en_section_html = ""
+
+if show_captions_in_ui:
+    en_section_html = f"""
+    <div>
+        <div class="caption-label">English Caption <span class="caption-status">{safe_en_status}</span></div>
+        <div class="en-caption-box">{safe_caption_text}</div>
+    </div>
+    """
 
 caption_html = f"""
 <style>
@@ -4548,24 +4584,13 @@ caption_html = f"""
 </style>
 
 <div class="caption-wrapper">
-    {f"""
-    <div>
-        <div class="caption-label">Japanese Original <span class="caption-status">{safe_jp_status}</span></div>
-        <div class="jp-caption-box">{safe_original}</div>
-    </div>
-    """ if show_captions_in_ui else ""}
+    {jp_section_html}
 
     {llm_html}
 
-    {f"""
-    <div>
-        <div class="caption-label">English Caption <span class="caption-status">{safe_en_status}</span></div>
-        <div class="en-caption-box">{safe_caption_text}</div>
-    </div>
-    """ if show_captions_in_ui else ""}
+    {en_section_html}
 </div>
 """
-
 st.html(caption_html)
 
 
