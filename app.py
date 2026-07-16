@@ -67,8 +67,11 @@ ENGINE_GEMINI_LIVE = "Gemini Mode - Gemini 3.5 Live Translate + helper correctio
 ENGINE_SONIOX = "Soniox STT + Soniox translation + Groq correction"
 
 DEFAULT_LLM_HINT_INTERVAL = 45.0
-MIN_LLM_CONTEXT_CHARS = 180
-MAX_LLM_CONTEXT_CHUNKS = 6
+MIN_LLM_CONTEXT_CHARS = 60
+MAX_LLM_CONTEXT_CHUNKS = 2
+MAX_GROQ_CONTEXT_CHARS = 1100
+MAX_GROQ_TRANSLATION_CHARS = 450
+MAX_GROQ_GLOSSARY_TERMS = 4
 
 # Helper AI safety net.
 # Gemini 3.5 Live Translate can keep running, but Gemini 3.1 Flash-Lite
@@ -81,10 +84,10 @@ LLM_BUDGET_MODES = {
         "description": "Fast Groq helper checks. Use for short important demos.",
     },
     "Balanced": {
-        "interval": 20.0,
-        "min_chars": 100,
+        "interval": 15.0,
+        "min_chars": 60,
         "session_limit": 300,
-        "description": "Recommended default for Soniox + Groq live captions.",
+        "description": "Recommended default for Soniox + Groq key-term support.",
     },
     "Saver": {
         "interval": 45.0,
@@ -2181,6 +2184,189 @@ def build_llm_context(context_chunks, current_original, current_translation):
     return "\n\n---\n\n".join(chunks).strip()
 
 
+def compact_text(text, max_chars):
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:].strip()
+
+
+def build_slim_llm_context(context_chunks, current_original, current_translation):
+    """
+    Small context for Groq free-tier TPM.
+    Keep only last finished chunk + current chunk.
+    """
+    chunks = list(context_chunks or [])[-1:]
+    current_chunk = make_context_chunk(current_original, current_translation)
+    if current_chunk:
+        chunks.append(current_chunk)
+    slim = "\n\n---\n\n".join([c for c in chunks if c]).strip()
+    return compact_text(slim, MAX_GROQ_CONTEXT_CHARS)
+
+
+def make_compact_domain_context(domain_mode, self_context=""):
+    domain = (domain_mode or "auto").lower()
+    self_context = compact_text(self_context, 350)
+
+    if domain == "automotive":
+        base = "Domain: automotive/AEB/braking/control. Important: TTC, AEB, ADAS, 慣性補償, braking force, rotary engine."
+    elif domain == "cad":
+        base = "Domain: CAD/CATIA. Important: CATIA, CAD, Sketcher, dimensional/geometric constraints, Pad, Fillet, Chamfer."
+    elif domain == "product design":
+        base = "Domain: product design/CAD. Important: design intent, manufacturability, CATIA, dimensions, constraints."
+    elif domain in ["school", "school/event", "event"]:
+        base = "Domain: school event. Important only if mentioned: Summer Course, BINUS, BINUS University, BINUS ASO, ARE, PDE, BE."
+    else:
+        base = "Domain: mixed Japanese technical classroom. Do not force unrelated proper nouns."
+
+    if self_context:
+        return f"{base}\nUser context: {self_context}"
+
+    return base
+
+
+def shorten_error_for_ui(message, max_chars=180):
+    message = str(message or "").strip()
+    if len(message) <= max_chars:
+        return message
+    return message[:max_chars] + " ..."
+
+
+def format_key_term_line(term, meaning, show_meaning=True):
+    line = normalize_key_term_line(term, meaning)
+    if not line:
+        return ""
+    if not show_meaning and "=" in line:
+        return line.split("=", 1)[0].strip()
+    return line
+
+
+def parse_ask_ai_json(text):
+    base = {
+        "answer": "",
+        "key_terms": [],
+        "unclear": False,
+        "raw_text": text or "",
+    }
+    if not text:
+        return base
+
+    cleaned = str(text).strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned.replace("```json", "", 1).strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```", "", 1).strip()
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+
+    start_idx = cleaned.find("{")
+    end_idx = cleaned.rfind("}")
+    if start_idx >= 0 and end_idx > start_idx:
+        cleaned = cleaned[start_idx:end_idx + 1].strip()
+
+    try:
+        data = json.loads(cleaned)
+        return {
+            "answer": str(data.get("answer", "")).strip(),
+            "key_terms": data.get("key_terms", []),
+            "unclear": bool(data.get("unclear", False)),
+            "raw_text": text or "",
+        }
+    except Exception:
+        return base
+
+
+def ask_ai_worker(result_queue, api_key, model_name, question_text, context_text, domain_context):
+    """
+    Separate assistant for the interpreter/translator.
+    It answers the translator's question and does NOT overwrite live captions.
+    """
+    try:
+        client = Groq(api_key=api_key)
+        question_text = compact_text(question_text, 350)
+        context_text = compact_text(context_text, 900)
+        domain_context = compact_text(domain_context, 450)
+
+        if not question_text:
+            raise RuntimeError("Ask AI question is empty.")
+
+        prompt = f"""
+Return ONLY JSON. No markdown.
+
+You are helping a live interpreter.
+The interpreter asks a short Japanese question or says a difficult term.
+Use the lecture context to answer briefly.
+
+Output max 3 key terms.
+Keep answer short.
+
+Context:
+{domain_context}
+
+Recent lecture:
+{context_text}
+
+Interpreter question / term:
+{question_text}
+
+JSON:
+{{
+  "answer": "short English answer for the interpreter",
+  "key_terms": [
+    {{"term": "Japanese term or acronym", "meaning": "English meaning"}}
+  ],
+  "unclear": false
+}}
+""".strip()
+
+        messages = [
+            {"role": "system", "content": "You are a concise interpreter support assistant. Return only JSON."},
+            {"role": "user", "content": prompt},
+        ]
+
+        text = ""
+        last_error = ""
+
+        for response_format in [{"type": "json_object"}, None]:
+            try:
+                kwargs = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": 0.0,
+                    "max_tokens": 350,
+                }
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+                completion = client.chat.completions.create(**kwargs)
+                text = completion.choices[0].message.content or ""
+                if text.strip():
+                    break
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        if not text.strip():
+            raise RuntimeError(last_error or "Groq Ask AI returned empty text.")
+
+        parsed = parse_ask_ai_json(text)
+        if not parsed.get("answer") and not parsed.get("key_terms"):
+            parsed["answer"] = "I could not get a clear answer. Try asking with one technical term."
+
+        result_queue.put({
+            "type": "ask_ai_answer",
+            "answer": parsed.get("answer", ""),
+            "key_terms": parsed.get("key_terms", []),
+            "unclear": bool(parsed.get("unclear", False)),
+            "question": question_text,
+            "raw_response_preview": text[:500],
+        })
+    except Exception as e:
+        result_queue.put({
+            "type": "ask_ai_error",
+            "message": shorten_error_for_ui(str(e)),
+        })
+
+
 # ============================================================
 # Selected domain context for Gemini helper
 # ============================================================
@@ -2346,74 +2532,61 @@ def llm_hint_worker(
     current_translation,
     key_terms,
     class_context="",
+    self_context="",
 ):
     try:
         client = Groq(api_key=api_key)
 
-        glossary_text = ""
+        context_text = compact_text(context_text, MAX_GROQ_CONTEXT_CHARS)
+        current_translation = compact_text(current_translation, MAX_GROQ_TRANSLATION_CHARS)
+        class_context = compact_text(class_context, 500)
+        self_context = compact_text(self_context, 350)
 
-        if key_terms:
-            glossary_lines = []
+        glossary_lines = []
+        for item in (key_terms or [])[:MAX_GROQ_GLOSSARY_TERMS]:
+            jp = item.get("jp", "")
+            en = item.get("en", "")
+            if jp and en:
+                glossary_lines.append(f"{jp} = {en}")
 
-            for item in key_terms[:8]:
-                jp = item.get("jp", "")
-                en = item.get("en", "")
-                notes = item.get("notes", "")
-
-                if notes:
-                    glossary_lines.append(f"- {jp} = {en} ({notes})")
-                else:
-                    glossary_lines.append(f"- {jp} = {en}")
-
-            glossary_text = "\n".join(glossary_lines)
-
-        if not class_context:
-            class_context = "No fixed class context was selected."
-
-        correction_hints = make_groq_correction_hints(
-            class_context,
-            context_text,
-            current_translation,
-        )
+        glossary_text = "\n".join(glossary_lines)
 
         prompt = f"""
-Return ONLY one JSON object. No markdown. No code fences.
+Return ONLY JSON. No markdown.
 
 You are the second AI after Soniox.
-Soniox already transcribed Japanese and translated it to English.
-Your job is to repair the caption, not invent a new lecture.
+Main purpose: help an interpreter by extracting difficult key terms.
+Also fix caption text only when the correction is obvious.
 
-Tasks:
-1. Fix obvious Japanese STT mistakes in technical terms/proper nouns.
-2. Fix English grammar naturally.
-3. Keep speaker perspective. If speaker says I/we, keep I/we.
-4. Stay close to the current caption. Do not add new facts.
-5. If unclear, set is_unclear true and keep correction minimal.
-6. Always fill corrected_japanese_original and corrected_english_caption.
-7. If no correction is needed, copy the current Japanese/English text.
-8. Do not output key_terms unless the term is actually supported by the current caption.
+Rules:
+- Output max 4 key_terms.
+- Do not output unrelated key terms.
+- Do not invent facts.
+- If no key term, key_terms = [].
+- Keep corrected captions close to Soniox text.
+- If no correction needed, copy the current text.
 
-Current correction hints:
-{correction_hints}
-
-Selected class/domain context:
+Context:
 {class_context}
 
-Recent caption context:
+Self context:
+{self_context}
+
+Recent caption:
 {context_text}
 
-Current English caption:
+Current English:
 {current_translation}
 
-Detected glossary terms:
+Matched glossary:
 {glossary_text}
 
-Required JSON:
+JSON:
 {{
-  "main_idea": "short current main point, or empty string",
-  "say_it_simply": "one natural sentence the interpreter can say, or empty string",
-  "corrected_japanese_original": "corrected Japanese transcript, or copy Japanese if no correction",
-  "corrected_english_caption": "corrected natural English caption, or copy English if no correction",
+  "main_idea": "",
+  "say_it_simply": "",
+  "corrected_japanese_original": "",
+  "corrected_english_caption": "",
   "is_unclear": false,
   "unclear_reason": "",
   "key_terms": [
@@ -2426,38 +2599,27 @@ Required JSON:
 """.strip()
 
         messages = [
-            {
-                "role": "system",
-                "content": "You are a strict JSON caption correction assistant. Return only valid JSON.",
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
+            {"role": "system", "content": "You are a concise JSON-only interpreter key-term assistant."},
+            {"role": "user", "content": prompt},
         ]
 
         text = ""
         last_error = ""
 
-        # JSON mode first, plain mode second because not every Groq model supports JSON mode equally.
         for response_format in [{"type": "json_object"}, None]:
             try:
                 kwargs = {
                     "model": model_name,
                     "messages": messages,
                     "temperature": 0.0,
-                    "max_tokens": 900,
+                    "max_tokens": 520,
                 }
-
                 if response_format is not None:
                     kwargs["response_format"] = response_format
-
                 completion = client.chat.completions.create(**kwargs)
                 text = completion.choices[0].message.content or ""
-
                 if text.strip():
                     break
-
             except Exception as e:
                 last_error = str(e)
                 continue
@@ -2467,12 +2629,11 @@ Required JSON:
 
         parsed = parse_llm_json(text)
 
-        # If Groq gave non-JSON, do not destroy captions. Return minimal safe copy.
         if not parsed.get("parse_ok"):
             parsed["corrected_english_caption"] = current_translation or ""
             parsed["corrected_japanese_original"] = ""
             parsed["is_unclear"] = True
-            parsed["unclear_reason"] = "Groq helper returned non-JSON output. Raw caption kept."
+            parsed["unclear_reason"] = "Groq returned non-JSON output. Raw caption kept."
 
         if not parsed.get("corrected_english_caption"):
             parsed["corrected_english_caption"] = current_translation or ""
@@ -2495,7 +2656,7 @@ Required JSON:
     except Exception as e:
         result_queue.put({
             "type": "llm_error",
-            "message": str(e),
+            "message": shorten_error_for_ui(str(e)),
         })
 
 
@@ -2874,25 +3035,52 @@ with st.sidebar:
     )
     st.caption(f"Helper AI fixed context: {domain_mode}")
 
+    main_display_mode = st.radio(
+        "Main display",
+        ["Key terms only", "Terms + meaning", "Captions + terms", "Full captions"],
+        index=1,
+        help="For interpreters, use Key terms only or Terms + meaning.",
+    )
+
+    show_term_meaning = st.checkbox(
+        "Show meaning with key terms",
+        value=True,
+    )
+
     subtitle_display = st.radio(
-        "Caption display",
+        "Caption history",
         ["Latest only", "History"],
         index=0,
     )
 
+    self_context = st.text_area(
+        "Self context / today's context",
+        value=st.session_state.get("self_context_text", ""),
+        height=80,
+        placeholder="Example: Today is about automotive braking and inertia compensation.",
+        help="This is sent only to Groq helper/Ask AI, not shown to audience.",
+    )
+    st.session_state.self_context_text = self_context
+
+    show_error_details = st.checkbox(
+        "Show AI error details",
+        value=False,
+        help="Keep OFF during interpreting. Details stay in debug.",
+    )
+
     font_size = st.slider(
         "English caption font size",
-        min_value=14,
-        max_value=34,
-        value=16,
+        min_value=12,
+        max_value=32,
+        value=15,
         step=1,
     )
 
     jp_font_size = st.slider(
         "Japanese original font size",
-        min_value=12,
-        max_value=30,
-        value=14,
+        min_value=11,
+        max_value=28,
+        value=13,
         step=1,
     )
 
@@ -3028,6 +3216,17 @@ defaults = {
     "llm_last_call_time": 0.0,
     "llm_last_source_text": "",
     "llm_context_chunks": [],
+
+    "self_context_text": "",
+    "ask_ai_question": "",
+    "ask_ai_answer": "",
+    "ask_ai_terms": [],
+    "ask_ai_error": "",
+    "ask_ai_running": False,
+    "ask_ai_result_queue": queue.Queue(),
+    "ask_ai_thread": None,
+    "ask_ai_last_time": "",
+    "ask_ai_last_question": "",
 }
 
 for key, value in defaults.items():
@@ -3194,11 +3393,118 @@ if clear_clicked:
     st.session_state.llm_corrections = []
     st.session_state.llm_error = ""
     st.session_state.llm_last_source_text = ""
+    st.session_state.ask_ai_question = ""
+    st.session_state.ask_ai_answer = ""
+    st.session_state.ask_ai_terms = []
+    st.session_state.ask_ai_error = ""
+    st.session_state.ask_ai_running = False
+    st.session_state.ask_ai_last_time = ""
+    st.session_state.ask_ai_last_question = ""
 
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
         st.session_state.debug_messages.append("Clear requested.")
         st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+
+
+# ============================================================
+# Translator Ask AI
+# ============================================================
+
+with st.expander("Translator Ask AI / 用語だけ聞く", expanded=False):
+    st.caption(
+        "Use this when YOU are confused. It uses recent lecture context, "
+        "but it does not overwrite the live caption."
+    )
+
+    typed_question = st.text_input(
+        "Type Japanese question or difficult term",
+        key="ask_ai_question",
+        placeholder="例：慣性補償って英語で何？ / 寸法拘束？",
+    )
+
+    col_ask_1, col_ask_2 = st.columns(2)
+
+    ask_typed_clicked = col_ask_1.button(
+        "Ask typed question",
+        use_container_width=True,
+        disabled=st.session_state.ask_ai_running,
+    )
+
+    ask_latest_clicked = col_ask_2.button(
+        "Ask latest Japanese speech",
+        use_container_width=True,
+        disabled=st.session_state.ask_ai_running,
+        help="Speak your question into the same mic, then press this. It uses the latest Japanese text.",
+    )
+
+    if st.session_state.ask_ai_running:
+        st.info("Ask AI is thinking...")
+
+    if st.session_state.ask_ai_error:
+        if show_error_details or show_debug:
+            st.warning(st.session_state.ask_ai_error)
+        else:
+            st.caption("Ask AI skipped. Open debug for details.")
+
+    if st.session_state.ask_ai_answer:
+        st.markdown("**Ask AI answer**")
+        st.success(st.session_state.ask_ai_answer)
+
+    if st.session_state.ask_ai_terms:
+        term_lines = []
+        for item in st.session_state.ask_ai_terms[:4]:
+            term = str(item.get("term", "")).strip()
+            meaning = str(item.get("meaning", "")).strip()
+            line = format_key_term_line(term, meaning, show_term_meaning)
+            if line:
+                term_lines.append(line)
+
+        if term_lines:
+            st.markdown("**Ask AI key terms**")
+            st.code("\n".join(term_lines))
+
+    if ask_typed_clicked or ask_latest_clicked:
+        if not groq_api_key:
+            st.session_state.ask_ai_error = "GROQ_API_KEY missing."
+        else:
+            if ask_latest_clicked:
+                question_text = compact_text(st.session_state.live_original, 350)
+            else:
+                question_text = compact_text(typed_question, 350)
+
+            if not question_text:
+                st.session_state.ask_ai_error = "No question text. Speak or type first."
+            else:
+                st.session_state.ask_ai_error = ""
+                st.session_state.ask_ai_answer = ""
+                st.session_state.ask_ai_terms = []
+                st.session_state.ask_ai_running = True
+                st.session_state.ask_ai_last_question = question_text
+
+                ask_context_text = build_slim_llm_context(
+                    st.session_state.llm_context_chunks,
+                    st.session_state.live_original,
+                    st.session_state.live_translation,
+                )
+                ask_domain_context = make_compact_domain_context(
+                    domain_mode,
+                    self_context,
+                )
+
+                st.session_state.ask_ai_thread = threading.Thread(
+                    target=ask_ai_worker,
+                    args=(
+                        st.session_state.ask_ai_result_queue,
+                        groq_api_key,
+                        llm_model_name,
+                        question_text,
+                        ask_context_text,
+                        ask_domain_context,
+                    ),
+                    daemon=True,
+                )
+                st.session_state.ask_ai_thread.start()
 
 
 # ============================================================
@@ -3245,6 +3551,12 @@ if (
     st.session_state.llm_error = ""
     st.session_state.llm_last_source_text = ""
     st.session_state.llm_last_call_time = 0.0
+    st.session_state.ask_ai_answer = ""
+    st.session_state.ask_ai_terms = []
+    st.session_state.ask_ai_error = ""
+    st.session_state.ask_ai_running = False
+    st.session_state.ask_ai_last_time = ""
+    st.session_state.ask_ai_last_question = ""
 
     processor = webrtc_ctx.audio_processor
 
@@ -3504,11 +3816,37 @@ while not st.session_state.llm_result_queue.empty():
 
 
 # ============================================================
+# Pull Ask AI results
+# ============================================================
+
+while not st.session_state.ask_ai_result_queue.empty():
+    item = st.session_state.ask_ai_result_queue.get()
+    item_type = item.get("type")
+
+    if item_type == "ask_ai_answer":
+        st.session_state.ask_ai_answer = item.get("answer", "")
+        st.session_state.ask_ai_terms = filter_llm_key_terms_for_current_caption(
+            item.get("key_terms", []),
+            st.session_state.live_original + "\n" + st.session_state.ask_ai_last_question,
+            st.session_state.live_translation + "\n" + st.session_state.ask_ai_answer,
+            domain_mode,
+        )
+        st.session_state.ask_ai_error = ""
+        st.session_state.ask_ai_running = False
+        st.session_state.ask_ai_last_time = time.strftime("%H:%M:%S")
+
+    elif item_type == "ask_ai_error":
+        st.session_state.ask_ai_error = item.get("message", "")
+        st.session_state.ask_ai_running = False
+        st.session_state.ask_ai_last_time = time.strftime("%H:%M:%S")
+
+
+# ============================================================
 # Start LLM hint worker
 # ============================================================
 
 if use_llm_hints and groq_api_key:
-    source_text = build_llm_context(
+    source_text = build_slim_llm_context(
         st.session_state.llm_context_chunks,
         st.session_state.live_original,
         st.session_state.live_translation,
@@ -3566,7 +3904,10 @@ if use_llm_hints and groq_api_key:
         st.session_state.llm_last_source_text = source_text
         st.session_state.last_llm_checked_token_version = st.session_state.live_token_version
 
-        selected_class_context = make_selected_domain_context(domain_mode)
+        selected_class_context = make_compact_domain_context(
+            domain_mode,
+            self_context,
+        )
 
         st.session_state.llm_thread = threading.Thread(
             target=llm_hint_worker,
@@ -3578,6 +3919,7 @@ if use_llm_hints and groq_api_key:
                 st.session_state.live_translation,
                 detected_terms,
                 selected_class_context,
+                self_context,
             ),
             daemon=True,
         )
@@ -3613,7 +3955,10 @@ if st.session_state.soniox_error:
     st.error(st.session_state.soniox_error)
 
 if use_llm_hints and st.session_state.llm_error:
-    st.warning(f"LLM error: {st.session_state.llm_error}")
+    if show_error_details or show_debug:
+        st.warning(f"LLM error: {st.session_state.llm_error}")
+    else:
+        st.caption("AI helper skipped this update. Debug has details.")
 
 if use_llm_hints and st.session_state.llm_budget_reached:
     if llm_budget_mode == "Emergency Rule-Based Only":
@@ -3732,7 +4077,10 @@ if not use_llm_hints:
 elif not groq_api_key:
     correction_status_text = "AI correction unavailable: GROQ_API_KEY missing"
 elif st.session_state.llm_error:
-    correction_status_text = f"AI correction error: {st.session_state.llm_error}"
+    if show_error_details or show_debug:
+        correction_status_text = f"AI helper skipped: {shorten_error_for_ui(st.session_state.llm_error)}"
+    else:
+        correction_status_text = "AI helper skipped this update"
 elif st.session_state.llm_running:
     correction_status_text = "AI correction checking..."
 elif st.session_state.llm_is_unclear and st.session_state.last_helper_fix_time:
@@ -3780,9 +4128,9 @@ if use_llm_hints:
         simple_text = "Waiting for enough lecture context..."
 
     if st.session_state.llm_running:
-        llm_terms_text = "AI checking key terms and caption corrections..."
+        llm_terms_text = "Checking key terms..."
     elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
-        llm_terms_text = "AI correction pending..."
+        llm_terms_text = "No key terms yet."
     elif st.session_state.llm_key_terms:
         current_llm_key_terms = filter_llm_key_terms_for_current_caption(
             st.session_state.llm_key_terms,
@@ -3800,7 +4148,7 @@ if use_llm_hints:
             term = apply_llm_corrections(term, st.session_state.llm_corrections)
             meaning = apply_llm_corrections(meaning, st.session_state.llm_corrections)
 
-            line = normalize_key_term_line(term, meaning)
+            line = format_key_term_line(term, meaning, show_term_meaning)
 
             if line and line not in llm_terms_lines:
                 llm_terms_lines.append(line)
@@ -3826,19 +4174,54 @@ safe_jp_status = html.escape(jp_status_text)
 safe_en_status = html.escape(en_status_text)
 safe_correction_status = html.escape(correction_status_text)
 
+safe_ask_answer = html.escape(st.session_state.ask_ai_answer or "")
+ask_terms_lines_for_display = []
+
+for item in st.session_state.ask_ai_terms[:4]:
+    term = str(item.get("term", "")).strip()
+    meaning = str(item.get("meaning", "")).strip()
+    line = format_key_term_line(term, meaning, show_term_meaning)
+    if line and line not in ask_terms_lines_for_display:
+        ask_terms_lines_for_display.append(line)
+
+safe_ask_terms = html.escape("\n".join(ask_terms_lines_for_display))
+
+show_captions_in_ui = main_display_mode in ["Captions + terms", "Full captions"]
+show_status_in_ui = main_display_mode == "Full captions"
+show_ask_in_main = bool(st.session_state.ask_ai_answer or ask_terms_lines_for_display)
+
 llm_html = ""
 
 if use_llm_hints:
+    correction_status_html = ""
+
+    if show_status_in_ui:
+        correction_status_html = f"""
+        <div>
+            <div class="caption-label">Correction Status</div>
+            <div class="correction-status-box">{safe_correction_status}</div>
+        </div>
+        """
+
+    ask_main_html = ""
+
+    if show_ask_in_main:
+        ask_main_html = f"""
+        <div>
+            <div class="caption-label">Translator Ask AI</div>
+            <div class="ask-ai-box">{safe_ask_terms if safe_ask_terms else safe_ask_answer}</div>
+        </div>
+        """
+
     llm_html = f"""
-    <div>
-        <div class="caption-label">Correction Status</div>
-        <div class="correction-status-box">{safe_correction_status}</div>
-    </div>
+    {correction_status_html}
 
     <div>
-        <div class="caption-label">LLM Key Terms</div>
+        <div class="caption-label">Key Terms</div>
         <div class="llm-terms-box">{safe_llm_terms}</div>
     </div>
+
+    {ask_main_html}
     """
 
 
@@ -3953,6 +4336,15 @@ if show_debug:
             else "No error"
         )
 
+        st.write("Ask AI:")
+        st.code(
+            f"running={st.session_state.ask_ai_running}\n"
+            f"question={st.session_state.ask_ai_last_question}\n"
+            f"answer={st.session_state.ask_ai_answer}\n"
+            f"terms={st.session_state.ask_ai_terms}\n"
+            f"error={st.session_state.ask_ai_error}"
+        )
+
 
 # ============================================================
 # Caption display
@@ -4017,18 +4409,34 @@ caption_html = f"""
 
 
 .llm-terms-box {{
-    font-size: 16px;
+    font-size: 20px;
     line-height: 1.35;
-    font-weight: 600;
-    padding: 12px;
+    font-weight: 800;
+    padding: 14px;
     border-radius: 14px;
     background-color: #ECFDF5;
     color: #064E3B;
-    min-height: 55px;
-    max-height: 130px;
+    min-height: 60px;
+    max-height: 150px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #10B981;
+    box-sizing: border-box;
+}}
+
+.ask-ai-box {{
+    font-size: 18px;
+    line-height: 1.35;
+    font-weight: 700;
+    padding: 12px;
+    border-radius: 14px;
+    background-color: #FEF3C7;
+    color: #78350F;
+    min-height: 48px;
+    max-height: 125px;
+    overflow: hidden;
+    white-space: pre-wrap;
+    border: 1px solid #F59E0B;
     box-sizing: border-box;
 }}
 
@@ -4115,11 +4523,19 @@ caption_html = f"""
         max-height: 55px;
     }}
     .llm-terms-box {{
-        font-size: 12px;
-        line-height: 1.2;
-        padding: 7px;
-        min-height: 38px;
-        max-height: 70px;
+        font-size: 18px;
+        line-height: 1.22;
+        padding: 9px;
+        min-height: 44px;
+        max-height: 110px;
+    }}
+
+    .ask-ai-box {{
+        font-size: 16px;
+        line-height: 1.22;
+        padding: 8px;
+        min-height: 40px;
+        max-height: 95px;
     }}
     .en-caption-box {{
         font-size: min({font_size}px, 16px);
@@ -4132,17 +4548,21 @@ caption_html = f"""
 </style>
 
 <div class="caption-wrapper">
+    {f"""
     <div>
         <div class="caption-label">Japanese Original <span class="caption-status">{safe_jp_status}</span></div>
         <div class="jp-caption-box">{safe_original}</div>
     </div>
+    """ if show_captions_in_ui else ""}
 
     {llm_html}
 
+    {f"""
     <div>
         <div class="caption-label">English Caption <span class="caption-status">{safe_en_status}</span></div>
         <div class="en-caption-box">{safe_caption_text}</div>
     </div>
+    """ if show_captions_in_ui else ""}
 </div>
 """
 
@@ -4153,6 +4573,6 @@ st.html(caption_html)
 # Live refresh
 # ============================================================
 
-if st.session_state.app_active or st.session_state.soniox_running:
+if st.session_state.app_active or st.session_state.soniox_running or st.session_state.ask_ai_running:
     time.sleep(0.2)
     st.rerun()
