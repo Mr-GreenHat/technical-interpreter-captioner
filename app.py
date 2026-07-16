@@ -2191,6 +2191,29 @@ def compact_text(text, max_chars):
     return text[-max_chars:].strip()
 
 
+def get_new_text_after_baseline(current_text, baseline_text):
+    """
+    For Translator Ask AI two-step mode.
+    First press stores baseline_text.
+    Second press sends only the text spoken after that baseline.
+    """
+    current_text = (current_text or "").strip()
+    baseline_text = (baseline_text or "").strip()
+
+    if not current_text:
+        return ""
+
+    if baseline_text and current_text.startswith(baseline_text):
+        return current_text[len(baseline_text):].strip()
+
+    # Soniox sometimes trims the beginning, so exact prefix can fail.
+    # If the texts are different, use current text as fallback.
+    if current_text != baseline_text:
+        return current_text
+
+    return ""
+
+
 def build_slim_llm_context(context_chunks, current_original, current_translation):
     """
     Small context for Groq free-tier TPM.
@@ -3229,6 +3252,11 @@ defaults = {
     "ask_ai_thread": None,
     "ask_ai_last_time": "",
     "ask_ai_last_question": "",
+    "ask_latest_capture_active": False,
+    "ask_latest_capture_baseline_original": "",
+    "ask_latest_capture_baseline_translation": "",
+    "ask_latest_capture_started_at": 0.0,
+    "ask_latest_notice": "",
 }
 
 for key, value in defaults.items():
@@ -3351,6 +3379,8 @@ if toggle_clicked:
         st.session_state.soniox_control_queue = queue.Queue()
         st.session_state.soniox_thread = None
         st.session_state.mic_instance_id += 1
+        st.session_state.ask_latest_capture_active = False
+        st.session_state.ask_latest_notice = ""
 
         st.rerun()
 
@@ -3405,6 +3435,16 @@ if clear_clicked:
     st.session_state.ask_ai_last_time = ""
     st.session_state.ask_ai_last_question = ""
 
+    if st.session_state.ask_latest_capture_active:
+        st.session_state.ask_latest_notice = (
+            "Listening mode ON. Speak your difficult Japanese term, then press the green button again."
+        )
+    st.session_state.ask_latest_capture_active = False
+    st.session_state.ask_latest_capture_baseline_original = ""
+    st.session_state.ask_latest_capture_baseline_translation = ""
+    st.session_state.ask_latest_capture_started_at = 0.0
+    st.session_state.ask_latest_notice = ""
+
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
         st.session_state.debug_messages.append("Clear requested.")
@@ -3427,6 +3467,33 @@ with st.expander("Translator Ask AI / 用語だけ聞く", expanded=False):
         placeholder="例：慣性補償って英語で何？ / 寸法拘束？",
     )
 
+    # Two-step latest-speech mode:
+    # 1st press = start listening/capture
+    # 2nd press = send newly spoken Japanese to Ask AI
+    ask_latest_active = bool(st.session_state.ask_latest_capture_active)
+
+    if ask_latest_active:
+        st.markdown(
+            """
+            <div style="
+                background:#DCFCE7;
+                color:#14532D;
+                border:1px solid #22C55E;
+                border-radius:12px;
+                padding:10px 12px;
+                font-weight:700;
+                margin:8px 0;
+            ">
+            🟢 Translator Ask listening mode ON. Speak the difficult Japanese word now,
+            then press the green button again.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if st.session_state.ask_latest_notice:
+        st.info(st.session_state.ask_latest_notice)
+
     col_ask_1, col_ask_2 = st.columns(2)
 
     ask_typed_clicked = col_ask_1.button(
@@ -3435,11 +3502,21 @@ with st.expander("Translator Ask AI / 用語だけ聞く", expanded=False):
         disabled=st.session_state.ask_ai_running,
     )
 
+    ask_latest_label = (
+        "🟢 Ask AI with captured Japanese"
+        if ask_latest_active
+        else "Start Ask-latest listening"
+    )
+
     ask_latest_clicked = col_ask_2.button(
-        "Ask latest Japanese speech",
+        ask_latest_label,
         use_container_width=True,
         disabled=st.session_state.ask_ai_running,
-        help="Speak your question into the same mic, then press this. It uses the latest Japanese text.",
+        type="primary" if ask_latest_active else "secondary",
+        help=(
+            "First press starts a small capture mode. Speak your Japanese term. "
+            "Second press sends only the new Japanese text to AI."
+        ),
     )
 
     if st.session_state.ask_ai_running:
@@ -3468,47 +3545,104 @@ with st.expander("Translator Ask AI / 用語だけ聞く", expanded=False):
             st.markdown("**Ask AI key terms**")
             st.code("\n".join(term_lines))
 
-    if ask_typed_clicked or ask_latest_clicked:
+    def start_ask_ai_with_question(question_text):
+        question_text = compact_text(question_text, 350)
+
         if not groq_api_key:
             st.session_state.ask_ai_error = "GROQ_API_KEY missing."
-        else:
-            if ask_latest_clicked:
-                question_text = compact_text(st.session_state.live_original, 350)
+            return
+
+        if not question_text:
+            st.session_state.ask_ai_error = "No question text. Speak or type first."
+            return
+
+        st.session_state.ask_ai_error = ""
+        st.session_state.ask_ai_answer = ""
+        st.session_state.ask_ai_terms = []
+        st.session_state.ask_ai_running = True
+        st.session_state.ask_ai_last_question = question_text
+        st.session_state.ask_latest_notice = ""
+
+        ask_context_text = build_slim_llm_context(
+            st.session_state.llm_context_chunks,
+            st.session_state.live_original,
+            st.session_state.live_translation,
+        )
+        ask_domain_context = make_compact_domain_context(
+            domain_mode,
+            self_context,
+        )
+
+        st.session_state.ask_ai_thread = threading.Thread(
+            target=ask_ai_worker,
+            args=(
+                st.session_state.ask_ai_result_queue,
+                groq_api_key,
+                llm_model_name,
+                question_text,
+                ask_context_text,
+                ask_domain_context,
+            ),
+            daemon=True,
+        )
+        st.session_state.ask_ai_thread.start()
+
+    if ask_typed_clicked:
+        start_ask_ai_with_question(typed_question)
+
+    if ask_latest_clicked:
+        if not ask_latest_active:
+            # First press: enable capture mode.
+            st.session_state.ask_latest_capture_active = True
+            st.session_state.ask_latest_capture_baseline_original = st.session_state.live_original or ""
+            st.session_state.ask_latest_capture_baseline_translation = st.session_state.live_translation or ""
+            st.session_state.ask_latest_capture_started_at = time.time()
+            st.session_state.ask_ai_answer = ""
+            st.session_state.ask_ai_terms = []
+            st.session_state.ask_ai_error = ""
+
+            # If translation/mic is not running, start it automatically.
+            if not st.session_state.app_active or not st.session_state.soniox_running:
+                st.session_state.soniox_stop_event = threading.Event()
+                st.session_state.soniox_result_queue = queue.Queue()
+                st.session_state.soniox_control_queue = queue.Queue()
+                st.session_state.soniox_thread = None
+                st.session_state.app_active = True
+                st.session_state.pending_start_translation = True
+                st.session_state.soniox_error = ""
+                st.session_state.ask_latest_notice = (
+                    "Starting Soniox listening. When it says running, speak your term, "
+                    "then press the green button again."
+                )
             else:
-                question_text = compact_text(typed_question, 350)
+                st.session_state.ask_latest_notice = (
+                    "Listening mode ON. Speak your difficult Japanese term, "
+                    "then press the green button again."
+                )
+
+            st.rerun()
+
+        else:
+            # Second press: send only the new Japanese spoken after capture start.
+            baseline = st.session_state.ask_latest_capture_baseline_original
+            question_text = get_new_text_after_baseline(
+                st.session_state.live_original,
+                baseline,
+            )
 
             if not question_text:
-                st.session_state.ask_ai_error = "No question text. Speak or type first."
+                st.session_state.ask_latest_notice = (
+                    "Still no new Japanese captured. Speak the term/question first, "
+                    "then press the green button again."
+                )
+                st.rerun()
             else:
-                st.session_state.ask_ai_error = ""
-                st.session_state.ask_ai_answer = ""
-                st.session_state.ask_ai_terms = []
-                st.session_state.ask_ai_running = True
-                st.session_state.ask_ai_last_question = question_text
+                st.session_state.ask_latest_capture_active = False
+                st.session_state.ask_latest_capture_baseline_original = ""
+                st.session_state.ask_latest_capture_baseline_translation = ""
+                st.session_state.ask_latest_capture_started_at = 0.0
+                start_ask_ai_with_question(question_text)
 
-                ask_context_text = build_slim_llm_context(
-                    st.session_state.llm_context_chunks,
-                    st.session_state.live_original,
-                    st.session_state.live_translation,
-                )
-                ask_domain_context = make_compact_domain_context(
-                    domain_mode,
-                    self_context,
-                )
-
-                st.session_state.ask_ai_thread = threading.Thread(
-                    target=ask_ai_worker,
-                    args=(
-                        st.session_state.ask_ai_result_queue,
-                        groq_api_key,
-                        llm_model_name,
-                        question_text,
-                        ask_context_text,
-                        ask_domain_context,
-                    ),
-                    daemon=True,
-                )
-                st.session_state.ask_ai_thread.start()
 
 
 # ============================================================
@@ -3824,7 +3958,7 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
         # Error cooldown is longer because Groq TPM/rate errors often happen
         # when the next request starts too soon.
-        st.session_state.llm_cooldown_until = time.time() + max(float(llm_hint_interval), 30.0)
+        st.session_state.llm_cooldown_until = time.time() + max(float(llm_hint_interval), 45.0)
         st.session_state.llm_calls_this_session += 1
         st.session_state.correction_status = "error"
 
@@ -3847,11 +3981,15 @@ while not st.session_state.ask_ai_result_queue.empty():
         )
         st.session_state.ask_ai_error = ""
         st.session_state.ask_ai_running = False
+        st.session_state.ask_latest_capture_active = False
+        st.session_state.ask_latest_notice = ""
         st.session_state.ask_ai_last_time = time.strftime("%H:%M:%S")
 
     elif item_type == "ask_ai_error":
         st.session_state.ask_ai_error = item.get("message", "")
         st.session_state.ask_ai_running = False
+        st.session_state.ask_latest_capture_active = False
+        st.session_state.ask_latest_notice = ""
         st.session_state.ask_ai_last_time = time.strftime("%H:%M:%S")
 
 
@@ -4358,7 +4496,10 @@ if show_debug:
             f"question={st.session_state.ask_ai_last_question}\n"
             f"answer={st.session_state.ask_ai_answer}\n"
             f"terms={st.session_state.ask_ai_terms}\n"
-            f"error={st.session_state.ask_ai_error}"
+            f"error={st.session_state.ask_ai_error}\n"
+            f"capture_active={st.session_state.ask_latest_capture_active}\n"
+            f"capture_baseline={st.session_state.ask_latest_capture_baseline_original}\n"
+            f"capture_notice={st.session_state.ask_latest_notice}"
         )
 
 
@@ -4598,6 +4739,11 @@ st.html(caption_html)
 # Live refresh
 # ============================================================
 
-if st.session_state.app_active or st.session_state.soniox_running or st.session_state.ask_ai_running:
+if (
+    st.session_state.app_active
+    or st.session_state.soniox_running
+    or st.session_state.ask_ai_running
+    or st.session_state.ask_latest_capture_active
+):
     time.sleep(0.2)
     st.rerun()
