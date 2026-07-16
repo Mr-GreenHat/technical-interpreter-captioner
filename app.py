@@ -352,6 +352,7 @@ def safe_get_secret_or_env(key):
 # Glossary
 # ============================================================
 
+@st.cache_data(show_spinner=False)
 def load_soniox_context_terms(terms_file):
     terms = []
     translation_terms = []
@@ -424,6 +425,7 @@ def load_soniox_context_terms(terms_file):
         return [], []
 
 
+@st.cache_data(show_spinner=False)
 def load_glossary_entries(terms_file):
     entries = []
 
@@ -463,6 +465,324 @@ def load_glossary_entries(terms_file):
             existing.add(key)
 
     return entries
+
+
+SCHOOL_TERM_WORDS = [
+    "サマーコース",
+    "サマコース",
+    "サマー講座",
+    "Summer Course",
+    "summer course",
+    "BINUS",
+    "Binus",
+    "binus",
+    "ビヌス",
+    "ビナス",
+    "ビーナス",
+    "ネウス",
+    "ヴィヌス",
+    "BINUS ASO",
+    "ビヌスASO",
+    "ビヌス大学",
+    "BINUS University",
+    "ARE",
+    "PDE",
+    "Business Engineering",
+    "Automotive and Robotics Engineering",
+    "Product Design Engineering",
+]
+
+SCHOOL_STRONG_CONTEXT_WORDS = [
+    "サマーコース",
+    "サマコース",
+    "Summer Course",
+    "summer course",
+    "BINUS",
+    "binus",
+    "ビヌス",
+    "ビナス",
+    "ビーナス",
+    "ネウス",
+    "BINUS ASO",
+    "ビヌスASO",
+    "ビヌス大学",
+    "BINUS University",
+]
+
+CAD_STRONG_CONTEXT_WORDS = [
+    "CATIA",
+    "catia",
+    "CAD",
+    "Sketcher",
+    "スケッチャー",
+    "寸法拘束",
+    "幾何拘束",
+    "完全拘束",
+    "Pad",
+    "フィレット",
+    "Chamfer",
+    "面取り",
+    "設計意図",
+    "加工性",
+]
+
+AUTO_STRONG_CONTEXT_WORDS = [
+    "TTC",
+    "AEB",
+    "ADAS",
+    "慣性補償",
+    "brake",
+    "braking",
+    "ブレーキ",
+    "ロータリーエンジン",
+    "rotary engine",
+    "アペックスシール",
+]
+
+
+def contains_any_text(text, words):
+    text = text or ""
+    lower = text.lower()
+
+    for word in words:
+        if not word:
+            continue
+
+        if word in text:
+            return True
+
+        if word.lower() in lower:
+            return True
+
+    return False
+
+
+def is_school_context_active(original_text, translation_text, domain_mode):
+    domain = (domain_mode or "auto").lower()
+
+    if domain in ["school", "school/event", "event"]:
+        return True
+
+    combined = f"{original_text or ''}\n{translation_text or ''}"
+
+    return contains_any_text(combined, SCHOOL_STRONG_CONTEXT_WORDS)
+
+
+def is_school_related_term(term, meaning):
+    combined = f"{term or ''}\n{meaning or ''}"
+    return contains_any_text(combined, SCHOOL_TERM_WORDS)
+
+
+def is_term_relevant_to_current_caption(term, meaning, original_text, translation_text, domain_mode):
+    """
+    Avoid stale or hallucinated key terms.
+
+    Example problem:
+    Current speech is about 挨拶 / schedule,
+    but the LLM box shows サマーコース / ビヌス大学 from old context.
+    This function blocks that unless the current caption actually supports it.
+    """
+    term = (term or "").strip()
+    meaning = (meaning or "").strip()
+    original_text = original_text or ""
+    translation_text = translation_text or ""
+
+    if not term and not meaning:
+        return False
+
+    combined = f"{original_text}\n{translation_text}"
+    combined_lower = combined.lower()
+
+    # Strong block: do not show school terms unless school context is currently active.
+    if is_school_related_term(term, meaning):
+        if not is_school_context_active(original_text, translation_text, domain_mode):
+            return False
+
+    # Direct mention is always okay.
+    for value in [term, meaning]:
+        value = (value or "").strip()
+
+        if not value:
+            continue
+
+        if value in combined:
+            return True
+
+        if value.lower() in combined_lower:
+            return True
+
+    # Domain-selected allowance for technical terms.
+    domain = (domain_mode or "auto").lower()
+
+    if domain == "cad" and contains_any_text(f"{term}\n{meaning}", CAD_STRONG_CONTEXT_WORDS):
+        return True
+
+    if domain == "product design" and contains_any_text(f"{term}\n{meaning}", CAD_STRONG_CONTEXT_WORDS):
+        return True
+
+    if domain == "automotive" and contains_any_text(f"{term}\n{meaning}", AUTO_STRONG_CONTEXT_WORDS):
+        return True
+
+    if domain in ["school", "school/event", "event"] and is_school_related_term(term, meaning):
+        return True
+
+    return False
+
+
+def filter_llm_key_terms_for_current_caption(key_terms, original_text, translation_text, domain_mode, max_terms=5):
+    filtered = []
+
+    for item in key_terms or []:
+        term = str(item.get("term", item.get("jp", ""))).strip()
+        meaning = str(item.get("meaning", item.get("en", ""))).strip()
+
+        if not term:
+            continue
+
+        if not is_term_relevant_to_current_caption(
+            term,
+            meaning,
+            original_text,
+            translation_text,
+            domain_mode,
+        ):
+            continue
+
+        filtered.append(item)
+
+        if len(filtered) >= max_terms:
+            break
+
+    return filtered
+
+
+def filter_detected_terms_for_current_caption(detected_terms, original_text, translation_text, domain_mode, max_terms=8):
+    """
+    Same filter, but for glossary rows before sending them to Groq.
+    This prevents the second AI prompt from being polluted by unrelated
+    Summer Course/BINUS terms in Auto mode.
+    """
+    filtered = []
+
+    for item in detected_terms or []:
+        jp = str(item.get("jp", "")).strip()
+        en = str(item.get("en", "")).strip()
+
+        if not is_term_relevant_to_current_caption(
+            jp,
+            en,
+            original_text,
+            translation_text,
+            domain_mode,
+        ):
+            continue
+
+        filtered.append(item)
+
+        if len(filtered) >= max_terms:
+            break
+
+    return filtered
+
+
+def filter_soniox_context_terms_for_domain(context_terms, translation_terms, domain_mode):
+    """
+    In Auto mode, do not bias Soniox toward Summer Course/BINUS.
+    Use 'school/event' when you actually need those terms.
+    """
+    domain = (domain_mode or "auto").lower()
+
+    if domain in ["school", "school/event", "event"]:
+        return context_terms, translation_terms
+
+    def keep_text(value):
+        return not contains_any_text(value or "", SCHOOL_TERM_WORDS)
+
+    filtered_context_terms = [
+        term
+        for term in context_terms or []
+        if keep_text(term)
+    ]
+
+    filtered_translation_terms = []
+
+    for item in translation_terms or []:
+        source = item.get("source", "")
+        target = item.get("target", "")
+
+        if keep_text(source) and keep_text(target):
+            filtered_translation_terms.append(item)
+
+    return filtered_context_terms, filtered_translation_terms
+
+
+def make_soniox_important_term_text(domain_mode):
+    domain = (domain_mode or "auto").lower()
+
+    parts = [
+        "TTC means Time To Collision.",
+        "If speech sounds like ABC in AEB context, it is probably TTC.",
+        "慣性補償 means inertia compensation.",
+        "Do not translate 慣性補償 as sensory compensation, completion assurance, or completion compensation.",
+        "CATIA is CAD software. CAD means Computer-Aided Design.",
+        "In CATIA class, Sketcher, dimensional constraint, geometric constraint, Pad, Fillet, Chamfer, Hole, design intent, and manufacturability are important terms.",
+        "ロータリーエンジン means rotary engine. アペックスシール means apex seal. レシプロエンジン means reciprocating engine.",
+    ]
+
+    if domain in ["school", "school/event", "event"]:
+        parts.extend([
+            "サマーコース means Summer Course.",
+            "ビヌス means BINUS. ビヌスASO means BINUS ASO.",
+            "ビヌス大学 means BINUS University.",
+            "ARE means Automotive and Robotics Engineering.",
+            "PDE means Product Design Engineering.",
+            "BE means Business Engineering.",
+            "If speech sounds like AROI or ARO in the BINUS ASO major context, it is probably ARE.",
+            "If speech sounds like PDA or ADC in the BINUS ASO major context, it is probably PDE.",
+            "If Japanese sounds like ネウス大学, ビーナス大学, or ビナス大学, it is probably ビヌス大学 / BINUS University.",
+        ])
+
+    return " ".join(parts)
+
+
+def make_groq_correction_hints(domain_mode, context_text, current_translation):
+    """
+    Keep Groq prompt small and relevant.
+    Do not always include Summer Course/BINUS examples because the model
+    may output those as key terms even when the current topic is unrelated.
+    """
+    domain = (domain_mode or "auto").lower()
+    combined = f"{context_text or ''}\n{current_translation or ''}"
+
+    hints = [
+        "- Fix grammar naturally but stay close to the current caption.",
+        "- Do not output key terms unless the current caption actually mentions or clearly implies them.",
+        "- TTC = Time To Collision. In AEB/braking context, ABC can mean TTC.",
+        "- 慣性補償 = inertia compensation.",
+    ]
+
+    if domain in ["cad", "product design"] or contains_any_text(combined, CAD_STRONG_CONTEXT_WORDS):
+        hints.extend([
+            "- CATIA = CATIA. CAD = Computer-Aided Design.",
+            "- In CAD context, 勝ち方 / 書き方 / way to win can mean CATIA, but only if the sentence is about CAD/CATIA.",
+            "- スケッチャー = Sketcher; 寸法拘束 = dimensional constraint; 幾何拘束 = geometric constraint.",
+        ])
+
+    if domain == "automotive" or contains_any_text(combined, AUTO_STRONG_CONTEXT_WORDS):
+        hints.extend([
+            "- AEB = Autonomous Emergency Braking.",
+            "- ロータリーエンジン = rotary engine; アペックスシール = apex seal.",
+        ])
+
+    if domain in ["school", "school/event", "event"] or contains_any_text(combined, SCHOOL_STRONG_CONTEXT_WORDS):
+        hints.extend([
+            "- サマーコース = Summer Course.",
+            "- ビヌス大学 = BINUS University.",
+            "- In school-event context only, sauna/saunas or mackerel course can mean Summer Course.",
+            "- In school-event context only, News university / New Tiger students can mean BINUS University students.",
+        ])
+
+    return "\n".join(hints)
 
 
 def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_terms=8):
@@ -1926,6 +2246,21 @@ Correction priorities:
 - If the lecture mentions rotary engine, preserve ロータリーエンジン, ローター, アペックスシール.
 """.strip()
 
+    if domain in ["school", "school/event", "event"]:
+        return """
+Selected technical domain: school event / Summer Course / BINUS ASO.
+
+The speaker is probably explaining:
+- Summer Course, BINUS, BINUS ASO, BINUS University
+- students coming to Japan, lectures, internship, training, Japanese culture
+- ARE, PDE, BE majors only when the topic is clearly BINUS ASO majors
+
+Correction priorities:
+- サマーコース = Summer Course.
+- ビヌス大学 = BINUS University.
+- Do not force Summer Course/BINUS terms when the current sentence is not about this event.
+""".strip()
+
     return """
 Selected technical domain: mixed Japanese technical classroom.
 
@@ -2035,6 +2370,12 @@ def llm_hint_worker(
         if not class_context:
             class_context = "No fixed class context was selected."
 
+        correction_hints = make_groq_correction_hints(
+            class_context,
+            context_text,
+            current_translation,
+        )
+
         prompt = f"""
 Return ONLY one JSON object. No markdown. No code fences.
 
@@ -2050,16 +2391,10 @@ Tasks:
 5. If unclear, set is_unclear true and keep correction minimal.
 6. Always fill corrected_japanese_original and corrected_english_caption.
 7. If no correction is needed, copy the current Japanese/English text.
+8. Do not output key_terms unless the term is actually supported by the current caption.
 
-Important hints:
-- サマーコース = Summer Course.
-- ビヌス大学 = BINUS University.
-- In school-event context: sauna/saunas, mackerel course, virtual cram school can mean Summer Course.
-- News university, New Tiger students, new style students can mean BINUS University students.
-- CATIA = CATIA. In CAD context, 勝ち方 / way to win can mean CATIA.
-- TTC = Time To Collision. In AEB/braking context, ABC can mean TTC.
-- 慣性補償 = inertia compensation. Sensory/completion compensation can mean inertia compensation.
-- ロータリーエンジン = rotary engine.
+Current correction hints:
+{correction_hints}
 
 Selected class/domain context:
 {class_context}
@@ -2214,15 +2549,18 @@ def soniox_live_worker(
 
     try:
         context_terms, translation_terms = load_soniox_context_terms(terms_file)
+        context_terms, translation_terms = filter_soniox_context_terms_for_domain(
+            context_terms,
+            translation_terms,
+            domain_mode,
+        )
 
         if domain_mode == "auto":
             domain_text = (
                 "Japanese automotive engineering, CAD, product design, vehicle systems, "
                 "braking systems, vehicle control, TTC, Time To Collision, AEB, "
                 "inertia compensation, classroom interpretation, technical terms, "
-                "Summer Course, BINUS, BINUS ASO, BINUS University, ビヌス大学, "
-                "ARE, Automotive and Robotics Engineering, PDE, Product Design Engineering, "
-                "BE, Business Engineering, CATIA, CAD, Sketcher, dimensional constraint, "
+                "CATIA, CAD, Sketcher, dimensional constraint, "
                 "geometric constraint, Pad, Fillet, Chamfer, rotary engine, apex seal"
             )
 
@@ -2246,6 +2584,13 @@ def soniox_live_worker(
                 "dimensions, materials, usability, strength, manufacturability, cost, product development, prototyping"
             )
 
+        elif domain_mode in ["school", "school/event", "event"]:
+            domain_text = (
+                "Japanese school event interpretation, Summer Course, BINUS, BINUS ASO, "
+                "BINUS University, students coming to Japan, lectures, internships, training, Japanese culture, "
+                "ARE, PDE, BE majors"
+            )
+
         else:
             domain_text = "Japanese technical classroom interpretation"
 
@@ -2267,27 +2612,7 @@ def soniox_live_worker(
                     },
                     {
                         "key": "important_term",
-                        "value": (
-                            "TTC means Time To Collision. "
-                            "If speech sounds like ABC in AEB context, it is probably TTC. "
-                            "慣性補償 means inertia compensation. "
-                            "Do not translate 慣性補償 as sensory compensation, completion assurance, "
-                            "or completion compensation. "
-                            "サマーコース means Summer Course. "
-                            "In the ASO/BINUS Summer Course context only, if a phrase sounds like 様様, 様々, さまざま, or チーム but the sentence is clearly about the course/program, it may mean サマーコース. Do not force this correction when it really means various or team. "
-                            "ビヌス means BINUS. ビヌスASO means BINUS ASO. "
-                            "ビヌス大学 means BINUS University. "
-                            "ARE means Automotive and Robotics Engineering. "
-                            "PDE means Product Design Engineering. "
-                            "BE means Business Engineering. "
-                            "If speech sounds like AROI or ARO in the BINUS ASO major context, it is probably ARE. "
-                            "If speech sounds like PDA or ADC in the BINUS ASO major context, it is probably PDE. "
-                            "CATIA is CAD software. CAD means Computer-Aided Design. "
-                            "In CATIA class, Sketcher, dimensional constraint, geometric constraint, Pad, Fillet, Chamfer, Hole, design intent, and manufacturability are important terms. "
-                            "ロータリーエンジン means rotary engine. アペックスシール means apex seal. レシプロエンジン means reciprocating engine. "
-                            "If Japanese sounds like ネウス大学, ビーナス大学, or ビナス大学, "
-                            "it is probably ビヌス大学 / BINUS University."
-                        ),
+                        "value": make_soniox_important_term_text(domain_mode),
                     },
                     {
                         "key": "task",
@@ -2543,9 +2868,9 @@ with st.sidebar:
 
     domain_mode = st.selectbox(
         "Technical domain",
-        ["auto", "automotive", "cad", "product design"],
+        ["auto", "automotive", "cad", "product design", "school/event"],
         index=0,
-        help="For CATIA classes, choose 'cad' or 'product design' so CATIA is not misheard as 勝ち方 / way to win.",
+        help="Choose the real class topic. Use 'school/event' only for Summer Course/BINUS topics.",
     )
     st.caption(f"Helper AI fixed context: {domain_mode}")
 
@@ -2557,17 +2882,17 @@ with st.sidebar:
 
     font_size = st.slider(
         "English caption font size",
-        min_value=16,
-        max_value=38,
-        value=18,
-        step=2,
+        min_value=14,
+        max_value=34,
+        value=16,
+        step=1,
     )
 
     jp_font_size = st.slider(
         "Japanese original font size",
-        min_value=14,
-        max_value=34,
-        value=15,
+        min_value=12,
+        max_value=30,
+        value=14,
         step=1,
     )
 
@@ -2967,9 +3292,16 @@ while not st.session_state.soniox_result_queue.empty():
         if original or translation:
             st.session_state.live_token_version += 1
             prepare_next_ai_check_after_new_live_text()
-            # New live speech means the previous unclear warning may be stale.
+            # New live speech means the previous unclear warning/key terms may be stale.
             st.session_state.llm_is_unclear = False
             st.session_state.llm_unclear_reason = ""
+
+            st.session_state.llm_key_terms = filter_llm_key_terms_for_current_caption(
+                st.session_state.llm_key_terms,
+                original or st.session_state.live_original,
+                translation or st.session_state.live_translation,
+                domain_mode,
+            )
 
         if st.session_state.pending_visual_reset and (original or translation):
             st.session_state.live_original = ""
@@ -3104,7 +3436,12 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrected_source_text = item.get("source_text", "")
         st.session_state.llm_is_unclear = bool(item.get("is_unclear", False))
         st.session_state.llm_unclear_reason = item.get("unclear_reason", "")
-        st.session_state.llm_key_terms = item.get("key_terms", [])
+        st.session_state.llm_key_terms = filter_llm_key_terms_for_current_caption(
+            item.get("key_terms", []),
+            st.session_state.live_original,
+            st.session_state.live_translation,
+            domain_mode,
+        )
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
         st.session_state.llm_running = False
@@ -3210,6 +3547,12 @@ if use_llm_hints and groq_api_key:
             st.session_state.live_original,
             st.session_state.live_translation,
             terms_file,
+        )
+        detected_terms = filter_detected_terms_for_current_caption(
+            detected_terms,
+            st.session_state.live_original,
+            st.session_state.live_translation,
+            domain_mode,
         )
 
         st.session_state.llm_running = True
@@ -3441,9 +3784,16 @@ if use_llm_hints:
     elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
         llm_terms_text = "AI correction pending..."
     elif st.session_state.llm_key_terms:
+        current_llm_key_terms = filter_llm_key_terms_for_current_caption(
+            st.session_state.llm_key_terms,
+            display_japanese,
+            display_english,
+            domain_mode,
+        )
+
         llm_terms_lines = []
 
-        for item in st.session_state.llm_key_terms[:8]:
+        for item in current_llm_key_terms[:8]:
             term = str(item.get("term", "")).strip()
             meaning = str(item.get("meaning", "")).strip()
 
@@ -3461,7 +3811,7 @@ if use_llm_hints:
         if llm_terms_lines:
             llm_terms_text = "\n".join(llm_terms_lines)
         else:
-            llm_terms_text = "No Japanese technical key terms yet."
+            llm_terms_text = "No current key terms yet."
     else:
         llm_terms_text = "No LLM key terms yet."
 
@@ -3658,7 +4008,7 @@ caption_html = f"""
     background-color: #F3F4F6;
     color: #111827;
     min-height: 85px;
-    max-height: 190px;
+    max-height: 150px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
@@ -3691,7 +4041,7 @@ caption_html = f"""
     background-color: #111827;
     color: white;
     min-height: 130px;
-    max-height: 280px;
+    max-height: 220px;
     overflow: hidden;
     white-space: pre-wrap;
     border: 1px solid #374151;
@@ -3772,11 +4122,11 @@ caption_html = f"""
         max-height: 70px;
     }}
     .en-caption-box {{
-        font-size: min({font_size}px, 18px);
+        font-size: min({font_size}px, 16px);
         line-height: 1.18;
         padding: 8px;
         min-height: 80px;
-        max-height: 180px;
+        max-height: 145px;
     }}
 }}
 </style>
