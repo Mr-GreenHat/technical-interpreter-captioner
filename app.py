@@ -33,6 +33,12 @@ MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 KEY_TERM_HOLD_SECONDS = 10.0
 
+# Soniox expects a steady raw s16le audio stream after connection.
+# If WebRTC has not produced frames yet, send short silence frames so Soniox
+# does not close with "Audio data decode timeout".
+SONIOX_SILENCE_KEEPALIVE_SECONDS = 0.25
+SONIOX_SILENCE_KEEPALIVE_BYTES = b"\x00\x00" * 4800  # 100 ms at 48 kHz mono s16le
+
 # Japanese-only safety:
 # Ignore accidental Spanish/English/other-language recognition.
 JAPANESE_ONLY_MODE = True
@@ -1323,6 +1329,9 @@ def is_connection_noise_error(message):
         "socket is already closed",
         "connection is already closed",
         "websocketconnectionclosed",
+        "audio data decode timeout",
+        "audio data decode",
+        "decode timeout",
     ]
     return any(part in message for part in noisy_parts)
 
@@ -1334,6 +1343,12 @@ def friendly_soniox_error(message):
         return ""
 
     lower = message.lower()
+
+    if "audio data decode timeout" in lower or "audio data decode" in lower:
+        return (
+            "Soniox did not receive valid mic audio fast enough. "
+            "Check the mic permission, then press Start Translation again."
+        )
 
     if "request timeout" in lower or "timed out" in lower:
         return "Soniox connection timed out. Press Start Translation again."
@@ -3709,6 +3724,14 @@ def soniox_live_worker(
             config["language_hints"] = ["ja"]
             config["language"] = "ja"
 
+        # Drop stale audio frames before opening a fresh Soniox connection.
+        # This avoids sending old buffered frames from a previous WebRTC session.
+        try:
+            while True:
+                audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+
         ws = websocket.create_connection(SONIOX_WS_URL, timeout=10)
         ws.settimeout(0.5)
         ws.send(json.dumps(config))
@@ -3725,14 +3748,54 @@ def soniox_live_worker(
         reset_sent = False
 
         def send_audio():
+            last_audio_send_time = 0.0
+            sent_silence_keepalive = False
+
             while not stop_event.is_set():
                 try:
                     audio_bytes = audio_queue.get(timeout=0.1)
 
                     if audio_bytes:
                         ws.send_binary(audio_bytes)
+                        last_audio_send_time = time.time()
+                        sent_silence_keepalive = False
 
                 except queue.Empty:
+                    # If WebRTC is not producing frames yet, Soniox may close
+                    # with "Audio data decode timeout". Send a tiny silence
+                    # frame as a keepalive until real mic audio arrives.
+                    now = time.time()
+
+                    if (
+                        now - last_audio_send_time
+                        >= SONIOX_SILENCE_KEEPALIVE_SECONDS
+                    ):
+                        try:
+                            ws.send_binary(SONIOX_SILENCE_KEEPALIVE_BYTES)
+                            last_audio_send_time = now
+
+                            if not sent_silence_keepalive:
+                                result_queue.put({
+                                    "type": "debug",
+                                    "message": "Sent silence audio keepalive while waiting for mic frames.",
+                                })
+                                sent_silence_keepalive = True
+
+                        except Exception as e:
+                            message = f"Audio send error: {e}"
+                            if not stop_event.is_set():
+                                if is_connection_noise_error(message):
+                                    result_queue.put({
+                                        "type": "debug",
+                                        "message": message,
+                                    })
+                                else:
+                                    result_queue.put({
+                                        "type": "error",
+                                        "message": message,
+                                    })
+                            break
+
                     continue
 
                 except Exception as e:
@@ -3827,9 +3890,10 @@ def soniox_live_worker(
                 continue
 
             if data.get("error_code"):
+                soniox_message = data.get("error_message", "Unknown Soniox error")
                 result_queue.put({
                     "type": "error",
-                    "message": data.get("error_message", "Unknown Soniox error"),
+                    "message": soniox_message,
                 })
                 break
 
