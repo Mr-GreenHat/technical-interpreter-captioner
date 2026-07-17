@@ -31,6 +31,7 @@ MAX_ORIGINAL_CHARS = 300
 MAX_TRANSLATION_CHARS = 480
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
+KEY_TERM_HOLD_SECONDS = 10.0
 
 # Japanese-only safety:
 # Ignore accidental Spanish/English/other-language recognition.
@@ -741,15 +742,15 @@ def filter_llm_key_terms_for_current_caption(key_terms, original_text, translati
             continue
 
         source_match = str(item.get("source_match", item.get("matched_candidate", ""))).strip()
-        combined = f"{original_text or ''}\n{translation_text or ''}"
+        source_text = original_text or ""
 
-        if source_match and glossary_candidate_matches(source_match, combined):
+        if source_match and glossary_candidate_matches(source_match, source_text):
             pass
         elif not is_term_relevant_to_current_caption(
             term,
             meaning,
             original_text,
-            translation_text,
+            "",  # never use English translation as proof for key terms
             domain_mode,
         ):
             continue
@@ -775,15 +776,15 @@ def filter_detected_terms_for_current_caption(detected_terms, original_text, tra
         en = str(item.get("en", "")).strip()
 
         matched_candidate = str(item.get("matched_candidate", "")).strip()
-        combined = f"{original_text or ''}\n{translation_text or ''}"
+        source_text = original_text or ""
 
-        if matched_candidate and glossary_candidate_matches(matched_candidate, combined):
+        if matched_candidate and glossary_candidate_matches(matched_candidate, source_text):
             filtered.append(item)
         elif is_term_relevant_to_current_caption(
             jp,
             en,
             original_text,
-            translation_text,
+            "",  # do not let wrong English translation support key terms
             domain_mode,
         ):
             filtered.append(item)
@@ -822,6 +823,7 @@ def detected_terms_to_llm_key_terms(detected_terms, max_terms=5):
             "meaning": en,
             "reading": item.get("reading", ""),
             "source_match": item.get("matched_candidate", ""),
+            "added_at": time.time(),
         })
         seen.add(key)
 
@@ -857,6 +859,7 @@ def merge_key_terms_preserve_order(primary_terms, secondary_terms, max_terms=5):
             "meaning": meaning,
             "reading": item.get("reading", ""),
             "source_match": item.get("source_match", item.get("matched_candidate", "")),
+            "added_at": float(item.get("added_at", time.time()) or time.time()),
         })
         seen.add(key)
 
@@ -1071,12 +1074,11 @@ def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_t
             if not candidate:
                 continue
 
+            # Source-first key term detection:
+            # Do NOT match glossary terms from English translation.
+            # The English caption can be partial or wrong, and it caused
+            # unrelated key terms like ABS/extrusion to appear.
             if glossary_candidate_matches(candidate, original_text):
-                found = True
-                matched_candidate = candidate
-                break
-
-            if glossary_candidate_matches(candidate, translation_text, is_translation=True):
                 found = True
                 matched_candidate = candidate
                 break
@@ -2883,6 +2885,69 @@ def lookup_reading_for_term(term, provided_reading=""):
     return ""
 
 
+def key_term_supported_by_source(item, source_text):
+    """
+    Final UI guard against hallucinated key terms.
+
+    A key term can be shown when:
+    - its glossary source_match still appears in the Japanese source, or
+    - the displayed Japanese term itself appears in the Japanese source.
+
+    English translation is intentionally NOT used as proof.
+    """
+    source_text = source_text or ""
+
+    if not source_text:
+        return False
+
+    source_match = str(item.get("source_match", item.get("matched_candidate", ""))).strip()
+
+    if source_match and glossary_candidate_matches(source_match, source_text):
+        return True
+
+    term = str(item.get("term", item.get("jp", ""))).strip()
+    meaning = str(item.get("meaning", item.get("en", ""))).strip()
+    line = normalize_key_term_line(term, meaning)
+
+    if not line:
+        return False
+
+    display_term = line.split("=", 1)[0].strip()
+
+    if display_term and glossary_candidate_matches(display_term, source_text):
+        return True
+
+    # If term is Japanese and appears directly after cleanup, keep it.
+    cleaned_term = light_original_cleanup(term)
+
+    if cleaned_term and contains_japanese(cleaned_term) and cleaned_term in source_text:
+        return True
+
+    return False
+
+
+def key_term_display_allowed(item, source_text):
+    """
+    Prevent delete/reappear while still blocking unsupported Groq hallucinations.
+
+    - Glossary terms with source_match get a short hold time, so partial STT
+      changes do not make them blink.
+    - Groq-only terms with no source_match must be supported by the current
+      Japanese source immediately.
+    """
+    source_match = str(item.get("source_match", item.get("matched_candidate", ""))).strip()
+
+    if key_term_supported_by_source(item, source_text):
+        return True
+
+    if source_match:
+        added_at = float(item.get("added_at", 0.0) or 0.0)
+        if time.time() - added_at <= KEY_TERM_HOLD_SECONDS:
+            return True
+
+    return False
+
+
 def format_key_term_line(term, meaning, show_meaning=True, reading=""):
     """
     Display key terms with furigana-like hiragana in parentheses when the
@@ -4504,6 +4569,23 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.pending_visual_reset = False
 
         if original:
+            # If the Japanese source changed a lot but no matching new English
+            # translation has arrived yet, remove the old English caption so the
+            # two boxes do not describe different speech.
+            previous_original = st.session_state.live_original or ""
+            if (
+                previous_original
+                and original != previous_original
+                and previous_original not in original
+                and original not in previous_original
+                and not translation
+            ):
+                st.session_state.live_translation = ""
+                st.session_state.llm_corrected_english_caption = ""
+                st.session_state.llm_corrected_source_text = ""
+                st.session_state.llm_corrections = []
+                st.session_state.correction_status = "waiting_for_english"
+
             st.session_state.live_original = original
             st.session_state.caption_stage = "raw_japanese"
             st.session_state.last_raw_input_time = time.strftime("%H:%M:%S")
@@ -4512,10 +4594,10 @@ while not st.session_state.soniox_result_queue.empty():
                 st.session_state.correction_status = "waiting_for_english"
 
         if translation:
-            st.session_state.live_translation = choose_stable_translation(
-                st.session_state.live_translation,
-                translation,
-            )
+            # Use current Soniox translation directly.
+            # Keeping an older, longer translation made English and Japanese
+            # captions become different conversations.
+            st.session_state.live_translation = translation
             st.session_state.caption_stage = "raw_english"
             st.session_state.last_raw_translation_time = time.strftime("%H:%M:%S")
 
@@ -4632,9 +4714,12 @@ while not st.session_state.llm_result_queue.empty():
         groq_terms = filter_llm_key_terms_for_current_caption(
             item.get("key_terms", []),
             st.session_state.live_original,
-            st.session_state.live_translation,
+            "",  # do not use English translation as proof for Groq key terms
             domain_mode,
         )
+        for term_item in groq_terms:
+            term_item["added_at"] = time.time()
+
         st.session_state.llm_key_terms = merge_key_terms_preserve_order(
             st.session_state.llm_key_terms,
             groq_terms,
@@ -5026,10 +5111,17 @@ if use_llm_hints:
     elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
         llm_terms_text = "No key terms yet."
     elif st.session_state.llm_key_terms:
-        # Terms are already filtered before being stored.
-        # Do not re-filter here, because partial live captions can temporarily
-        # make valid terms disappear from the UI.
-        current_llm_key_terms = st.session_state.llm_key_terms
+        # Final UI guard:
+        # Keep source-matched glossary terms stable for a short time, but block
+        # unsupported Groq hallucinations like ABS immediately.
+        current_llm_key_terms = [
+            item
+            for item in st.session_state.llm_key_terms
+            if key_term_display_allowed(item, display_japanese)
+        ]
+
+        # Also prune the stored list, so old terms do not survive forever.
+        st.session_state.llm_key_terms = current_llm_key_terms
 
         llm_terms_lines = []
 
