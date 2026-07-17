@@ -7,6 +7,7 @@ import threading
 import time
 import asyncio
 import base64
+import logging
 
 import av
 import numpy as np
@@ -22,6 +23,48 @@ from groq import Groq
 # ============================================================
 # Settings
 # ============================================================
+
+# WebRTC/aiortc cleanup noise suppression.
+# Streamlit Cloud can print this after stopping/restarting WebRTC:
+#   AttributeError: 'NoneType' object has no attribute 'sendto'
+#   AttributeError: 'NoneType' object has no attribute 'call_exception_handler'
+# It happens when aioice retries STUN on a datagram transport that has already
+# been closed. It is cleanup noise, not a Soniox/Groq failure.
+logging.getLogger("aioice").setLevel(logging.CRITICAL)
+logging.getLogger("aiortc").setLevel(logging.CRITICAL)
+
+try:
+    from asyncio import selector_events
+
+    if not getattr(selector_events._SelectorDatagramTransport, "_chatgpt_safe_sendto_patch", False):
+        _original_selector_datagram_sendto = selector_events._SelectorDatagramTransport.sendto
+
+        def _safe_selector_datagram_sendto(self, data, addr=None):
+            if getattr(self, "_sock", None) is None or getattr(self, "_loop", None) is None:
+                return None
+
+            try:
+                return _original_selector_datagram_sendto(self, data, addr)
+
+            except AttributeError as exc:
+                msg = str(exc)
+                if (
+                    "NoneType" in msg
+                    and (
+                        "sendto" in msg
+                        or "call_exception_handler" in msg
+                    )
+                ):
+                    return None
+                raise
+
+        selector_events._SelectorDatagramTransport.sendto = _safe_selector_datagram_sendto
+        selector_events._SelectorDatagramTransport._chatgpt_safe_sendto_patch = True
+
+except Exception:
+    pass
+
+
 
 SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"  # unused; kept for compatibility
 DEFAULT_TERMS_FILE = "technical_terms.csv"
@@ -4278,7 +4321,8 @@ if st.session_state.current_engine and st.session_state.current_engine != transl
     st.session_state.pending_start_translation = False
     st.session_state.soniox_running = False
     st.session_state.soniox_stop_event.set()
-    st.session_state.mic_instance_id += 1
+    # Keep the WebRTC component stable. Recreating it repeatedly can leave
+    # old aioice STUN retry timers behind on Streamlit Cloud.
     st.session_state.current_engine = translation_engine
     st.rerun()
 
@@ -4340,7 +4384,9 @@ rtc_configuration = RTCConfiguration(
 st.subheader("Microphone")
 
 webrtc_ctx = webrtc_streamer(
-    key=f"soniox-live-caption-mic-{st.session_state.mic_instance_id}",
+    # Stable key prevents repeated WebRTC peer-connection destruction/recreation.
+    # Use the manual Reset mic connection button below if a hard reset is needed.
+    key="soniox-live-caption-mic-stable",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -4378,6 +4424,25 @@ clear_clicked = st.button(
     use_container_width=True,
 )
 
+reset_mic_clicked = st.button(
+    "Reset Mic Connection",
+    use_container_width=True,
+    help="Use only if the browser mic gets stuck. This refreshes the page and rebuilds the WebRTC connection.",
+)
+
+if reset_mic_clicked:
+    st.session_state.app_active = False
+    st.session_state.pending_start_translation = False
+    st.session_state.soniox_running = False
+    st.session_state.soniox_stop_event.set()
+    st.session_state.soniox_result_queue = queue.Queue()
+    st.session_state.soniox_control_queue = queue.Queue()
+    st.session_state.soniox_thread = None
+    st.session_state.mic_wait_start_time = 0.0
+    st.session_state.mic_wait_notice = ""
+    st.session_state.soniox_error = ""
+    st.rerun()
+
 if toggle_clicked:
     if st.session_state.app_active:
         st.session_state.app_active = False
@@ -4389,7 +4454,7 @@ if toggle_clicked:
         st.session_state.soniox_thread = None
         st.session_state.mic_wait_start_time = 0.0
         st.session_state.mic_wait_notice = ""
-        st.session_state.mic_instance_id += 1
+        # Do not recreate the WebRTC component on every stop.
         st.session_state.ask_latest_capture_active = False
         st.session_state.ask_latest_notice = ""
 
@@ -4796,7 +4861,8 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.soniox_running = False
         st.session_state.app_active = False
         st.session_state.pending_start_translation = False
-        st.session_state.mic_instance_id += 1
+        st.session_state.mic_wait_start_time = 0.0
+        st.session_state.mic_wait_notice = ""
 
     elif item_type == "stopped":
         st.session_state.soniox_running = False
@@ -5299,6 +5365,9 @@ if show_debug:
 
         st.write("Mic wait notice:")
         st.code(str(st.session_state.get("mic_wait_notice", "")))
+
+        st.write("WebRTC key mode:")
+        st.code("stable")
 
         if webrtc_ctx.audio_processor:
             st.write("Mic processor frame count:")
