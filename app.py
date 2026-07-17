@@ -514,61 +514,6 @@ def safe_get_secret_or_env(key):
     return value
 
 
-
-def parse_secret_list(value):
-    """
-    Accept either:
-      - a comma-separated string
-      - a Streamlit secrets list/tuple
-      - one URL string
-    """
-    if not value:
-        return []
-
-    if isinstance(value, (list, tuple)):
-        return [str(item).strip() for item in value if str(item).strip()]
-
-    return [
-        item.strip()
-        for item in str(value).split(",")
-        if item.strip()
-    ]
-
-
-def build_rtc_ice_servers():
-    """
-    Build WebRTC ICE configuration.
-
-    STUN only discovers public addresses. It is not enough for many mobile
-    carrier networks and restrictive NATs. TURN relays audio when a direct
-    WebRTC path cannot be created.
-    """
-    ice_servers = [
-        {
-            "urls": [
-                "stun:stun.l.google.com:19302",
-                "stun:stun1.l.google.com:19302",
-            ]
-        }
-    ]
-
-    turn_urls = parse_secret_list(safe_get_secret_or_env("TURN_URLS"))
-    turn_username = safe_get_secret_or_env("TURN_USERNAME")
-    turn_credential = safe_get_secret_or_env("TURN_CREDENTIAL")
-
-    turn_ready = bool(turn_urls and turn_username and turn_credential)
-
-    if turn_ready:
-        ice_servers.append({
-            "urls": turn_urls,
-            "username": str(turn_username),
-            "credential": str(turn_credential),
-        })
-
-    return ice_servers, turn_ready
-
-
-
 # ============================================================
 # Glossary
 # ============================================================
@@ -4425,25 +4370,23 @@ if use_llm_hints and not groq_api_key:
 # Microphone / WebRTC
 # ============================================================
 
-ice_servers, turn_server_ready = build_rtc_ice_servers()
-
 rtc_configuration = RTCConfiguration(
     {
-        "iceServers": ice_servers,
-        # Prefer all candidate types. TURN relay will be used automatically
-        # when direct STUN connectivity fails.
-        "iceTransportPolicy": "all",
+        "iceServers": [
+            {
+                "urls": [
+                    "stun:stun.l.google.com:19302",
+                    "stun:stun1.l.google.com:19302",
+                    "stun:stun2.l.google.com:19302",
+                    "stun:stun3.l.google.com:19302",
+                    "stun:stun4.l.google.com:19302",
+                ]
+            }
+        ]
     }
 )
 
 st.subheader("Microphone")
-
-if not turn_server_ready:
-    st.warning(
-        "TURN server is not configured. Desktop Wi-Fi may work, but phones, "
-        "mobile data, and restrictive Wi-Fi can fail. Add TURN_URLS, "
-        "TURN_USERNAME, and TURN_CREDENTIAL in Streamlit Secrets."
-    )
 
 webrtc_ctx = webrtc_streamer(
     # Stable key prevents repeated WebRTC peer-connection destruction/recreation.
@@ -4637,14 +4580,14 @@ if (
             st.session_state.mic_wait_start_time = 0.0
             st.session_state.mic_wait_notice = ""
             st.session_state.mobile_mic_failure_message = (
-                "No microphone audio reached the server. Tap Start Translation again. "
-                "If this happens on phones or mobile data, configure a TURN server."
+                "Microphone did not restart after refresh. "
+                "Tap Start Translation once to enable the iPhone microphone."
             )
             st.rerun()
         else:
             st.session_state.mic_wait_notice = (
                 "Waiting for browser microphone audio... "
-                "On a phone, allow mic access and speak once."
+                "On iPhone, allow mic access and speak once."
             )
 
     else:
@@ -5449,12 +5392,6 @@ if show_debug:
 
         st.write("WebRTC mic generation:")
         st.code(str(st.session_state.get("mic_generation", 0)))
-
-        st.write("TURN server configured:")
-        st.code(str(turn_server_ready))
-
-        st.write("ICE servers:")
-        st.code(str(ice_servers))
 
         if webrtc_ctx.audio_processor:
             st.write("Mic processor frame count:")
