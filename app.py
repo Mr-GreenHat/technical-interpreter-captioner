@@ -1,7 +1,7 @@
 import os
 import csv
 import html
-import json
+import jsona
 import queue
 import threading
 import time
@@ -2031,6 +2031,36 @@ def trim_caption_soft(text, max_chars):
 
     return recent.strip()
 
+
+
+def choose_stable_translation(old_translation, new_translation):
+    """
+    Avoid replacing a useful English caption with a much shorter partial
+    translation during live streaming. This does not fix Soniox itself; it
+    only makes the UI less jumpy.
+    """
+    old_translation = (old_translation or "").strip()
+    new_translation = (new_translation or "").strip()
+
+    if not new_translation:
+        return old_translation
+
+    if not old_translation:
+        return new_translation
+
+    # If the new translation is just a short prefix/fragment of the old one,
+    # keep the old one for readability.
+    if (
+        len(new_translation) < max(12, int(len(old_translation) * 0.55))
+        and (
+            old_translation.lower().startswith(new_translation.lower())
+            or new_translation.lower() in old_translation.lower()
+        )
+    ):
+        return old_translation
+
+    return new_translation
+
 def downsample_pcm48_to_pcm16(pcm48_bytes):
     """
     Browser/WebRTC audio is resampled to 48 kHz in AudioProcessor.
@@ -3773,6 +3803,10 @@ def soniox_live_worker(
                     endpoint_detected = True
                     continue
 
+                status = token.get("translation_status")
+                is_final = token.get("is_final", False)
+                is_translation_token = status in ["translation", "translated"]
+
                 token_language = (
                     token.get("language")
                     or token.get("language_code")
@@ -3780,15 +3814,16 @@ def soniox_live_worker(
                     or token.get("source_language")
                 )
 
+                # Important:
+                # Only source/original tokens must pass the Japanese language gate.
+                # Translation tokens are target-language English, so filtering them
+                # as non-Japanese makes the English caption stop early.
                 if (
                     is_japanese_only_source_mode(source_language_mode)
+                    and not is_translation_token
                     and not is_allowed_soniox_language(token_language)
                 ):
                     continue
-
-                status = token.get("translation_status")
-                is_final = token.get("is_final", False)
-                is_translation_token = status in ["translation", "translated"]
 
                 if is_translation_token:
                     if is_final:
@@ -4441,16 +4476,13 @@ while not st.session_state.soniox_result_queue.empty():
             )
             instant_key_terms = detected_terms_to_llm_key_terms(instant_detected_terms)
 
-            existing_filtered_terms = filter_llm_key_terms_for_current_caption(
-                st.session_state.llm_key_terms,
-                original or st.session_state.live_original,
-                translation or st.session_state.live_translation,
-                domain_mode,
-            )
-
+            # Keep key terms stable during the current caption segment.
+            # Live STT partials can temporarily remove words, so re-filtering old
+            # terms on every rerun makes the key-term box delete/reappear.
+            # We clear terms when a new caption segment starts, not on every token.
             st.session_state.llm_key_terms = merge_key_terms_preserve_order(
+                st.session_state.llm_key_terms,
                 instant_key_terms,
-                existing_filtered_terms,
                 max_terms=5,
             )
 
@@ -4480,7 +4512,10 @@ while not st.session_state.soniox_result_queue.empty():
                 st.session_state.correction_status = "waiting_for_english"
 
         if translation:
-            st.session_state.live_translation = translation
+            st.session_state.live_translation = choose_stable_translation(
+                st.session_state.live_translation,
+                translation,
+            )
             st.session_state.caption_stage = "raw_english"
             st.session_state.last_raw_translation_time = time.strftime("%H:%M:%S")
 
@@ -4967,7 +5002,7 @@ if st.session_state.llm_running:
     jp_status_text = "Live Japanese / AI checking..."
     en_status_text = "Live English / AI checking..."
 elif st.session_state.correction_status == "pending" and st.session_state.live_translation:
-    en_status_text = "Live English / AI correction pending"
+    en_status_text = "Live English / still updating"
 
 
 if use_llm_hints:
@@ -4991,12 +5026,10 @@ if use_llm_hints:
     elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
         llm_terms_text = "No key terms yet."
     elif st.session_state.llm_key_terms:
-        current_llm_key_terms = filter_llm_key_terms_for_current_caption(
-            st.session_state.llm_key_terms,
-            display_japanese,
-            display_english,
-            domain_mode,
-        )
+        # Terms are already filtered before being stored.
+        # Do not re-filter here, because partial live captions can temporarily
+        # make valid terms disappear from the UI.
+        current_llm_key_terms = st.session_state.llm_key_terms
 
         llm_terms_lines = []
 
