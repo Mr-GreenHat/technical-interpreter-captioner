@@ -78,20 +78,20 @@ MAX_GROQ_GLOSSARY_TERMS = 4
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
     "High Accuracy": {
-        "interval": 10.0,
-        "min_chars": 60,
+        "interval": 15.0,
+        "min_chars": 50,
         "session_limit": 500,
-        "description": "Fast Groq helper checks. Use for short important demos.",
+        "description": "Fast helper checks. Use for short important demos.",
     },
     "Balanced": {
-        "interval": 20.0,
+        "interval": 25.0,
         "min_chars": 60,
         "session_limit": 300,
         "description": "Recommended default for Soniox + Groq key-term support.",
     },
     "Saver": {
-        "interval": 45.0,
-        "min_chars": 180,
+        "interval": 60.0,
+        "min_chars": 160,
         "session_limit": 120,
         "description": "Safer for longer classes or low Groq quota.",
     },
@@ -406,6 +406,36 @@ EXTRA_GLOSSARY_ENTRIES.extend([
 ])
 
 
+# Extra mechanical drawing / jig terms.
+# These are preprocessing truth terms, not AI suggestions.
+EXTRA_GLOSSARY_ENTRIES.extend([
+    {
+        "domain": "cad",
+        "jp": "治具",
+        "reading": "じぐ",
+        "en": "jig",
+        "common_wrong": "ジグ;時空;時具;地具;事故;spacetime;space-time;space time;jig;fixture",
+        "notes": "Device used to hold/position a workpiece or guide machining/assembly",
+    },
+    {
+        "domain": "cad",
+        "jp": "治具のCAD",
+        "reading": "じぐのきゃど",
+        "en": "jig CAD model",
+        "common_wrong": "時空のCAD;時空CAD;spacetime CAD;space-time CAD;space time CAD;jig CAD",
+        "notes": "CAD model/design of a jig",
+    },
+    {
+        "domain": "cad",
+        "jp": "三面図",
+        "reading": "さんめんず",
+        "en": "three-view drawing / orthographic drawing",
+        "common_wrong": "三面;三面図面;3面図;three-view drawing;three view drawing;orthographic drawing;three views",
+        "notes": "Mechanical drawing showing front/top/side views",
+    },
+])
+
+
 # ============================================================
 # Secrets
 # ============================================================
@@ -685,21 +715,9 @@ def is_term_relevant_to_current_caption(term, meaning, original_text, translatio
         if value.lower() in combined_lower:
             return True
 
-    # Domain-selected allowance for technical terms.
-    domain = (domain_mode or "auto").lower()
-
-    if domain == "cad" and contains_any_text(f"{term}\n{meaning}", CAD_STRONG_CONTEXT_WORDS):
-        return True
-
-    if domain == "product design" and contains_any_text(f"{term}\n{meaning}", CAD_STRONG_CONTEXT_WORDS):
-        return True
-
-    if domain == "automotive" and contains_any_text(f"{term}\n{meaning}", AUTO_STRONG_CONTEXT_WORDS):
-        return True
-
-    if domain in ["school", "school/event", "event"] and is_school_related_term(term, meaning):
-        return True
-
+    # Do not allow terms only because the selected domain is CAD/automotive.
+    # Domain context is background, not proof. This prevents hallucinated
+    # terms like CATIA appearing when the current speech did not mention it.
     return False
 
 
@@ -713,7 +731,12 @@ def filter_llm_key_terms_for_current_caption(key_terms, original_text, translati
         if not term:
             continue
 
-        if not is_term_relevant_to_current_caption(
+        source_match = str(item.get("source_match", item.get("matched_candidate", ""))).strip()
+        combined = f"{original_text or ''}\n{translation_text or ''}"
+
+        if source_match and glossary_candidate_matches(source_match, combined):
+            pass
+        elif not is_term_relevant_to_current_caption(
             term,
             meaning,
             original_text,
@@ -742,16 +765,21 @@ def filter_detected_terms_for_current_caption(detected_terms, original_text, tra
         jp = str(item.get("jp", "")).strip()
         en = str(item.get("en", "")).strip()
 
-        if not is_term_relevant_to_current_caption(
+        matched_candidate = str(item.get("matched_candidate", "")).strip()
+        combined = f"{original_text or ''}\n{translation_text or ''}"
+
+        if matched_candidate and glossary_candidate_matches(matched_candidate, combined):
+            filtered.append(item)
+        elif is_term_relevant_to_current_caption(
             jp,
             en,
             original_text,
             translation_text,
             domain_mode,
         ):
+            filtered.append(item)
+        else:
             continue
-
-        filtered.append(item)
 
         if len(filtered) >= max_terms:
             break
@@ -783,6 +811,7 @@ def detected_terms_to_llm_key_terms(detected_terms, max_terms=5):
         output.append({
             "term": jp,
             "meaning": en,
+            "source_match": item.get("matched_candidate", ""),
         })
         seen.add(key)
 
@@ -816,6 +845,7 @@ def merge_key_terms_preserve_order(primary_terms, secondary_terms, max_terms=5):
         merged.append({
             "term": term,
             "meaning": meaning,
+            "source_match": item.get("source_match", item.get("matched_candidate", "")),
         })
         seen.add(key)
 
@@ -884,32 +914,50 @@ def filter_soniox_context_terms_for_domain(context_terms, translation_terms, dom
 
 
 def make_soniox_important_term_text(domain_mode):
+    """
+    Soniox context should be small and neutral.
+    Do not push unrelated terms too strongly, or STT may hallucinate them.
+    The real key-term truth comes from preprocessing + glossary after STT.
+    """
     domain = (domain_mode or "auto").lower()
 
-    parts = [
-        "TTC means Time To Collision.",
-        "If speech sounds like ABC in AEB context, it is probably TTC.",
-        "慣性補償 means inertia compensation.",
-        "Do not translate 慣性補償 as sensory compensation, completion assurance, or completion compensation.",
-        "CATIA is CAD software. CAD means Computer-Aided Design.",
-        "In CATIA class, Sketcher, dimensional constraint, geometric constraint, Pad, Fillet, Chamfer, Hole, design intent, and manufacturability are important terms.",
-        "ロータリーエンジン means rotary engine. アペックスシール means apex seal. レシプロエンジン means reciprocating engine.",
-    ]
+    if domain == "automotive":
+        parts = [
+            "TTC means Time To Collision.",
+            "AEB means Autonomous Emergency Braking.",
+            "慣性補償 means inertia compensation.",
+            "ロータリーエンジン means rotary engine.",
+            "アペックスシール means apex seal.",
+        ]
 
-    if domain in ["school", "school/event", "event"]:
-        parts.extend([
+    elif domain in ["cad", "product design"]:
+        parts = [
+            "CAD means Computer-Aided Design.",
+            "治具 means jig.",
+            "三面図 means three-view drawing.",
+            "寸法拘束 means dimensional constraint.",
+            "幾何拘束 means geometric constraint.",
+            "面取り means chamfering.",
+            "三角形 means triangle.",
+        ]
+
+    elif domain in ["school", "school/event", "event"]:
+        parts = [
             "サマーコース means Summer Course.",
-            "ビヌス means BINUS. ビヌスASO means BINUS ASO.",
             "ビヌス大学 means BINUS University.",
             "ARE means Automotive and Robotics Engineering.",
             "PDE means Product Design Engineering.",
             "BE means Business Engineering.",
-            "If speech sounds like AROI or ARO in the BINUS ASO major context, it is probably ARE.",
-            "If speech sounds like PDA or ADC in the BINUS ASO major context, it is probably PDE.",
-            "If Japanese sounds like ネウス大学, ビーナス大学, or ビナス大学, it is probably ビヌス大学 / BINUS University.",
-        ])
+        ]
+
+    else:
+        parts = [
+            "Japanese technical classroom interpretation.",
+            "Only Japanese speech should be transcribed and translated.",
+        ]
 
     return " ".join(parts)
+
 
 
 def make_groq_correction_hints(domain_mode, context_text, current_translation):
@@ -930,8 +978,9 @@ def make_groq_correction_hints(domain_mode, context_text, current_translation):
 
     if domain in ["cad", "product design"] or contains_any_text(combined, CAD_STRONG_CONTEXT_WORDS):
         hints.extend([
-            "- CATIA = CATIA. CAD = Computer-Aided Design.",
-            "- In CAD context, 勝ち方 / 書き方 / way to win can mean CATIA, but only if the sentence is about CAD/CATIA.",
+            "- CAD = Computer-Aided Design.",
+            "- 治具 = jig; 三面図 = three-view drawing.",
+            "- CATIA should only be used if CATIA/キャティア/カティア is actually supported by the current text.",
             "- スケッチャー = Sketcher; 寸法拘束 = dimensional constraint; 幾何拘束 = geometric constraint.",
         ])
 
@@ -950,6 +999,34 @@ def make_groq_correction_hints(domain_mode, context_text, current_translation):
         ])
 
     return "\n".join(hints)
+
+
+def glossary_candidate_matches(candidate, text, is_translation=False):
+    """
+    Preprocessing matcher.
+
+    It prevents false matches like:
+        BE inside "because"
+        CAD inside a random longer word
+
+    Japanese candidates are matched by substring because Japanese has no spaces.
+    """
+    candidate = (candidate or "").strip()
+    text = text or ""
+
+    if not candidate:
+        return False
+
+    if all(ord(ch) < 128 for ch in candidate):
+        import re
+
+        if len(candidate) <= 4:
+            pattern = r"(?<![A-Za-z0-9])" + re.escape(candidate) + r"(?![A-Za-z0-9])"
+            return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+        return candidate.lower() in text.lower()
+
+    return candidate in text
 
 
 def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_terms=8):
@@ -977,17 +1054,20 @@ def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_t
             ])
 
         found = False
+        matched_candidate = ""
 
         for candidate in candidates:
             if not candidate:
                 continue
 
-            if candidate in original_text:
+            if glossary_candidate_matches(candidate, original_text):
                 found = True
+                matched_candidate = candidate
                 break
 
-            if candidate.lower() in translation_lower:
+            if glossary_candidate_matches(candidate, translation_text, is_translation=True):
                 found = True
+                matched_candidate = candidate
                 break
 
         if found:
@@ -995,7 +1075,24 @@ def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_t
                 "jp": jp,
                 "en": en,
                 "notes": notes,
+                "matched_candidate": matched_candidate,
             })
+
+    def key_term_priority(item):
+        jp = item.get("jp", "")
+        priority = {
+            "治具のCAD": 0,
+            "治具": 1,
+            "三面図": 2,
+            "寸法拘束": 3,
+            "幾何拘束": 4,
+            "三角形": 5,
+            "CATIA": 8,
+            "CAD": 9,
+        }
+        return priority.get(jp, 5)
+
+    matched_terms = sorted(matched_terms, key=key_term_priority)
 
     unique_terms = []
     seen = set()
@@ -1056,6 +1153,165 @@ def is_japanese_text(text):
             return True
 
     return False
+
+
+JAPANESE_FILLER_WORDS = [
+    "えー", "ええ", "えっと", "えーっと", "あの", "あのー", "その",
+    "まあ", "うん", "はい", "はいはい", "じゃあ", "そうですね",
+    "そうね", "なんか", "ちょっと", "ですね", "です",
+]
+
+
+def japanese_char_ratio(text):
+    text = (text or "").strip()
+
+    if not text:
+        return 0.0
+
+    useful_chars = [
+        ch for ch in text
+        if not ch.isspace() and ch not in ["。", "、", "？", "?", "！", "!", ".", ",", "…", "・"]
+    ]
+
+    if not useful_chars:
+        return 0.0
+
+    jp_count = 0
+
+    for ch in useful_chars:
+        cp = ord(ch)
+        if (
+            0x3040 <= cp <= 0x309F
+            or 0x30A0 <= cp <= 0x30FF
+            or 0x4E00 <= cp <= 0x9FFF
+        ):
+            jp_count += 1
+
+    return jp_count / max(1, len(useful_chars))
+
+
+def normalize_for_filler_check(text):
+    text = (text or "").strip()
+
+    for mark in ["。", "、", "？", "?", "！", "!", ".", ",", "…", "・", " "]:
+        text = text.replace(mark, "")
+
+    return text.strip()
+
+
+def strip_leading_japanese_fillers(text):
+    """
+    Remove leading filler only. Do not delete content inside normal sentences.
+    """
+    text = (text or "").strip()
+    changed = True
+
+    while changed:
+        changed = False
+
+        for filler in JAPANESE_FILLER_WORDS:
+            for prefix in [filler + "、", filler + "。", filler + " ", filler]:
+                if text.startswith(prefix) and len(text) > len(prefix):
+                    text = text[len(prefix):].strip()
+                    changed = True
+
+    return text.strip()
+
+
+def is_filler_only_japanese(text):
+    text = normalize_for_filler_check(text)
+
+    if not text:
+        return True
+
+    if not is_japanese_text(text):
+        return False
+
+    temp = text
+
+    for filler in sorted(JAPANESE_FILLER_WORDS, key=len, reverse=True):
+        temp = temp.replace(filler, "")
+
+    return temp.strip() == ""
+
+
+def is_filler_only_english(text):
+    text = (text or "").strip().lower()
+
+    for mark in [".", ",", "?", "!", "…"]:
+        text = text.replace(mark, " ")
+
+    words = [word for word in text.split() if word]
+
+    if not words:
+        return True
+
+    filler_words = {
+        "um", "uh", "er", "ah", "yeah", "yes", "okay", "ok",
+        "well", "so", "like", "you", "know", "right", "hmm"
+    }
+
+    return all(word in filler_words for word in words)
+
+
+def should_skip_as_filler(original, translation):
+    original = (original or "").strip()
+    translation = (translation or "").strip()
+
+    if original and is_filler_only_japanese(original):
+        return True
+
+    if not original and translation and is_filler_only_english(translation):
+        return True
+
+    return False
+
+
+def is_allowed_soniox_language(language_value):
+    """
+    If Soniox token language metadata exists, only accept Japanese.
+    If metadata is absent, return True and let the text gates decide.
+    """
+    language_value = str(language_value or "").strip().lower()
+
+    if not language_value:
+        return True
+
+    return language_value.startswith("ja") or language_value in ["jpn", "japanese"]
+
+
+def looks_like_valid_japanese_for_display(text):
+    """
+    Text gate before display/Groq.
+
+    This cannot perfectly detect the original spoken language, but it blocks:
+    - English/Indonesian text with no Japanese script
+    - filler-only Japanese
+    - tiny vague Japanese fragments that are not glossary terms
+    """
+    text = (text or "").strip()
+
+    if not text:
+        return False
+
+    if not is_japanese_text(text):
+        return False
+
+    if is_filler_only_japanese(text):
+        return False
+
+    # If Japanese ratio is very low, it is probably mostly English/noise.
+    # Japanese sentence with acronyms like CAD still passes because ratio is usually > 0.15.
+    if japanese_char_ratio(text) < 0.15:
+        return False
+
+    vague = normalize_for_filler_check(text)
+
+    if vague in {"それ", "これ", "あれ", "どれ", "ここ", "そこ", "あそこ", "です", "ます", "した", "する"}:
+        return False
+
+    return True
+
 
 
 def light_caption_cleanup(text):
@@ -1157,9 +1413,6 @@ def light_caption_cleanup(text):
         "CADIA": "CATIA",
         "Catiya": "CATIA",
         "CADIA": "CATIA",
-        "the way to win": "CATIA",
-        "way to win": "CATIA",
-        "how to win": "CATIA",
         "Computer Aided Design": "CAD",
         "computer aided design": "CAD",
         "Computer-Aided Design": "CAD",
@@ -1176,6 +1429,14 @@ def light_caption_cleanup(text):
         "chamfering": "chamfering",
         "Chamfering": "chamfering",
         "manufacturing feasibility": "manufacturability",
+        "spacetime CAD": "jig CAD",
+        "space-time CAD": "jig CAD",
+        "space time CAD": "jig CAD",
+        "spacetime": "jig",
+        "space-time": "jig",
+        "space time": "jig",
+        "three-view drawing": "three-view drawing",
+        "orthographic drawing": "orthographic drawing",
 
         # Rotary engine terms
         "Rotary Engine": "rotary engine",
@@ -1361,6 +1622,16 @@ def light_original_cleanup(text):
         "加工製": "加工性",
         "加工生": "加工性",
 
+        # Jig / mechanical drawing terms
+        "時空のCAD": "治具のCAD",
+        "時空CAD": "治具CAD",
+        "時空": "治具",
+        "時具": "治具",
+        "地具": "治具",
+        "ジグ": "治具",
+        "三面図面": "三面図",
+        "3面図": "三面図",
+
         # Rotary engine terms
         "Rotary Engine": "ロータリーエンジン",
         "rotary engine": "ロータリーエンジン",
@@ -1437,6 +1708,11 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
         "形状",
         "モデル",
         "モデリング",
+        "治具",
+        "ジグ",
+        "三面図",
+        "図面",
+        "製図",
     ]
 
     is_cad_domain = domain in ["auto", "cad", "product design"]
@@ -1444,9 +1720,12 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
 
     if is_cad_domain and has_cad_context:
         original_replacements = {
-            "勝ち方": "CATIA",
-            "書き方": "CATIA",
-            "キャリア": "CATIA",
+            "時空のCAD": "治具のCAD",
+            "時空CAD": "治具CAD",
+            "時空": "治具",
+            "時具": "治具",
+            "地具": "治具",
+            "ジグ": "治具",
             "カチア": "CATIA",
             "勝ティア": "CATIA",
             "勝ちア": "CATIA",
@@ -1457,15 +1736,12 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
         }
 
         translation_replacements = {
-            "the way to win": "CATIA",
-            "way to win": "CATIA",
-            "how to win": "CATIA",
-            "winning method": "CATIA",
-            "So, the way to win": "So, in CATIA",
-            "So the way to win": "So in CATIA",
-            "the winning method": "CATIA",
-            "career": "CATIA",
-            "Carrier": "CATIA",
+            "spacetime CAD": "jig CAD",
+            "space-time CAD": "jig CAD",
+            "space time CAD": "jig CAD",
+            "spacetime": "jig",
+            "space-time": "jig",
+            "space time": "jig",
         }
 
         for wrong, correct in original_replacements.items():
@@ -1579,9 +1855,6 @@ def normalize_key_term_line(term, meaning):
         "be": ("BE", "Business Engineering"),
 
         "catia": ("CATIA", "CATIA"),
-        "way to win": ("CATIA", "CATIA"),
-        "how to win": ("CATIA", "CATIA"),
-        "career": ("CATIA", "CATIA"),
         "cad": ("CAD", "Computer-Aided Design"),
         "computer aided design": ("CAD", "Computer-Aided Design"),
         "computer-aided design": ("CAD", "Computer-Aided Design"),
@@ -1597,6 +1870,19 @@ def normalize_key_term_line(term, meaning):
         "chamfering": ("面取り", "chamfering"),
         "design intent": ("設計意図", "design intent"),
         "manufacturability": ("加工性", "manufacturability"),
+        "jig": ("治具", "jig"),
+        "fixture": ("治具", "jig / fixture"),
+        "spacetime": ("治具", "jig"),
+        "space-time": ("治具", "jig"),
+        "space time": ("治具", "jig"),
+        "jig cad": ("治具のCAD", "jig CAD model"),
+        "spacetime cad": ("治具のCAD", "jig CAD model"),
+        "space-time cad": ("治具のCAD", "jig CAD model"),
+        "space time cad": ("治具のCAD", "jig CAD model"),
+        "three-view drawing": ("三面図", "three-view drawing / orthographic drawing"),
+        "three view drawing": ("三面図", "three-view drawing / orthographic drawing"),
+        "orthographic drawing": ("三面図", "three-view drawing / orthographic drawing"),
+        "three views": ("三面図", "three-view drawing / orthographic drawing"),
         "triangle": ("三角形", "triangle"),
         "triangular shape": ("三角形", "triangle"),
         "rectangle": ("長方形", "rectangle"),
@@ -2919,10 +3205,12 @@ Also fix caption text only when the correction is obvious.
 
 Rules:
 - Output max 4 key_terms.
-- First use Matched glossary if available.
+- Preprocessing/glossary is the source of truth. Prefer Matched glossary.
 - If no glossary match, you may infer a simple key term ONLY when the Japanese source clearly contains it.
-  Example: 三角形 = triangle.
+  Example: 三角形 = triangle, 時空のCAD/spacetime CAD = 治具のCAD/jig CAD, 三面図 = three-view drawing.
 - Do not output unrelated key terms.
+- Do not output CATIA, CAD, TTC, AEB, BINUS, BE, PDE, ARE, etc. unless they are in the current Japanese source or Matched glossary.
+- Context/domain is background only, not evidence.
 - Do not invent facts.
 - If no key term, key_terms = [].
 - Keep corrected captions close to Soniox text.
@@ -3080,11 +3368,11 @@ def soniox_live_worker(
 
         if domain_mode == "auto":
             domain_text = (
-                "Japanese automotive engineering, CAD, product design, vehicle systems, "
+                "Advanced Japanese-only technical classroom interpretation. "
+                "Possible topics: automotive engineering, CAD, product design, vehicle systems, "
                 "braking systems, vehicle control, TTC, Time To Collision, AEB, "
-                "inertia compensation, classroom interpretation, technical terms, "
-                "CATIA, CAD, Sketcher, dimensional constraint, "
-                "geometric constraint, Pad, Fillet, Chamfer, rotary engine, apex seal"
+                "inertia compensation, jig, mechanical drawing, three-view drawing, "
+                "dimensional constraint, geometric constraint, Pad, Fillet, Chamfer, rotary engine, apex seal"
             )
 
         elif domain_mode == "automotive":
@@ -3096,14 +3384,15 @@ def soniox_live_worker(
 
         elif domain_mode == "cad":
             domain_text = (
-                "Japanese CAD class, CATIA, CAD, Sketcher, sketch constraints, dimensional constraints, "
+                "Advanced Japanese-only CAD/mechanical drawing class. "
+                "CAD, jig, fixture, three-view drawing, mechanical drawing, sketch constraints, dimensional constraints, "
                 "geometric constraints, fully constrained sketch, degrees of freedom, Pad, extrusion, "
-                "Hole, fillet, chamfering, technical drawing, projection drawing, product modeling"
+                "Hole, fillet, chamfering, projection drawing, product modeling"
             )
 
         elif domain_mode == "product design":
             domain_text = (
-                "Japanese product design class, CATIA, CAD modeling, design process, design intent, "
+                "Japanese product design class, CAD modeling, design process, design intent, "
                 "dimensions, materials, usability, strength, manufacturability, cost, product development, prototyping"
             )
 
@@ -3124,7 +3413,7 @@ def soniox_live_worker(
             "sample_rate": 48000,
             "num_channels": 1,
             "language_hints": ["ja"],
-            "enable_language_identification": False,
+            "enable_language_identification": True,
             "enable_endpoint_detection": True,
             "max_endpoint_delay_ms": 800,
             "context": {
@@ -3140,8 +3429,8 @@ def soniox_live_worker(
                     {
                         "key": "task",
                         "value": (
-                            "Translate Japanese technical classroom speech "
-                            "into clear English subtitles for an interpreter."
+                            "Advanced Japanese-only mode. Translate only Japanese technical classroom speech "
+                            "into clear English subtitles for an interpreter. If speech is English, Indonesian, or not Japanese, ignore it."
                         ),
                     },
                     {
@@ -3313,6 +3602,16 @@ def soniox_live_worker(
                     endpoint_detected = True
                     continue
 
+                token_language = (
+                    token.get("language")
+                    or token.get("language_code")
+                    or token.get("detected_language")
+                    or token.get("source_language")
+                )
+
+                if not is_allowed_soniox_language(token_language):
+                    continue
+
                 status = token.get("translation_status")
                 is_final = token.get("is_final", False)
                 is_translation_token = status in ["translation", "translated"]
@@ -3329,10 +3628,14 @@ def soniox_live_worker(
                         non_final_original += text
 
             current_original = (final_original + non_final_original).strip()
+            current_original = strip_leading_japanese_fillers(current_original)
             current_original = light_original_cleanup(current_original)
 
             current_translation = (final_translation + non_final_translation).strip()
             current_translation = light_caption_cleanup(current_translation)
+
+            if should_skip_as_filler(current_original, current_translation):
+                continue
 
             if current_original or current_translation:
                 result_queue.put({
@@ -3894,17 +4197,28 @@ while not st.session_state.soniox_result_queue.empty():
             domain_mode,
         )
 
+        # Filler guard:
+        # Do not display filler-only Japanese like えー、あの、うん.
+        original = strip_leading_japanese_fillers(original)
+
+        if should_skip_as_filler(original, translation):
+            st.session_state.debug_messages.append(
+                f"Ignored filler-only speech: {original[:80] or translation[:80]}"
+            )
+            st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            continue
+
         # Japanese-only guard:
         # Do not display or translate Indonesian/English/other-language speech.
         if JAPANESE_ONLY_MODE:
-            if original and not is_japanese_text(original):
+            if original and not looks_like_valid_japanese_for_display(original):
                 st.session_state.debug_messages.append(
-                    f"Ignored non-Japanese Soniox text: {original[:80]}"
+                    f"Ignored non-Japanese or low-quality Soniox text: {original[:80]}"
                 )
                 st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
                 continue
 
-            if translation and not original and not is_japanese_text(st.session_state.live_original):
+            if translation and not original and not looks_like_valid_japanese_for_display(st.session_state.live_original):
                 st.session_state.debug_messages.append(
                     f"Ignored translation without Japanese source: {translation[:80]}"
                 )
