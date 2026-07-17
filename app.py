@@ -820,6 +820,7 @@ def detected_terms_to_llm_key_terms(detected_terms, max_terms=5):
         output.append({
             "term": jp,
             "meaning": en,
+            "reading": item.get("reading", ""),
             "source_match": item.get("matched_candidate", ""),
         })
         seen.add(key)
@@ -854,6 +855,7 @@ def merge_key_terms_preserve_order(primary_terms, secondary_terms, max_terms=5):
         merged.append({
             "term": term,
             "meaning": meaning,
+            "reading": item.get("reading", ""),
             "source_match": item.get("source_match", item.get("matched_candidate", "")),
         })
         seen.add(key)
@@ -1083,6 +1085,7 @@ def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_t
             matched_terms.append({
                 "jp": jp,
                 "en": en,
+                "reading": reading,
                 "notes": notes,
                 "matched_candidate": matched_candidate,
             })
@@ -1164,10 +1167,18 @@ def is_japanese_text(text):
     return False
 
 
+# Only real hesitation fillers.
+# Do NOT include useful conversational words like はい, うん, そうですね,
+# まあ, ちょっと, です. Those may carry meaning and should stay.
 JAPANESE_FILLER_WORDS = [
-    "えー", "ええ", "えっと", "えーっと", "あの", "あのー", "その",
-    "まあ", "うん", "はい", "はいはい", "じゃあ", "そうですね",
-    "そうね", "なんか", "ちょっと", "ですね", "です",
+    "えー",
+    "ええ",
+    "えっと",
+    "えーっと",
+    "えーと",
+    "あの",
+    "あのー",
+    "あのう",
 ]
 
 
@@ -2803,13 +2814,80 @@ def shorten_error_for_ui(message, max_chars=180):
     return message[:max_chars] + " ..."
 
 
-def format_key_term_line(term, meaning, show_meaning=True):
+def contains_kanji(text):
+    for ch in text or "":
+        cp = ord(ch)
+        if 0x4E00 <= cp <= 0x9FFF:
+            return True
+    return False
+
+
+def lookup_reading_for_term(term, provided_reading=""):
+    """
+    Use the glossary reading when displaying kanji key terms.
+    Example:
+        三面図 -> さんめんず
+        治具 -> じぐ
+    """
+    term = (term or "").strip()
+    provided_reading = (provided_reading or "").strip()
+
+    if provided_reading:
+        return provided_reading
+
+    if not term:
+        return ""
+
+    try:
+        entries = load_glossary_entries(DEFAULT_TERMS_FILE)
+    except Exception:
+        entries = []
+
+    for row in entries:
+        jp = str(row.get("jp", "")).strip()
+        reading = str(row.get("reading", "")).strip()
+
+        if jp == term and reading:
+            return reading
+
+    return ""
+
+
+def format_key_term_line(term, meaning, show_meaning=True, reading=""):
+    """
+    Display key terms with furigana-like hiragana in parentheses when the
+    source term contains kanji.
+
+    Example:
+        三面図 (さんめんず)： three-view drawing / orthographic drawing
+        治具 (じぐ)： jig
+        CAD = Computer-Aided Design
+    """
     line = normalize_key_term_line(term, meaning)
+
     if not line:
         return ""
-    if not show_meaning and "=" in line:
-        return line.split("=", 1)[0].strip()
-    return line
+
+    if "=" in line:
+        display_term, display_meaning = [part.strip() for part in line.split("=", 1)]
+    else:
+        display_term = line.strip()
+        display_meaning = ""
+
+    display_reading = lookup_reading_for_term(display_term, reading)
+
+    if display_reading and contains_kanji(display_term):
+        display_term = f"{display_term} ({display_reading})"
+
+    if not show_meaning:
+        return display_term
+
+    if display_meaning:
+        if display_reading and contains_kanji(line.split("=", 1)[0].strip()):
+            return f"{display_term}： {display_meaning}"
+        return f"{display_term} = {display_meaning}"
+
+    return display_term
 
 
 ASK_ALLOWED_ACRONYMS = {
@@ -3893,7 +3971,7 @@ with st.sidebar:
     llm_budget_mode = st.selectbox(
         "AI helper budget mode",
         list(LLM_BUDGET_MODES.keys()),
-        index=1,
+        index=0,
     )
 
     selected_budget = LLM_BUDGET_MODES[llm_budget_mode]
@@ -4925,11 +5003,12 @@ if use_llm_hints:
         for item in current_llm_key_terms[:8]:
             term = str(item.get("term", "")).strip()
             meaning = str(item.get("meaning", "")).strip()
+            reading = str(item.get("reading", "")).strip()
 
             term = apply_llm_corrections(term, st.session_state.llm_corrections)
             meaning = apply_llm_corrections(meaning, st.session_state.llm_corrections)
 
-            line = format_key_term_line(term, meaning, show_term_meaning)
+            line = format_key_term_line(term, meaning, show_term_meaning, reading)
 
             if line and line not in llm_terms_lines:
                 llm_terms_lines.append(line)
