@@ -82,6 +82,9 @@ KEY_TERM_HOLD_SECONDS = 10.0
 SONIOX_SILENCE_KEEPALIVE_SECONDS = 0.25
 SONIOX_SILENCE_KEEPALIVE_BYTES = b"\x00\x00" * 4800  # 100 ms at 48 kHz mono s16le
 
+# iPhone/Safari needs a new user tap after refresh before microphone capture.
+MOBILE_MIC_START_TIMEOUT_SECONDS = 8.0
+
 # Japanese-only safety:
 # Ignore accidental Spanish/English/other-language recognition.
 JAPANESE_ONLY_MODE = True
@@ -509,6 +512,61 @@ def safe_get_secret_or_env(key):
         value = os.getenv(key)
 
     return value
+
+
+
+def parse_secret_list(value):
+    """
+    Accept either:
+      - a comma-separated string
+      - a Streamlit secrets list/tuple
+      - one URL string
+    """
+    if not value:
+        return []
+
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    return [
+        item.strip()
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+
+
+def build_rtc_ice_servers():
+    """
+    Build WebRTC ICE configuration.
+
+    STUN only discovers public addresses. It is not enough for many mobile
+    carrier networks and restrictive NATs. TURN relays audio when a direct
+    WebRTC path cannot be created.
+    """
+    ice_servers = [
+        {
+            "urls": [
+                "stun:stun.l.google.com:19302",
+                "stun:stun1.l.google.com:19302",
+            ]
+        }
+    ]
+
+    turn_urls = parse_secret_list(safe_get_secret_or_env("TURN_URLS"))
+    turn_username = safe_get_secret_or_env("TURN_USERNAME")
+    turn_credential = safe_get_secret_or_env("TURN_CREDENTIAL")
+
+    turn_ready = bool(turn_urls and turn_username and turn_credential)
+
+    if turn_ready:
+        ice_servers.append({
+            "urls": turn_urls,
+            "username": str(turn_username),
+            "credential": str(turn_credential),
+        })
+
+    return ice_servers, turn_ready
+
 
 
 # ============================================================
@@ -4247,6 +4305,8 @@ defaults = {
     "app_active": False,
     "pending_start_translation": False,
     "mic_instance_id": 0,
+    "mic_generation": 0,
+    "mobile_mic_failure_message": "",
     "current_engine": "",
 
     "live_original": "",
@@ -4365,28 +4425,30 @@ if use_llm_hints and not groq_api_key:
 # Microphone / WebRTC
 # ============================================================
 
+ice_servers, turn_server_ready = build_rtc_ice_servers()
+
 rtc_configuration = RTCConfiguration(
     {
-        "iceServers": [
-            {
-                "urls": [
-                    "stun:stun.l.google.com:19302",
-                    "stun:stun1.l.google.com:19302",
-                    "stun:stun2.l.google.com:19302",
-                    "stun:stun3.l.google.com:19302",
-                    "stun:stun4.l.google.com:19302",
-                ]
-            }
-        ]
+        "iceServers": ice_servers,
+        # Prefer all candidate types. TURN relay will be used automatically
+        # when direct STUN connectivity fails.
+        "iceTransportPolicy": "all",
     }
 )
 
 st.subheader("Microphone")
 
+if not turn_server_ready:
+    st.warning(
+        "TURN server is not configured. Desktop Wi-Fi may work, but phones, "
+        "mobile data, and restrictive Wi-Fi can fail. Add TURN_URLS, "
+        "TURN_USERNAME, and TURN_CREDENTIAL in Streamlit Secrets."
+    )
+
 webrtc_ctx = webrtc_streamer(
     # Stable key prevents repeated WebRTC peer-connection destruction/recreation.
     # Use the manual Reset mic connection button below if a hard reset is needed.
-    key="soniox-live-caption-mic-stable",
+    key=f"soniox-live-caption-mic-{st.session_state.mic_generation}",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -4434,6 +4496,10 @@ if reset_mic_clicked:
     st.session_state.app_active = False
     st.session_state.pending_start_translation = False
     st.session_state.soniox_running = False
+    st.session_state.mic_generation += 1
+    st.session_state.mobile_mic_failure_message = (
+        "Mic connection reset. Tap Start Translation to enable the microphone again."
+    )
     st.session_state.soniox_stop_event.set()
     st.session_state.soniox_result_queue = queue.Queue()
     st.session_state.soniox_control_queue = queue.Queue()
@@ -4468,6 +4534,7 @@ if toggle_clicked:
         st.session_state.app_active = True
         st.session_state.pending_start_translation = True
         st.session_state.soniox_error = ""
+        st.session_state.mobile_mic_failure_message = ""
         st.session_state.mic_wait_start_time = time.time()
         st.session_state.mic_wait_notice = "Waiting for browser microphone audio..."
 
@@ -4558,15 +4625,26 @@ if (
     waited = time.time() - wait_started if wait_started else 0.0
 
     if mic_frame_count <= 0:
-        if waited > 8.0:
-            st.session_state.mic_wait_notice = (
-                "Still waiting for mic audio. Check browser mic permission, "
-                "then press Stop Translation and Start Translation again."
+        if waited > MOBILE_MIC_START_TIMEOUT_SECONDS:
+            # iOS Safari does not automatically restart microphone capture
+            # after refresh. Return to stopped state so the next Start button
+            # press is a real user gesture and rebuild the WebRTC component.
+            st.session_state.app_active = False
+            st.session_state.pending_start_translation = False
+            st.session_state.soniox_running = False
+            st.session_state.soniox_stop_event.set()
+            st.session_state.mic_generation += 1
+            st.session_state.mic_wait_start_time = 0.0
+            st.session_state.mic_wait_notice = ""
+            st.session_state.mobile_mic_failure_message = (
+                "No microphone audio reached the server. Tap Start Translation again. "
+                "If this happens on phones or mobile data, configure a TURN server."
             )
+            st.rerun()
         else:
             st.session_state.mic_wait_notice = (
                 "Waiting for browser microphone audio... "
-                "Allow mic permission and speak once."
+                "On a phone, allow mic access and speak once."
             )
 
     else:
@@ -5088,6 +5166,9 @@ if use_llm_hints:
 # Status
 # ============================================================
 
+if st.session_state.mobile_mic_failure_message:
+    st.warning(st.session_state.mobile_mic_failure_message)
+
 if st.session_state.soniox_running:
     st.success("Soniox STT/translation running.")
 elif st.session_state.app_active:
@@ -5366,8 +5447,14 @@ if show_debug:
         st.write("Mic wait notice:")
         st.code(str(st.session_state.get("mic_wait_notice", "")))
 
-        st.write("WebRTC key mode:")
-        st.code("stable")
+        st.write("WebRTC mic generation:")
+        st.code(str(st.session_state.get("mic_generation", 0)))
+
+        st.write("TURN server configured:")
+        st.code(str(turn_server_ready))
+
+        st.write("ICE servers:")
+        st.code(str(ice_servers))
 
         if webrtc_ctx.audio_processor:
             st.write("Mic processor frame count:")
