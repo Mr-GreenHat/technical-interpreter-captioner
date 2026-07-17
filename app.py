@@ -3562,6 +3562,9 @@ class AudioProcessor:
             layout="mono",
             rate=48000,
         )
+        self.frame_count = 0
+        self.last_audio_time = 0.0
+        self.last_audio_level = 0.0
 
     def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
         try:
@@ -3575,6 +3578,14 @@ class AudioProcessor:
 
                 pcm16 = audio.astype(np.int16)
                 self.audio_queue.put(pcm16.tobytes())
+
+                self.frame_count += 1
+                self.last_audio_time = time.time()
+
+                try:
+                    self.last_audio_level = float(np.abs(pcm16).mean())
+                except Exception:
+                    self.last_audio_level = 0.0
 
         except Exception:
             pass
@@ -4205,6 +4216,8 @@ defaults = {
     "soniox_stop_event": threading.Event(),
     "soniox_thread": None,
     "debug_messages": [],
+    "mic_wait_start_time": 0.0,
+    "mic_wait_notice": "",
     "last_update_time": "",
     "last_reset_seconds": DEFAULT_RESET_SECONDS,
     "pending_visual_reset": False,
@@ -4374,6 +4387,8 @@ if toggle_clicked:
         st.session_state.soniox_result_queue = queue.Queue()
         st.session_state.soniox_control_queue = queue.Queue()
         st.session_state.soniox_thread = None
+        st.session_state.mic_wait_start_time = 0.0
+        st.session_state.mic_wait_notice = ""
         st.session_state.mic_instance_id += 1
         st.session_state.ask_latest_capture_active = False
         st.session_state.ask_latest_notice = ""
@@ -4388,10 +4403,14 @@ if toggle_clicked:
         st.session_state.app_active = True
         st.session_state.pending_start_translation = True
         st.session_state.soniox_error = ""
+        st.session_state.mic_wait_start_time = time.time()
+        st.session_state.mic_wait_notice = "Waiting for browser microphone audio..."
 
         st.rerun()
 
 if clear_clicked:
+    st.session_state.mic_wait_start_time = 0.0
+    st.session_state.mic_wait_notice = ""
     st.session_state.live_original = ""
     st.session_state.live_translation = ""
     st.session_state.caption_history = []
@@ -4458,7 +4477,7 @@ if clear_clicked:
 
 
 # ============================================================
-# Auto-start Soniox after WebRTC mic is ready
+# Auto-start Soniox after WebRTC mic is actually sending audio
 # ============================================================
 
 if (
@@ -4467,75 +4486,99 @@ if (
     and not st.session_state.soniox_running
     and webrtc_ctx.audio_processor
 ):
-    st.session_state.soniox_stop_event = threading.Event()
-    st.session_state.soniox_result_queue = queue.Queue()
-    st.session_state.soniox_control_queue = queue.Queue()
-    st.session_state.soniox_error = ""
-    st.session_state.debug_messages = []
-    st.session_state.live_original = ""
-    st.session_state.live_translation = ""
-    st.session_state.caption_history = []
-    st.session_state.last_update_time = ""
-    st.session_state.pending_visual_reset = False
-    st.session_state.caption_stage = "idle"
-    st.session_state.last_raw_input_time = ""
-    st.session_state.last_raw_translation_time = ""
-    st.session_state.last_helper_fix_time = ""
-    st.session_state.last_ai_check_time = ""
-    st.session_state.correction_status = "idle"
-    st.session_state.live_token_version = 0
-    st.session_state.last_llm_checked_token_version = -1
-    st.session_state.llm_calls_this_session = 0
-    st.session_state.llm_budget_reached = False
+    processor_probe = webrtc_ctx.audio_processor
+    mic_frame_count = int(getattr(processor_probe, "frame_count", 0) or 0)
+    mic_level = float(getattr(processor_probe, "last_audio_level", 0.0) or 0.0)
+    wait_started = float(st.session_state.get("mic_wait_start_time", 0.0) or 0.0)
+    waited = time.time() - wait_started if wait_started else 0.0
 
-    st.session_state.llm_context_chunks = []
-    st.session_state.llm_main_idea = ""
-    st.session_state.llm_say_it_simply = ""
-    st.session_state.llm_corrected_japanese_original = ""
-    st.session_state.llm_corrected_english_caption = ""
-    st.session_state.llm_corrected_source_text = ""
-    st.session_state.llm_is_unclear = False
-    st.session_state.llm_unclear_reason = ""
-    st.session_state.llm_key_terms = []
-    st.session_state.llm_corrections = []
-    st.session_state.llm_error = ""
-    st.session_state.llm_last_source_text = ""
-    st.session_state.llm_last_call_time = 0.0
-    st.session_state.llm_cooldown_until = 0.0
-    st.session_state.llm_last_finish_time = ""
-    st.session_state.ask_ai_answer = ""
-    st.session_state.ask_ai_terms = []
-    st.session_state.ask_ai_error = ""
-    st.session_state.ask_ai_running = False
-    st.session_state.ask_ai_last_time = ""
-    st.session_state.ask_ai_last_question = ""
+    if mic_frame_count <= 0:
+        if waited > 8.0:
+            st.session_state.mic_wait_notice = (
+                "Still waiting for mic audio. Check browser mic permission, "
+                "then press Stop Translation and Start Translation again."
+            )
+        else:
+            st.session_state.mic_wait_notice = (
+                "Waiting for browser microphone audio... "
+                "Allow mic permission and speak once."
+            )
 
-    processor = webrtc_ctx.audio_processor
+    else:
+        st.session_state.mic_wait_notice = (
+            f"Mic audio detected. Frames: {mic_frame_count}, level: {mic_level:.1f}"
+        )
 
-    st.session_state.soniox_running = True
-    st.session_state.pending_start_translation = False
+        st.session_state.soniox_stop_event = threading.Event()
+        st.session_state.soniox_result_queue = queue.Queue()
+        st.session_state.soniox_control_queue = queue.Queue()
+        st.session_state.soniox_error = ""
+        st.session_state.debug_messages = []
+        st.session_state.live_original = ""
+        st.session_state.live_translation = ""
+        st.session_state.caption_history = []
+        st.session_state.last_update_time = ""
+        st.session_state.pending_visual_reset = False
+        st.session_state.caption_stage = "idle"
+        st.session_state.last_raw_input_time = ""
+        st.session_state.last_raw_translation_time = ""
+        st.session_state.last_helper_fix_time = ""
+        st.session_state.last_ai_check_time = ""
+        st.session_state.correction_status = "idle"
+        st.session_state.live_token_version = 0
+        st.session_state.last_llm_checked_token_version = -1
+        st.session_state.llm_calls_this_session = 0
+        st.session_state.llm_budget_reached = False
 
-    worker_target = soniox_live_worker
-    worker_args = (
-        processor.audio_queue,
-        st.session_state.soniox_result_queue,
-        st.session_state.soniox_stop_event,
-        st.session_state.soniox_control_queue,
-        api_key,
-        terms_file,
-        domain_mode,
-        float(reset_seconds),
-        source_language_mode,
-    )
+        st.session_state.llm_context_chunks = []
+        st.session_state.llm_main_idea = ""
+        st.session_state.llm_say_it_simply = ""
+        st.session_state.llm_corrected_japanese_original = ""
+        st.session_state.llm_corrected_english_caption = ""
+        st.session_state.llm_corrected_source_text = ""
+        st.session_state.llm_is_unclear = False
+        st.session_state.llm_unclear_reason = ""
+        st.session_state.llm_key_terms = []
+        st.session_state.llm_corrections = []
+        st.session_state.llm_error = ""
+        st.session_state.llm_last_source_text = ""
+        st.session_state.llm_last_call_time = 0.0
+        st.session_state.llm_cooldown_until = 0.0
+        st.session_state.llm_last_finish_time = ""
+        st.session_state.ask_ai_answer = ""
+        st.session_state.ask_ai_terms = []
+        st.session_state.ask_ai_error = ""
+        st.session_state.ask_ai_running = False
+        st.session_state.ask_ai_last_time = ""
+        st.session_state.ask_ai_last_question = ""
 
-    st.session_state.soniox_thread = threading.Thread(
-        target=worker_target,
-        args=worker_args,
-        daemon=True,
-    )
+        processor = processor_probe
 
-    st.session_state.soniox_thread.start()
+        st.session_state.soniox_running = True
+        st.session_state.pending_start_translation = False
+        st.session_state.mic_wait_notice = ""
+        st.session_state.mic_wait_start_time = 0.0
 
+        worker_target = soniox_live_worker
+        worker_args = (
+            processor.audio_queue,
+            st.session_state.soniox_result_queue,
+            st.session_state.soniox_stop_event,
+            st.session_state.soniox_control_queue,
+            api_key,
+            terms_file,
+            domain_mode,
+            float(reset_seconds),
+            source_language_mode,
+        )
+
+        st.session_state.soniox_thread = threading.Thread(
+            target=worker_target,
+            args=worker_args,
+            daemon=True,
+        )
+
+        st.session_state.soniox_thread.start()
 
 # ============================================================
 # Pull Soniox results into UI state
@@ -4982,7 +5025,10 @@ if use_llm_hints:
 if st.session_state.soniox_running:
     st.success("Soniox STT/translation running.")
 elif st.session_state.app_active:
-    st.info("Starting Soniox STT/translation...")
+    if st.session_state.mic_wait_notice:
+        st.info(st.session_state.mic_wait_notice)
+    else:
+        st.info("Starting Soniox STT/translation...")
 else:
     st.info("Live translation stopped.")
 
@@ -5250,6 +5296,15 @@ if show_debug:
 
         st.write("Live token version:")
         st.code(str(st.session_state.live_token_version))
+
+        st.write("Mic wait notice:")
+        st.code(str(st.session_state.get("mic_wait_notice", "")))
+
+        if webrtc_ctx.audio_processor:
+            st.write("Mic processor frame count:")
+            st.code(str(getattr(webrtc_ctx.audio_processor, "frame_count", 0)))
+            st.write("Mic processor audio level:")
+            st.code(str(getattr(webrtc_ctx.audio_processor, "last_audio_level", 0.0)))
 
         st.write("Last LLM checked token version:")
         st.code(str(st.session_state.last_llm_checked_token_version))
