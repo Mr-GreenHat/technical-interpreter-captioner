@@ -335,6 +335,77 @@ EXTRA_GLOSSARY_ENTRIES = [
 
 
 
+# Extra basic geometry / classroom terms.
+# Useful for interpreter key-term support even if technical_terms.csv
+# does not include them.
+EXTRA_GLOSSARY_ENTRIES.extend([
+    {
+        "domain": "cad",
+        "jp": "三角形",
+        "reading": "さんかくけい",
+        "en": "triangle",
+        "common_wrong": "三角;さんかく;triangle;triangular shape",
+        "notes": "Basic geometry / CAD shape",
+    },
+    {
+        "domain": "cad",
+        "jp": "三角",
+        "reading": "さんかく",
+        "en": "triangle",
+        "common_wrong": "三角形;さんかくけい;triangle",
+        "notes": "Basic geometry / CAD shape",
+    },
+    {
+        "domain": "cad",
+        "jp": "四角形",
+        "reading": "しかくけい",
+        "en": "quadrilateral / rectangle",
+        "common_wrong": "四角;しかく;rectangle;square",
+        "notes": "Basic geometry / CAD shape",
+    },
+    {
+        "domain": "cad",
+        "jp": "長方形",
+        "reading": "ちょうほうけい",
+        "en": "rectangle",
+        "common_wrong": "rectangle;rectangular shape",
+        "notes": "Basic geometry / CAD shape",
+    },
+    {
+        "domain": "cad",
+        "jp": "正方形",
+        "reading": "せいほうけい",
+        "en": "square",
+        "common_wrong": "square",
+        "notes": "Basic geometry / CAD shape",
+    },
+    {
+        "domain": "cad",
+        "jp": "円",
+        "reading": "えん",
+        "en": "circle",
+        "common_wrong": "circle;round shape",
+        "notes": "Basic geometry / CAD shape",
+    },
+    {
+        "domain": "cad",
+        "jp": "半径",
+        "reading": "はんけい",
+        "en": "radius",
+        "common_wrong": "radius",
+        "notes": "Basic geometry / CAD dimension",
+    },
+    {
+        "domain": "cad",
+        "jp": "直径",
+        "reading": "ちょっけい",
+        "en": "diameter",
+        "common_wrong": "diameter",
+        "notes": "Basic geometry / CAD dimension",
+    },
+])
+
+
 # ============================================================
 # Secrets
 # ============================================================
@@ -686,6 +757,99 @@ def filter_detected_terms_for_current_caption(detected_terms, original_text, tra
             break
 
     return filtered
+
+
+
+def detected_terms_to_llm_key_terms(detected_terms, max_terms=5):
+    """
+    Convert glossary matches to the same format used by LLM key terms.
+    This lets the UI show known terms immediately without waiting for Groq.
+    """
+    output = []
+    seen = set()
+
+    for item in detected_terms or []:
+        jp = str(item.get("jp", "")).strip()
+        en = str(item.get("en", "")).strip()
+
+        if not jp:
+            continue
+
+        key = (jp, en)
+
+        if key in seen:
+            continue
+
+        output.append({
+            "term": jp,
+            "meaning": en,
+        })
+        seen.add(key)
+
+        if len(output) >= max_terms:
+            break
+
+    return output
+
+
+def merge_key_terms_preserve_order(primary_terms, secondary_terms, max_terms=5):
+    merged = []
+    seen = set()
+
+    for item in list(primary_terms or []) + list(secondary_terms or []):
+        term = str(item.get("term", item.get("jp", ""))).strip()
+        meaning = str(item.get("meaning", item.get("en", ""))).strip()
+
+        if not term:
+            continue
+
+        line = normalize_key_term_line(term, meaning)
+
+        if not line:
+            continue
+
+        key = line.lower()
+
+        if key in seen:
+            continue
+
+        merged.append({
+            "term": term,
+            "meaning": meaning,
+        })
+        seen.add(key)
+
+        if len(merged) >= max_terms:
+            break
+
+    return merged
+
+
+def should_accept_soniox_token(original, translation):
+    """
+    Japanese-only guard for Soniox results.
+
+    If Soniox hears Indonesian/English/background speech, it can output:
+        original: Itu.
+        translation: That.
+    For this app, we only want Japanese speaker content.
+    """
+    if not JAPANESE_ONLY_MODE:
+        return True
+
+    original = (original or "").strip()
+    translation = (translation or "").strip()
+
+    if original and is_japanese_text(original):
+        return True
+
+    if original and not is_japanese_text(original):
+        return False
+
+    if translation:
+        return False
+
+    return False
 
 
 def filter_soniox_context_terms_for_domain(context_terms, translation_terms, domain_mode):
@@ -1433,6 +1597,13 @@ def normalize_key_term_line(term, meaning):
         "chamfering": ("面取り", "chamfering"),
         "design intent": ("設計意図", "design intent"),
         "manufacturability": ("加工性", "manufacturability"),
+        "triangle": ("三角形", "triangle"),
+        "triangular shape": ("三角形", "triangle"),
+        "rectangle": ("長方形", "rectangle"),
+        "square": ("正方形", "square"),
+        "circle": ("円", "circle"),
+        "radius": ("半径", "radius"),
+        "diameter": ("直径", "diameter"),
         "rotary engine": ("ロータリーエンジン", "rotary engine"),
         "wankel engine": ("ロータリーエンジン", "rotary engine"),
         "reciprocating engine": ("レシプロエンジン", "reciprocating engine"),
@@ -2264,6 +2435,127 @@ def format_key_term_line(term, meaning, show_meaning=True):
     return line
 
 
+ASK_ALLOWED_ACRONYMS = {
+    "TTC", "AEB", "ADAS", "ABS", "ECU", "CAN", "PWM", "PID", "IPM",
+    "CATIA", "CAD", "ARE", "PDE", "BE",
+}
+
+ASK_TECHNICAL_HINT_WORDS = [
+    "慣性", "慣性補償", "補償", "制御", "寸法拘束", "幾何拘束", "完全拘束",
+    "自由度", "スケッチャー", "面取り", "設計意図", "加工性",
+    "ロータリー", "アペックスシール", "ブレーキ", "サーボ",
+    "TTC", "AEB", "ADAS", "CATIA", "CAD", "ARE", "PDE", "BE",
+]
+
+
+def looks_like_valid_ask_latest_query(text):
+    """
+    Ask-latest is only for the translator speaking a short Japanese question
+    or difficult technical term. If Soniox captured random Indonesian/English
+    background speech, do not call Groq because it may hallucinate key terms.
+    """
+    text = (text or "").strip()
+
+    if not text:
+        return False
+
+    if is_japanese_text(text):
+        return True
+
+    # Without Japanese script, only accept known all-caps technical acronyms.
+    # This blocks Indonesian/English ordinary speech from being sent to Groq.
+    upper = text.upper()
+    words = set(upper.replace("?", " ").replace(".", " ").replace(",", " ").split())
+
+    for acronym in ASK_ALLOWED_ACRONYMS:
+        if acronym in words:
+            return True
+
+    return False
+
+
+def filter_ask_ai_key_terms_strict(key_terms, question_text, answer_text, context_text=""):
+    """
+    Strict filter for Translator Ask AI.
+
+    Normal live-caption key term filter can allow domain terms like BE/PDE/ARE
+    when the selected domain is school/event. That is useful sometimes for
+    class captions, but it is dangerous for Ask AI because it can show:
+        BE = Business Engineering
+    even when the captured question never mentioned BE.
+
+    This filter only allows a term when it is directly supported by:
+    - the translator's question/captured text,
+    - the AI answer,
+    - or the recent lecture text.
+    No domain-only allowance.
+    """
+    combined = f"{question_text or ''}\n{answer_text or ''}\n{context_text or ''}"
+    combined_lower = combined.lower()
+    filtered = []
+    seen = set()
+
+    for item in key_terms or []:
+        term = str(item.get("term", item.get("jp", ""))).strip()
+        meaning = str(item.get("meaning", item.get("en", ""))).strip()
+
+        if not term:
+            continue
+
+        line = normalize_key_term_line(term, meaning)
+
+        if not line:
+            continue
+
+        normalized_term = line.split("=", 1)[0].strip()
+        normalized_meaning = line.split("=", 1)[1].strip() if "=" in line else meaning
+
+        candidates = [
+            term,
+            meaning,
+            normalized_term,
+            normalized_meaning,
+        ]
+
+        supported = False
+
+        for value in candidates:
+            value = (value or "").strip()
+
+            if not value:
+                continue
+
+            if value in combined or value.lower() in combined_lower:
+                supported = True
+                break
+
+        # Allow acronyms only if the acronym itself appears in the captured text/context.
+        if not supported and normalized_term.upper() in ASK_ALLOWED_ACRONYMS:
+            if normalized_term.upper() in combined.upper():
+                supported = True
+
+        if not supported:
+            continue
+
+        key = (normalized_term, normalized_meaning)
+
+        if key in seen:
+            continue
+
+        filtered.append({
+            "term": normalized_term,
+            "meaning": normalized_meaning,
+        })
+        seen.add(key)
+
+        if len(filtered) >= 4:
+            break
+
+    return filtered
+
+
+
+
 def parse_ask_ai_json(text):
     base = {
         "answer": "",
@@ -2322,6 +2614,11 @@ Use the lecture context to answer briefly.
 
 Output max 3 key terms.
 Keep answer short.
+
+Important:
+- The domain/context is only background, not proof.
+- Do NOT output BE, PDE, ARE, BINUS, Summer Course, CATIA, TTC, or any term unless the question or recent lecture actually mentions/supports it.
+- If the captured question is unclear or unrelated, answer: "No clear technical term captured. Please ask again." and return key_terms=[].
 
 Context:
 {domain_context}
@@ -2583,6 +2880,9 @@ Also fix caption text only when the correction is obvious.
 
 Rules:
 - Output max 4 key_terms.
+- First use Matched glossary if available.
+- If no glossary match, you may infer a simple key term ONLY when the Japanese source clearly contains it.
+  Example: 三角形 = triangle.
 - Do not output unrelated key terms.
 - Do not invent facts.
 - If no key term, key_terms = [].
@@ -3550,10 +3850,14 @@ with st.expander("Translator Ask AI / 用語だけ聞く", expanded=False):
 
         if not groq_api_key:
             st.session_state.ask_ai_error = "GROQ_API_KEY missing."
+            st.session_state.ask_ai_answer = ""
+            st.session_state.ask_ai_terms = []
             return
 
         if not question_text:
             st.session_state.ask_ai_error = "No question text. Speak or type first."
+            st.session_state.ask_ai_answer = ""
+            st.session_state.ask_ai_terms = []
             return
 
         st.session_state.ask_ai_error = ""
@@ -3636,6 +3940,18 @@ with st.expander("Translator Ask AI / 用語だけ聞く", expanded=False):
                     "then press the green button again."
                 )
                 st.rerun()
+
+            elif not looks_like_valid_ask_latest_query(question_text):
+                st.session_state.ask_latest_notice = (
+                    "Captured text does not look like a Japanese/technical question. "
+                    "Ask-latest is still listening. Speak a Japanese term/question, "
+                    "then press the green button again."
+                )
+                st.session_state.ask_ai_error = ""
+                st.session_state.ask_ai_answer = ""
+                st.session_state.ask_ai_terms = []
+                st.rerun()
+
             else:
                 st.session_state.ask_latest_capture_active = False
                 st.session_state.ask_latest_capture_baseline_original = ""
@@ -3741,6 +4057,23 @@ while not st.session_state.soniox_result_queue.empty():
             domain_mode,
         )
 
+        # Japanese-only guard:
+        # Do not display or translate Indonesian/English/other-language speech.
+        if JAPANESE_ONLY_MODE:
+            if original and not is_japanese_text(original):
+                st.session_state.debug_messages.append(
+                    f"Ignored non-Japanese Soniox text: {original[:80]}"
+                )
+                st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+                continue
+
+            if translation and not original and not is_japanese_text(st.session_state.live_original):
+                st.session_state.debug_messages.append(
+                    f"Ignored translation without Japanese source: {translation[:80]}"
+                )
+                st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+                continue
+
         if original or translation:
             st.session_state.live_token_version += 1
             prepare_next_ai_check_after_new_live_text()
@@ -3748,11 +4081,32 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.llm_is_unclear = False
             st.session_state.llm_unclear_reason = ""
 
-            st.session_state.llm_key_terms = filter_llm_key_terms_for_current_caption(
+            # First layer: check our glossary immediately.
+            # This makes terms like 三角形 = triangle appear without waiting for Groq.
+            instant_detected_terms = extract_key_terms_for_llm(
+                original or st.session_state.live_original,
+                translation or st.session_state.live_translation,
+                terms_file,
+            )
+            instant_detected_terms = filter_detected_terms_for_current_caption(
+                instant_detected_terms,
+                original or st.session_state.live_original,
+                translation or st.session_state.live_translation,
+                domain_mode,
+            )
+            instant_key_terms = detected_terms_to_llm_key_terms(instant_detected_terms)
+
+            existing_filtered_terms = filter_llm_key_terms_for_current_caption(
                 st.session_state.llm_key_terms,
                 original or st.session_state.live_original,
                 translation or st.session_state.live_translation,
                 domain_mode,
+            )
+
+            st.session_state.llm_key_terms = merge_key_terms_preserve_order(
+                instant_key_terms,
+                existing_filtered_terms,
+                max_terms=5,
             )
 
         if st.session_state.pending_visual_reset and (original or translation):
@@ -3888,11 +4242,16 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrected_source_text = item.get("source_text", "")
         st.session_state.llm_is_unclear = bool(item.get("is_unclear", False))
         st.session_state.llm_unclear_reason = item.get("unclear_reason", "")
-        st.session_state.llm_key_terms = filter_llm_key_terms_for_current_caption(
+        groq_terms = filter_llm_key_terms_for_current_caption(
             item.get("key_terms", []),
             st.session_state.live_original,
             st.session_state.live_translation,
             domain_mode,
+        )
+        st.session_state.llm_key_terms = merge_key_terms_preserve_order(
+            st.session_state.llm_key_terms,
+            groq_terms,
+            max_terms=5,
         )
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
@@ -3973,11 +4332,16 @@ while not st.session_state.ask_ai_result_queue.empty():
 
     if item_type == "ask_ai_answer":
         st.session_state.ask_ai_answer = item.get("answer", "")
-        st.session_state.ask_ai_terms = filter_llm_key_terms_for_current_caption(
+        ask_filter_context = build_slim_llm_context(
+            st.session_state.llm_context_chunks,
+            st.session_state.live_original,
+            st.session_state.live_translation,
+        )
+        st.session_state.ask_ai_terms = filter_ask_ai_key_terms_strict(
             item.get("key_terms", []),
-            st.session_state.live_original + "\n" + st.session_state.ask_ai_last_question,
-            st.session_state.live_translation + "\n" + st.session_state.ask_ai_answer,
-            domain_mode,
+            st.session_state.ask_ai_last_question,
+            st.session_state.ask_ai_answer,
+            ask_filter_context,
         )
         st.session_state.ask_ai_error = ""
         st.session_state.ask_ai_running = False
@@ -4328,7 +4692,18 @@ safe_correction_status = html.escape(correction_status_text)
 safe_ask_answer = html.escape(st.session_state.ask_ai_answer or "")
 ask_terms_lines_for_display = []
 
-for item in st.session_state.ask_ai_terms[:4]:
+safe_ask_display_terms = filter_ask_ai_key_terms_strict(
+    st.session_state.ask_ai_terms,
+    st.session_state.ask_ai_last_question,
+    st.session_state.ask_ai_answer,
+    build_slim_llm_context(
+        st.session_state.llm_context_chunks,
+        st.session_state.live_original,
+        st.session_state.live_translation,
+    ),
+)
+
+for item in safe_ask_display_terms[:4]:
     term = str(item.get("term", "")).strip()
     meaning = str(item.get("meaning", "")).strip()
     line = format_key_term_line(term, meaning, show_term_meaning)
