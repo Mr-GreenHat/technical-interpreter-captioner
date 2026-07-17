@@ -36,6 +36,15 @@ MAX_DEBUG_MESSAGES = 10
 # Ignore accidental Spanish/English/other-language recognition.
 JAPANESE_ONLY_MODE = True
 
+SOURCE_LANG_JA_ONLY = "Japanese only"
+SOURCE_LANG_AUTO_DEBUG = "Auto detect / debug"
+SOURCE_LANG_FORCE_JA = "Force Japanese legacy"
+SOURCE_LANGUAGE_OPTIONS = [
+    SOURCE_LANG_JA_ONLY,
+    SOURCE_LANG_AUTO_DEBUG,
+    SOURCE_LANG_FORCE_JA,
+]
+
 # Gemini Live low-latency audio send settings.
 # 40 ms at 16 kHz mono int16 = 1280 bytes.
 GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
@@ -1278,6 +1287,49 @@ def is_allowed_soniox_language(language_value):
         return True
 
     return language_value.startswith("ja") or language_value in ["jpn", "japanese"]
+
+
+
+def is_japanese_only_source_mode(source_language_mode):
+    return (source_language_mode or SOURCE_LANG_JA_ONLY) in [
+        SOURCE_LANG_JA_ONLY,
+        SOURCE_LANG_FORCE_JA,
+    ]
+
+
+def is_force_japanese_source_mode(source_language_mode):
+    return (source_language_mode or SOURCE_LANG_JA_ONLY) == SOURCE_LANG_FORCE_JA
+
+
+def is_connection_noise_error(message):
+    message = str(message or "").lower()
+    noisy_parts = [
+        "write operation timed out",
+        "write timed out",
+        "audio send error",
+        "socket is already closed",
+        "connection is already closed",
+        "websocketconnectionclosed",
+    ]
+    return any(part in message for part in noisy_parts)
+
+
+def friendly_soniox_error(message):
+    message = str(message or "").strip()
+
+    if not message:
+        return ""
+
+    lower = message.lower()
+
+    if "request timeout" in lower or "timed out" in lower:
+        return "Soniox connection timed out. Press Start Translation again."
+
+    if "write operation timed out" in lower or "audio send error" in lower:
+        return "Soniox audio connection stopped. Press Start Translation again."
+
+    return "Soniox connection stopped. Press Start Translation again."
+
 
 
 def looks_like_valid_japanese_for_display(text):
@@ -3355,6 +3407,7 @@ def soniox_live_worker(
     terms_file,
     domain_mode,
     caption_reset_seconds,
+    source_language_mode=SOURCE_LANG_JA_ONLY,
 ):
     ws = None
 
@@ -3406,13 +3459,35 @@ def soniox_live_worker(
         else:
             domain_text = "Japanese technical classroom interpretation"
 
+        language_mode_text = (
+            source_language_mode
+            if source_language_mode in SOURCE_LANGUAGE_OPTIONS
+            else SOURCE_LANG_JA_ONLY
+        )
+
+        task_text = (
+            "Advanced Japanese-only mode. The target source speech is Japanese technical classroom speech. "
+            "Do not force unrelated English or Indonesian into Japanese. Translate valid Japanese into English."
+        )
+
+        if language_mode_text == SOURCE_LANG_AUTO_DEBUG:
+            task_text = (
+                "Auto-detect/debug mode. Transcribe detected speech and translate to English. "
+                "This mode is for microphone testing only; non-Japanese text may appear."
+            )
+
+        elif language_mode_text == SOURCE_LANG_FORCE_JA:
+            task_text = (
+                "Forced Japanese legacy mode. Treat incoming speech as Japanese technical classroom speech "
+                "and translate it into English. This can create fake Japanese if the user speaks English or Indonesian."
+            )
+
         config = {
             "api_key": api_key,
             "model": "stt-rt-v5",
             "audio_format": "s16le",
             "sample_rate": 48000,
             "num_channels": 1,
-            "language_hints": ["ja"],
             "enable_language_identification": True,
             "enable_endpoint_detection": True,
             "max_endpoint_delay_ms": 800,
@@ -3427,11 +3502,12 @@ def soniox_live_worker(
                         "value": make_soniox_important_term_text(domain_mode),
                     },
                     {
+                        "key": "source_language_mode",
+                        "value": language_mode_text,
+                    },
+                    {
                         "key": "task",
-                        "value": (
-                            "Advanced Japanese-only mode. Translate only Japanese technical classroom speech "
-                            "into clear English subtitles for an interpreter. If speech is English, Indonesian, or not Japanese, ignore it."
-                        ),
+                        "value": task_text,
                     },
                     {
                         "key": "style",
@@ -3449,6 +3525,16 @@ def soniox_live_worker(
                 "target_language": "en",
             },
         }
+
+        if language_mode_text == SOURCE_LANG_JA_ONLY:
+            # Hint Japanese, but do NOT force it. This reduces fake Japanese
+            # when English/Indonesian is spoken during testing.
+            config["language_hints"] = ["ja"]
+
+        elif language_mode_text == SOURCE_LANG_FORCE_JA:
+            # Legacy escape hatch. Use only if Soniox fails to hear Japanese.
+            config["language_hints"] = ["ja"]
+            config["language"] = "ja"
 
         ws = websocket.create_connection(SONIOX_WS_URL, timeout=10)
         ws.settimeout(0.5)
@@ -3477,11 +3563,18 @@ def soniox_live_worker(
                     continue
 
                 except Exception as e:
+                    message = f"Audio send error: {e}"
                     if not stop_event.is_set():
-                        result_queue.put({
-                            "type": "error",
-                            "message": f"Audio send error: {e}",
-                        })
+                        if is_connection_noise_error(message):
+                            result_queue.put({
+                                "type": "debug",
+                                "message": message,
+                            })
+                        else:
+                            result_queue.put({
+                                "type": "error",
+                                "message": message,
+                            })
                     break
 
             try:
@@ -3609,7 +3702,10 @@ def soniox_live_worker(
                     or token.get("source_language")
                 )
 
-                if not is_allowed_soniox_language(token_language):
+                if (
+                    is_japanese_only_source_mode(source_language_mode)
+                    and not is_allowed_soniox_language(token_language)
+                ):
                     continue
 
                 status = token.get("translation_status")
@@ -3677,7 +3773,7 @@ st.title("Technical Interpreter Captioner")
 
 st.caption(
     "Japanese → English live captions using Soniox STT/translation, "
-    "with Groq as the optional second AI for correction."
+    "with preprocessing/glossary first and Groq as an optional helper."
 )
 
 
@@ -3699,6 +3795,24 @@ with st.sidebar:
         help="Choose the real class topic. Use 'school/event' only for Summer Course/BINUS topics.",
     )
     st.caption(f"Helper AI fixed context: {domain_mode}")
+
+    source_language_mode = st.selectbox(
+        "Input language mode",
+        SOURCE_LANGUAGE_OPTIONS,
+        index=0,
+        help=(
+            "Japanese only = best for the real lecture/demo. "
+            "Auto detect / debug = test mic with English/Indonesian too. "
+            "Force Japanese legacy = old behavior, but it can turn English/Indonesian into fake Japanese."
+        ),
+    )
+
+    if source_language_mode == SOURCE_LANG_JA_ONLY:
+        st.caption("Source mode: Soniox language identification + Japanese filter. Not forced.")
+    elif source_language_mode == SOURCE_LANG_AUTO_DEBUG:
+        st.caption("Source mode: debug. Non-Japanese can appear.")
+    else:
+        st.caption("Source mode: forced Japanese legacy. Use only if Soniox fails to hear Japanese.")
 
     main_display_mode = st.radio(
         "Main display",
@@ -4169,6 +4283,7 @@ if (
         terms_file,
         domain_mode,
         float(reset_seconds),
+        source_language_mode,
     )
 
     st.session_state.soniox_thread = threading.Thread(
@@ -4209,8 +4324,9 @@ while not st.session_state.soniox_result_queue.empty():
             continue
 
         # Japanese-only guard:
-        # Do not display or translate Indonesian/English/other-language speech.
-        if JAPANESE_ONLY_MODE:
+        # Do not display or translate Indonesian/English/other-language speech
+        # unless Auto detect / debug is selected.
+        if JAPANESE_ONLY_MODE and is_japanese_only_source_mode(source_language_mode):
             if original and not looks_like_valid_japanese_for_display(original):
                 st.session_state.debug_messages.append(
                     f"Ignored non-Japanese or low-quality Soniox text: {original[:80]}"
@@ -4367,7 +4483,14 @@ while not st.session_state.soniox_result_queue.empty():
             )
 
     elif item_type == "error":
-        st.session_state.soniox_error = item.get("message", "")
+        error_message = item.get("message", "")
+        if is_connection_noise_error(error_message):
+            st.session_state.debug_messages.append(error_message)
+            st.session_state.debug_messages = (
+                st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            )
+        else:
+            st.session_state.soniox_error = error_message
         st.session_state.soniox_running = False
         st.session_state.app_active = False
         st.session_state.pending_start_translation = False
@@ -4602,7 +4725,10 @@ else:
     st.info("Live translation stopped.")
 
 if st.session_state.soniox_error:
-    st.error(st.session_state.soniox_error)
+    if show_error_details or show_debug:
+        st.error(st.session_state.soniox_error)
+    else:
+        st.caption(friendly_soniox_error(st.session_state.soniox_error))
 
 if use_llm_hints and st.session_state.llm_error:
     if show_error_details or show_debug:
@@ -4624,7 +4750,12 @@ if use_llm_hints and st.session_state.llm_budget_reached:
 st.subheader("Live Captions")
 
 if subtitle_display == "History":
-    caption_text = "\n\n".join(st.session_state.caption_history[-MAX_HISTORY_ITEMS:])
+    non_empty_history = [
+        item
+        for item in st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
+        if str(item or "").strip()
+    ]
+    caption_text = "\n\n".join(non_empty_history)
 else:
     caption_text = st.session_state.live_translation
 
@@ -4809,9 +4940,9 @@ if use_llm_hints:
         if llm_terms_lines:
             llm_terms_text = "\n".join(llm_terms_lines)
         else:
-            llm_terms_text = "No current key terms yet."
+            llm_terms_text = "No key terms yet."
     else:
-        llm_terms_text = "No LLM key terms yet."
+        llm_terms_text = "No key terms yet."
 
 else:
     simple_text = ""
