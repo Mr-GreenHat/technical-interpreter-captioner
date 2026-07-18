@@ -103,7 +103,7 @@ ENGINE_SONIOX = "Soniox STT + Soniox translation + Groq correction"
 MAX_LLM_CONTEXT_CHUNKS = 2
 MAX_GROQ_CONTEXT_CHARS = 1100
 MAX_GROQ_TRANSLATION_CHARS = 450
-MAX_GROQ_GLOSSARY_TERMS = 4
+MAX_GROQ_GLOSSARY_TERMS = 5
 
 # Helper AI safety net.
 # Soniox live transcription/translation keeps running, but Groq
@@ -630,7 +630,7 @@ def filter_detected_terms_for_current_caption(detected_terms, original_text, tra
     return filtered
 
 
-def detected_terms_to_llm_key_terms(detected_terms, max_terms=5):
+def detected_terms_to_llm_key_terms(detected_terms, max_terms=8):
     """
     Convert glossary matches to the same format used by LLM key terms.
     This lets the UI show known terms immediately without waiting for Groq.
@@ -3713,7 +3713,7 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.llm_key_terms = merge_key_terms_preserve_order(
                 st.session_state.llm_key_terms,
                 instant_key_terms,
-                max_terms=5,
+                max_terms=8,
             )
 
         if original:
@@ -3869,7 +3869,7 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_key_terms = merge_key_terms_preserve_order(
             st.session_state.llm_key_terms,
             groq_terms,
-            max_terms=5,
+            max_terms=8,
         )
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
@@ -4292,7 +4292,7 @@ if use_llm_hints:
             if line and line not in llm_terms_lines:
                 llm_terms_lines.append(line)
 
-            if len(llm_terms_lines) >= 5:
+            if len(llm_terms_lines) >= 8:
                 break
 
         llm_terms_text = "\n".join(llm_terms_lines) if llm_terms_lines else "No key terms yet."
