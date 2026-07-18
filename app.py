@@ -5,7 +5,6 @@ import json
 import queue
 import threading
 import time
-import asyncio
 import base64
 import logging
 
@@ -15,8 +14,6 @@ import streamlit as st
 import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
-from google import genai
-from google.genai import types
 from groq import Groq
 
 
@@ -30,8 +27,6 @@ from groq import Groq
 #   AttributeError: 'NoneType' object has no attribute 'call_exception_handler'
 # It happens when aioice retries STUN on a datagram transport that has already
 # been closed. It is cleanup noise, not a Soniox/Groq failure.
-logging.getLogger("aioice").setLevel(logging.CRITICAL)
-logging.getLogger("aiortc").setLevel(logging.CRITICAL)
 
 try:
     from asyncio import selector_events
@@ -65,8 +60,7 @@ except Exception:
     pass
 
 
-
-SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"  # unused; kept for compatibility
+SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"  
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
 DEFAULT_RESET_SECONDS = 3.0
@@ -74,7 +68,6 @@ MAX_ORIGINAL_CHARS = 300
 MAX_TRANSLATION_CHARS = 480
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
-KEY_TERM_HOLD_SECONDS = 10.0
 
 # Soniox expects a steady raw s16le audio stream after connection.
 # If WebRTC has not produced frames yet, send short silence frames so Soniox
@@ -90,53 +83,21 @@ MOBILE_MIC_START_TIMEOUT_SECONDS = 8.0
 JAPANESE_ONLY_MODE = True
 
 SOURCE_LANG_JA_ONLY = "Japanese only"
-SOURCE_LANG_AUTO_DEBUG = "Auto detect / debug"
-SOURCE_LANG_FORCE_JA = "Force Japanese legacy"
-SOURCE_LANGUAGE_OPTIONS = [
-    SOURCE_LANG_JA_ONLY,
-    SOURCE_LANG_AUTO_DEBUG,
-    SOURCE_LANG_FORCE_JA,
-]
-
-# Gemini Live low-latency audio send settings.
-# 40 ms at 16 kHz mono int16 = 1280 bytes.
-GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
-GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
 
 # Helper / correction AI
 # Main transcription/translation returns to Soniox.
 # Second AI correction/cleanup uses Groq because it is fast and has a usable free tier.
 GROQ_HELPER_FAST = "llama-3.1-8b-instant"
-GROQ_HELPER_QWEN = "qwen/qwen3-32b"
-GROQ_HELPER_70B = "llama-3.3-70b-versatile"
 
-LLM_MODEL_DEFAULT = GROQ_HELPER_FAST
-LLM_MODEL_BACKUP = GROQ_HELPER_QWEN
-LLM_MODEL_OPTIONS = [
-    GROQ_HELPER_FAST,
-    GROQ_HELPER_QWEN,
-    GROQ_HELPER_70B,
-]
-
-# Translation model for Gemini Live Translate mode
-GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
-GEMINI_LIVE_WS_URL = (
-    "wss://generativelanguage.googleapis.com/ws/"
-    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-)
-
-ENGINE_GEMINI_LIVE = "Gemini Mode - Gemini 3.5 Live Translate + helper correction"  # kept for compatibility
 ENGINE_SONIOX = "Soniox STT + Soniox translation + Groq correction"
 
-DEFAULT_LLM_HINT_INTERVAL = 45.0
-MIN_LLM_CONTEXT_CHARS = 60
 MAX_LLM_CONTEXT_CHUNKS = 2
 MAX_GROQ_CONTEXT_CHARS = 1100
 MAX_GROQ_TRANSLATION_CHARS = 450
 MAX_GROQ_GLOSSARY_TERMS = 4
 
 # Helper AI safety net.
-# Gemini 3.5 Live Translate can keep running, but Gemini 3.1 Flash-Lite
+# Soniox live transcription/translation keeps running, but Groq
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
     "High Accuracy": {
@@ -166,8 +127,10 @@ LLM_BUDGET_MODES = {
 }
 
 
-# Built-in non-technical / school event terms.
-# These are always added even when technical_terms.csv does not include them.
+# Built-in glossary terms not covered by technical_terms.csv.
+# These are always added even when the CSV does not include them.
+# Duplicate terms (same jp already in the CSV) live only in the CSV now,
+# with their common_wrong variants merged there.
 EXTRA_GLOSSARY_ENTRIES = [
     {
         "domain": "school",
@@ -251,115 +214,11 @@ EXTRA_GLOSSARY_ENTRIES = [
     },
     {
         "domain": "cad",
-        "jp": "CATIA",
-        "reading": "きゃてぃあ",
-        "en": "CATIA",
-        "common_wrong": "キャティア;カティア;キャディア;カディア;勝ち方;書き方;キャリア;Catia;catia;CADIA;way to win",
-        "notes": "CAD software used for product design and engineering",
-    },
-    {
-        "domain": "cad",
-        "jp": "CAD",
-        "reading": "きゃど",
-        "en": "CAD",
-        "common_wrong": "キャド;cad;computer aided design;Computer Aided Design;Computer-Aided Design",
-        "notes": "Computer-Aided Design",
-    },
-    {
-        "domain": "cad",
-        "jp": "スケッチャー",
-        "reading": "すけっちゃー",
-        "en": "Sketcher",
-        "common_wrong": "スケッチ;Sketcher;sketcher;sketch",
-        "notes": "CATIA sketch workspace",
-    },
-    {
-        "domain": "cad",
-        "jp": "寸法拘束",
-        "reading": "すんぽうこうそく",
-        "en": "dimensional constraint",
-        "common_wrong": "寸法高速;寸法校則;寸法公則;dimension constraint;dimensional constraints",
-        "notes": "Constraint that defines numerical dimensions",
-    },
-    {
-        "domain": "cad",
-        "jp": "幾何拘束",
-        "reading": "きかこうそく",
-        "en": "geometric constraint",
-        "common_wrong": "幾何高速;記号拘束;幾何校則;geometry constraint;geometrical constraint",
-        "notes": "Constraint that defines geometric relationships",
-    },
-    {
-        "domain": "cad",
-        "jp": "完全拘束",
-        "reading": "かんぜんこうそく",
-        "en": "fully constrained",
-        "common_wrong": "完全高速;完全校則;full constraint;fully constraint",
-        "notes": "Sketch condition where no degrees of freedom remain",
-    },
-    {
-        "domain": "cad",
-        "jp": "自由度",
-        "reading": "じゆうど",
-        "en": "degrees of freedom",
-        "common_wrong": "自由道;degree of freedom;degrees of freedom",
-        "notes": "Remaining movement/undetermined state in a sketch",
-    },
-    {
-        "domain": "cad",
-        "jp": "Pad",
-        "reading": "ぱっど",
-        "en": "Pad",
-        "common_wrong": "パッド;pad;extrude;extrusion;押し出し",
-        "notes": "CATIA function used to extrude a sketch",
-    },
-    {
-        "domain": "cad",
-        "jp": "押し出し",
-        "reading": "おしだし",
-        "en": "extrusion",
-        "common_wrong": "押出し;押し出す;extrude;extrusion",
-        "notes": "Creating 3D geometry by extruding a sketch",
-    },
-    {
-        "domain": "cad",
-        "jp": "フィレット",
-        "reading": "ふぃれっと",
-        "en": "fillet",
-        "common_wrong": "フィレ;fillet;Fillet;filet",
-        "notes": "Rounded edge feature",
-    },
-    {
-        "domain": "cad",
         "jp": "Chamfer",
         "reading": "ちゃんふぁー",
         "en": "Chamfer",
         "common_wrong": "チャンファー;シャンファー;面取り;chamfer;Chamfering",
         "notes": "Beveled edge feature",
-    },
-    {
-        "domain": "cad",
-        "jp": "面取り",
-        "reading": "めんとり",
-        "en": "chamfering",
-        "common_wrong": "面取;面どり;chamfer;chamfering",
-        "notes": "Removing or beveling a sharp edge",
-    },
-    {
-        "domain": "cad",
-        "jp": "設計意図",
-        "reading": "せっけいいと",
-        "en": "design intent",
-        "common_wrong": "設計糸;設計意図;design intent",
-        "notes": "Reasoning behind design dimensions and features",
-    },
-    {
-        "domain": "cad",
-        "jp": "加工性",
-        "reading": "かこうせい",
-        "en": "manufacturability",
-        "common_wrong": "加工製;加工生;manufacturability;manufacturing feasibility",
-        "notes": "How easy or realistic a part is to manufacture",
     },
     {
         "domain": "automotive",
@@ -393,22 +252,6 @@ EXTRA_GLOSSARY_ENTRIES = [
         "common_wrong": "apex seal;Apex seal;アペックス;アペックシール",
         "notes": "Seal at the rotor apex in a rotary engine",
     },
-]
-
-
-
-# Extra basic geometry / classroom terms.
-# Useful for interpreter key-term support even if technical_terms.csv
-# does not include them.
-EXTRA_GLOSSARY_ENTRIES.extend([
-    {
-        "domain": "cad",
-        "jp": "三角形",
-        "reading": "さんかくけい",
-        "en": "triangle",
-        "common_wrong": "三角;さんかく;triangle;triangular shape",
-        "notes": "Basic geometry / CAD shape",
-    },
     {
         "domain": "cad",
         "jp": "三角",
@@ -417,85 +260,7 @@ EXTRA_GLOSSARY_ENTRIES.extend([
         "common_wrong": "三角形;さんかくけい;triangle",
         "notes": "Basic geometry / CAD shape",
     },
-    {
-        "domain": "cad",
-        "jp": "四角形",
-        "reading": "しかくけい",
-        "en": "quadrilateral / rectangle",
-        "common_wrong": "四角;しかく;rectangle;square",
-        "notes": "Basic geometry / CAD shape",
-    },
-    {
-        "domain": "cad",
-        "jp": "長方形",
-        "reading": "ちょうほうけい",
-        "en": "rectangle",
-        "common_wrong": "rectangle;rectangular shape",
-        "notes": "Basic geometry / CAD shape",
-    },
-    {
-        "domain": "cad",
-        "jp": "正方形",
-        "reading": "せいほうけい",
-        "en": "square",
-        "common_wrong": "square",
-        "notes": "Basic geometry / CAD shape",
-    },
-    {
-        "domain": "cad",
-        "jp": "円",
-        "reading": "えん",
-        "en": "circle",
-        "common_wrong": "circle;round shape",
-        "notes": "Basic geometry / CAD shape",
-    },
-    {
-        "domain": "cad",
-        "jp": "半径",
-        "reading": "はんけい",
-        "en": "radius",
-        "common_wrong": "radius",
-        "notes": "Basic geometry / CAD dimension",
-    },
-    {
-        "domain": "cad",
-        "jp": "直径",
-        "reading": "ちょっけい",
-        "en": "diameter",
-        "common_wrong": "diameter",
-        "notes": "Basic geometry / CAD dimension",
-    },
-])
-
-
-# Extra mechanical drawing / jig terms.
-# These are preprocessing truth terms, not AI suggestions.
-EXTRA_GLOSSARY_ENTRIES.extend([
-    {
-        "domain": "cad",
-        "jp": "治具",
-        "reading": "じぐ",
-        "en": "jig",
-        "common_wrong": "ジグ;時空;時具;地具;事故;spacetime;space-time;space time;jig;fixture",
-        "notes": "Device used to hold/position a workpiece or guide machining/assembly",
-    },
-    {
-        "domain": "cad",
-        "jp": "治具のCAD",
-        "reading": "じぐのきゃど",
-        "en": "jig CAD model",
-        "common_wrong": "時空のCAD;時空CAD;spacetime CAD;space-time CAD;space time CAD;jig CAD",
-        "notes": "CAD model/design of a jig",
-    },
-    {
-        "domain": "cad",
-        "jp": "三面図",
-        "reading": "さんめんず",
-        "en": "three-view drawing / orthographic drawing",
-        "common_wrong": "三面;三面図面;3面図;three-view drawing;three view drawing;orthographic drawing;three views",
-        "notes": "Mechanical drawing showing front/top/side views",
-    },
-])
+]
 
 
 # ============================================================
@@ -849,7 +614,6 @@ def filter_detected_terms_for_current_caption(detected_terms, original_text, tra
     return filtered
 
 
-
 def detected_terms_to_llm_key_terms(detected_terms, max_terms=5):
     """
     Convert glossary matches to the same format used by LLM key terms.
@@ -919,33 +683,6 @@ def merge_key_terms_preserve_order(primary_terms, secondary_terms, max_terms=5):
             break
 
     return merged
-
-
-def should_accept_soniox_token(original, translation):
-    """
-    Japanese-only guard for Soniox results.
-
-    If Soniox hears Indonesian/English/background speech, it can output:
-        original: Itu.
-        translation: That.
-    For this app, we only want Japanese speaker content.
-    """
-    if not JAPANESE_ONLY_MODE:
-        return True
-
-    original = (original or "").strip()
-    translation = (translation or "").strip()
-
-    if original and is_japanese_text(original):
-        return True
-
-    if original and not is_japanese_text(original):
-        return False
-
-    if translation:
-        return False
-
-    return False
 
 
 def filter_soniox_context_terms_for_domain(context_terms, translation_terms, domain_mode):
@@ -1023,48 +760,6 @@ def make_soniox_important_term_text(domain_mode):
         ]
 
     return " ".join(parts)
-
-
-
-def make_groq_correction_hints(domain_mode, context_text, current_translation):
-    """
-    Keep Groq prompt small and relevant.
-    Do not always include Summer Course/BINUS examples because the model
-    may output those as key terms even when the current topic is unrelated.
-    """
-    domain = (domain_mode or "auto").lower()
-    combined = f"{context_text or ''}\n{current_translation or ''}"
-
-    hints = [
-        "- Fix grammar naturally but stay close to the current caption.",
-        "- Do not output key terms unless the current caption actually mentions or clearly implies them.",
-        "- TTC = Time To Collision. In AEB/braking context, ABC can mean TTC.",
-        "- 慣性補償 = inertia compensation.",
-    ]
-
-    if domain in ["cad", "product design"] or contains_any_text(combined, CAD_STRONG_CONTEXT_WORDS):
-        hints.extend([
-            "- CAD = Computer-Aided Design.",
-            "- 治具 = jig; 三面図 = three-view drawing.",
-            "- CATIA should only be used if CATIA/キャティア/カティア is actually supported by the current text.",
-            "- スケッチャー = Sketcher; 寸法拘束 = dimensional constraint; 幾何拘束 = geometric constraint.",
-        ])
-
-    if domain == "automotive" or contains_any_text(combined, AUTO_STRONG_CONTEXT_WORDS):
-        hints.extend([
-            "- AEB = Autonomous Emergency Braking.",
-            "- ロータリーエンジン = rotary engine; アペックスシール = apex seal.",
-        ])
-
-    if domain in ["school", "school/event", "event"] or contains_any_text(combined, SCHOOL_STRONG_CONTEXT_WORDS):
-        hints.extend([
-            "- サマーコース = Summer Course.",
-            "- ビヌス大学 = BINUS University.",
-            "- In school-event context only, sauna/saunas or mackerel course can mean Summer Course.",
-            "- In school-event context only, News university / New Tiger students can mean BINUS University students.",
-        ])
-
-    return "\n".join(hints)
 
 
 def glossary_candidate_matches(candidate, text, is_translation=False):
@@ -1178,6 +873,8 @@ def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_t
 # ============================================================
 
 def apply_llm_corrections(text, corrections):
+    import re
+
     if not text:
         return ""
 
@@ -1194,7 +891,16 @@ def apply_llm_corrections(text, corrections):
         if len(wrong) < 2:
             continue
 
-        cleaned = cleaned.replace(wrong, correct)
+        if re.fullmatch(r"[A-Za-z0-9]+", wrong):
+            # Latin-script terms (acronyms like ARE/BE/PDE) need whole-word
+            # matching, otherwise a plain substring replace would also hit
+            # unrelated words that merely contain the same letters
+            # (e.g. "ARE" inside "prepare", "BE" inside "before").
+            cleaned = re.sub(rf"\b{re.escape(wrong)}\b", correct, cleaned)
+        else:
+            # Japanese has no spaces, so word-boundary matching does not
+            # reliably apply here; a direct substring replace is used instead.
+            cleaned = cleaned.replace(wrong, correct)
 
     return cleaned.strip()
 
@@ -1354,18 +1060,6 @@ def is_allowed_soniox_language(language_value):
     return language_value.startswith("ja") or language_value in ["jpn", "japanese"]
 
 
-
-def is_japanese_only_source_mode(source_language_mode):
-    return (source_language_mode or SOURCE_LANG_JA_ONLY) in [
-        SOURCE_LANG_JA_ONLY,
-        SOURCE_LANG_FORCE_JA,
-    ]
-
-
-def is_force_japanese_source_mode(source_language_mode):
-    return (source_language_mode or SOURCE_LANG_JA_ONLY) == SOURCE_LANG_FORCE_JA
-
-
 def is_connection_noise_error(message):
     message = str(message or "").lower()
     noisy_parts = [
@@ -1405,7 +1099,6 @@ def friendly_soniox_error(message):
     return "Soniox connection stopped. Press Start Translation again."
 
 
-
 def looks_like_valid_japanese_for_display(text):
     """
     Text gate before display/Groq.
@@ -1437,7 +1130,6 @@ def looks_like_valid_japanese_for_display(text):
         return False
 
     return True
-
 
 
 def light_caption_cleanup(text):
@@ -1879,9 +1571,6 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
     return original_text.strip(), translation_text.strip()
 
 
-
-
-
 def prepare_next_ai_check_after_new_live_text():
     """
     When new live speech arrives after an AI-corrected segment, keep the
@@ -2095,441 +1784,6 @@ def trim_caption_soft(text, max_chars):
     return recent.strip()
 
 
-
-def choose_stable_translation(old_translation, new_translation):
-    """
-    Avoid replacing a useful English caption with a much shorter partial
-    translation during live streaming. This does not fix Soniox itself; it
-    only makes the UI less jumpy.
-    """
-    old_translation = (old_translation or "").strip()
-    new_translation = (new_translation or "").strip()
-
-    if not new_translation:
-        return old_translation
-
-    if not old_translation:
-        return new_translation
-
-    # If the new translation is just a short prefix/fragment of the old one,
-    # keep the old one for readability.
-    if (
-        len(new_translation) < max(12, int(len(old_translation) * 0.55))
-        and (
-            old_translation.lower().startswith(new_translation.lower())
-            or new_translation.lower() in old_translation.lower()
-        )
-    ):
-        return old_translation
-
-    return new_translation
-
-def downsample_pcm48_to_pcm16(pcm48_bytes):
-    """
-    Browser/WebRTC audio is resampled to 48 kHz in AudioProcessor.
-    Gemini Live Translate expects raw 16-bit PCM mono at 16 kHz.
-    This simple downsampler keeps every 3rd sample.
-
-    It is not studio-quality resampling, but good enough for speech testing.
-    """
-    if not pcm48_bytes:
-        return b""
-
-    audio = np.frombuffer(pcm48_bytes, dtype=np.int16)
-
-    if audio.size == 0:
-        return b""
-
-    audio16 = audio[::3].astype(np.int16)
-    return audio16.tobytes()
-
-
-def append_stream_text(old_text, new_text, max_chars=800):
-    old_text = old_text or ""
-    new_text = new_text or ""
-
-    if not new_text:
-        return old_text.strip()
-
-    if old_text and old_text[-1] not in [" ", "\n", "。", "、", ".", "?", "!", "！", "？"]:
-        combined = old_text + " " + new_text
-    else:
-        combined = old_text + new_text
-
-    while "  " in combined:
-        combined = combined.replace("  ", " ")
-
-    if len(combined) > max_chars:
-        combined = combined[-max_chars:]
-
-    return combined.strip()
-
-
-def make_gemini_live_setup(target_language_code="en"):
-    return {
-        "setup": {
-            "model": f"models/{GEMINI_LIVE_TRANSLATE_MODEL}",
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "inputAudioTranscription": {},
-                "outputAudioTranscription": {},
-                "translationConfig": {
-                    "targetLanguageCode": target_language_code,
-                    "echoTargetLanguage": True,
-                },
-            },
-        }
-    }
-
-
-def extract_live_text_from_response(data):
-    """
-    Raw Gemini Live websocket response uses lowerCamelCase.
-    We only need inputTranscription and outputTranscription text.
-    """
-    input_text = ""
-    output_text = ""
-
-    server_content = data.get("serverContent") or data.get("server_content") or {}
-
-    input_transcription = (
-        server_content.get("inputTranscription")
-        or server_content.get("input_transcription")
-        or {}
-    )
-
-    output_transcription = (
-        server_content.get("outputTranscription")
-        or server_content.get("output_transcription")
-        or {}
-    )
-
-    if isinstance(input_transcription, dict):
-        input_text = input_transcription.get("text", "") or ""
-
-    if isinstance(output_transcription, dict):
-        output_text = output_transcription.get("text", "") or ""
-
-    return input_text, output_text
-
-
-
-def make_gemini_live_sdk_config(target_language_code="en"):
-    """
-    SDK config for Gemini 3.5 Live Translate.
-
-    Correct model roles:
-    - Translation engine: gemini-3.5-live-translate-preview
-    - Helper/correction AI: gemini-3.1-flash-lite
-    """
-    return types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        translation_config=types.TranslationConfig(
-            target_language_code=target_language_code,
-            echo_target_language=True,
-        ),
-    )
-
-
-def gemini_live_translate_worker(
-    audio_queue,
-    result_queue,
-    stop_event,
-    control_queue,
-    api_key,
-    target_language_code="en",
-    caption_reset_seconds=DEFAULT_RESET_SECONDS,
-):
-    """
-    Gemini 3.5 Live Translate worker using the official google-genai SDK.
-
-    Translation engine:
-        gemini-3.5-live-translate-preview
-
-    Helper/correction AI:
-        gemini-3.1-flash-lite, handled separately by llm_hint_worker.
-
-    This keeps AudioProcessor and Soniox worker untouched.
-    """
-
-    async def run_live_session():
-        client = genai.Client(api_key=api_key)
-        config = make_gemini_live_sdk_config(target_language_code)
-
-        result_queue.put({
-            "type": "debug",
-            "message": "Connecting with official Gemini Live SDK...",
-        })
-
-        live_original = ""
-        live_translation = ""
-        last_text_time = time.time()
-        reset_sent = False
-        first_input_seen = False
-        first_output_seen = False
-        japanese_seen_in_segment = False
-
-        async with client.aio.live.connect(
-            model=GEMINI_LIVE_TRANSLATE_MODEL,
-            config=config,
-        ) as session:
-            result_queue.put({
-                "type": "debug",
-                "message": "Gemini 3.5 Live Translate session started.",
-            })
-
-            async def send_audio_loop():
-                nonlocal live_original
-                nonlocal live_translation
-                nonlocal last_text_time
-                nonlocal reset_sent
-                nonlocal first_input_seen
-                nonlocal first_output_seen
-                nonlocal japanese_seen_in_segment
-
-                pcm16_buffer = bytearray()
-                last_send_time = time.time()
-
-                while not stop_event.is_set():
-                    while control_queue is not None and not control_queue.empty():
-                        try:
-                            command = control_queue.get_nowait()
-
-                            if command == "clear":
-                                # Clear the Gemini worker's internal accumulated text too.
-                                # Otherwise old text can return after pressing Clear Captions.
-                                pcm16_buffer = bytearray()
-                                live_original = ""
-                                live_translation = ""
-                                last_text_time = time.time()
-                                reset_sent = False
-                                first_input_seen = False
-                                first_output_seen = False
-                                japanese_seen_in_segment = False
-                                result_queue.put({"type": "cleared"})
-
-                            elif isinstance(command, dict) and command.get("type") == "set_base_caption":
-                                # After AI correction is applied, do NOT clear the text.
-                                # Use the corrected text as the new worker base, so
-                                # the next live tokens continue from the fixed caption.
-                                live_original = command.get("original", "") or live_original
-                                live_translation = command.get("translation", "") or live_translation
-                                pcm16_buffer = bytearray()
-                                last_text_time = time.time()
-                                reset_sent = False
-                                first_input_seen = bool(live_original)
-                                first_output_seen = bool(live_translation)
-                                japanese_seen_in_segment = is_japanese_text(live_original)
-                                result_queue.put({
-                                    "type": "debug",
-                                    "message": "Gemini worker base updated after AI correction.",
-                                })
-
-                        except queue.Empty:
-                            break
-
-                    try:
-                        pcm48 = await asyncio.to_thread(audio_queue.get, True, 0.05)
-
-                        if pcm48:
-                            pcm16 = downsample_pcm48_to_pcm16(pcm48)
-
-                            if pcm16:
-                                pcm16_buffer.extend(pcm16)
-
-                    except queue.Empty:
-                        pass
-
-                    # Low latency:
-                    # Send about 40 ms of 16 kHz mono int16 audio per packet.
-                    # This helps Gemini receive speech earlier.
-                    now = time.time()
-                    should_send = (
-                        len(pcm16_buffer) >= GEMINI_LIVE_AUDIO_CHUNK_BYTES
-                        or (
-                            pcm16_buffer
-                            and now - last_send_time >= GEMINI_LIVE_AUDIO_FLUSH_SECONDS
-                        )
-                    )
-
-                    if not should_send:
-                        await asyncio.sleep(0.005)
-                        continue
-
-                    chunk = bytes(pcm16_buffer[:GEMINI_LIVE_AUDIO_CHUNK_BYTES])
-                    pcm16_buffer = pcm16_buffer[GEMINI_LIVE_AUDIO_CHUNK_BYTES:]
-                    last_send_time = now
-
-                    await session.send_realtime_input(
-                        audio=types.Blob(
-                            data=chunk,
-                            mime_type="audio/pcm;rate=16000",
-                        )
-                    )
-
-                    await asyncio.sleep(0.003)
-
-            async def receive_loop():
-                nonlocal live_original
-                nonlocal live_translation
-                nonlocal last_text_time
-                nonlocal reset_sent
-                nonlocal first_input_seen
-                nonlocal first_output_seen
-                nonlocal japanese_seen_in_segment
-
-                async for response in session.receive():
-                    if stop_event.is_set():
-                        break
-
-                    server_content = getattr(response, "server_content", None)
-
-                    if not server_content:
-                        continue
-
-                    input_transcription = getattr(
-                        server_content,
-                        "input_transcription",
-                        None,
-                    )
-
-                    output_transcription = getattr(
-                        server_content,
-                        "output_transcription",
-                        None,
-                    )
-
-                    input_text = ""
-                    output_text = ""
-
-                    if input_transcription:
-                        input_text = getattr(input_transcription, "text", "") or ""
-
-                    if output_transcription:
-                        output_text = getattr(output_transcription, "text", "") or ""
-
-                    if input_text or output_text:
-                        last_text_time = time.time()
-                        reset_sent = False
-
-                    if input_text:
-                        # Japanese-only guard.
-                        # If Gemini accidentally recognizes Spanish/English/other language,
-                        # do not show it and do not allow its English output to appear.
-                        if JAPANESE_ONLY_MODE and not is_japanese_text(input_text):
-                            result_queue.put({
-                                "type": "debug",
-                                "message": f"Ignored non-Japanese input: {input_text[:80]}",
-                            })
-                        else:
-                            japanese_seen_in_segment = True
-
-                            if not first_input_seen:
-                                first_input_seen = True
-                                result_queue.put({
-                                    "type": "debug",
-                                    "message": "Gemini Live Japanese input transcription started.",
-                                })
-
-                            live_original = append_stream_text(
-                                live_original,
-                                light_original_cleanup(input_text),
-                                max_chars=MAX_ORIGINAL_CHARS * 2,
-                            )
-
-                            # Show Japanese immediately, even before English translation arrives.
-                            result_queue.put({
-                                "type": "tokens",
-                                "original": live_original,
-                                "translation": live_translation,
-                                "endpoint": False,
-                            })
-
-                    if output_text:
-                        # Do not show translation unless a valid Japanese source
-                        # has been seen in this segment.
-                        if JAPANESE_ONLY_MODE and not japanese_seen_in_segment:
-                            result_queue.put({
-                                "type": "debug",
-                                "message": f"Ignored output because no Japanese source was detected: {output_text[:80]}",
-                            })
-                        else:
-                            if not first_output_seen:
-                                first_output_seen = True
-                                result_queue.put({
-                                    "type": "debug",
-                                    "message": "Gemini Live English output translation started.",
-                                })
-
-                            live_translation = append_stream_text(
-                                live_translation,
-                                light_caption_cleanup(output_text),
-                                max_chars=MAX_TRANSLATION_CHARS * 2,
-                            )
-
-                            # English appears when Gemini finishes/streams translation.
-                            result_queue.put({
-                                "type": "tokens",
-                                "original": live_original,
-                                "translation": live_translation,
-                                "endpoint": False,
-                            })
-
-            async def reset_watchdog_loop():
-                nonlocal live_original
-                nonlocal live_translation
-                nonlocal last_text_time
-                nonlocal reset_sent
-                nonlocal japanese_seen_in_segment
-
-                while not stop_event.is_set():
-                    await asyncio.sleep(0.25)
-
-                    if not live_original and not live_translation:
-                        continue
-
-                    if time.time() - last_text_time >= float(caption_reset_seconds) and not reset_sent:
-                        result_queue.put({"type": "page_reset"})
-                        live_original = ""
-                        live_translation = ""
-                        japanese_seen_in_segment = False
-                        reset_sent = True
-
-            send_task = asyncio.create_task(send_audio_loop())
-            receive_task = asyncio.create_task(receive_loop())
-            reset_task = asyncio.create_task(reset_watchdog_loop())
-
-            done, pending = await asyncio.wait(
-                [send_task, receive_task, reset_task],
-                return_when=asyncio.FIRST_EXCEPTION,
-            )
-
-            for task in pending:
-                task.cancel()
-
-            for task in done:
-                error = task.exception()
-                if error:
-                    raise error
-
-    try:
-        asyncio.run(run_live_session())
-
-    except Exception as e:
-        if not stop_event.is_set():
-            result_queue.put({
-                "type": "error",
-                "message": f"Gemini Live SDK error: {e}",
-            })
-
-    finally:
-        result_queue.put({
-            "type": "stopped",
-        })
-
-
 # ============================================================
 # LLM context helpers
 # ============================================================
@@ -2545,7 +1799,6 @@ def make_context_chunk(original_text, translation_text):
         f"Japanese: {original_text}\n"
         f"English: {translation_text}"
     ).strip()
-
 
 
 def source_text_matches_for_correction(current_source, corrected_source):
@@ -2843,29 +2096,6 @@ def is_short_japanese_term_query(text):
     return True
 
 
-def get_new_text_after_baseline(current_text, baseline_text):
-    """
-    For Translator Ask AI two-step mode.
-    First press stores baseline_text.
-    Second press sends only the text spoken after that baseline.
-    """
-    current_text = (current_text or "").strip()
-    baseline_text = (baseline_text or "").strip()
-
-    if not current_text:
-        return ""
-
-    if baseline_text and current_text.startswith(baseline_text):
-        return current_text[len(baseline_text):].strip()
-
-    # Soniox sometimes trims the beginning, so exact prefix can fail.
-    # If the texts are different, use current text as fallback.
-    if current_text != baseline_text:
-        return current_text
-
-    return ""
-
-
 def build_slim_llm_context(context_chunks, current_original, current_translation):
     """
     Small context for Groq free-tier TPM.
@@ -2991,8 +2221,9 @@ def key_term_display_allowed(item, source_text):
     """
     Prevent delete/reappear while still blocking unsupported Groq hallucinations.
 
-    - Glossary terms with source_match get a short hold time, so partial STT
-      changes do not make them blink.
+    - Glossary terms with source_match hold for the entire current caption
+      segment, so partial STT changes do not make them blink. They are only
+      cleared when a new segment starts after a reset (see pending_visual_reset).
     - Groq-only terms with no source_match must be supported by the current
       Japanese source immediately.
     """
@@ -3002,9 +2233,7 @@ def key_term_display_allowed(item, source_text):
         return True
 
     if source_match:
-        added_at = float(item.get("added_at", 0.0) or 0.0)
-        if time.time() - added_at <= KEY_TERM_HOLD_SECONDS:
-            return True
+        return True
 
     return False
 
@@ -3046,265 +2275,13 @@ def format_key_term_line(term, meaning, show_meaning=True, reading=""):
     return display_term
 
 
-ASK_ALLOWED_ACRONYMS = {
-    "TTC", "AEB", "ADAS", "ABS", "ECU", "CAN", "PWM", "PID", "IPM",
-    "CATIA", "CAD", "ARE", "PDE", "BE",
-}
-
-ASK_TECHNICAL_HINT_WORDS = [
-    "慣性", "慣性補償", "補償", "制御", "寸法拘束", "幾何拘束", "完全拘束",
-    "自由度", "スケッチャー", "面取り", "設計意図", "加工性",
-    "ロータリー", "アペックスシール", "ブレーキ", "サーボ",
-    "TTC", "AEB", "ADAS", "CATIA", "CAD", "ARE", "PDE", "BE",
-]
-
-
-def looks_like_valid_ask_latest_query(text):
-    """
-    Ask-latest is only for the translator speaking a short Japanese question
-    or difficult technical term. If Soniox captured random Indonesian/English
-    background speech, do not call Groq because it may hallucinate key terms.
-    """
-    text = (text or "").strip()
-
-    if not text:
-        return False
-
-    if is_japanese_text(text):
-        return True
-
-    # Without Japanese script, only accept known all-caps technical acronyms.
-    # This blocks Indonesian/English ordinary speech from being sent to Groq.
-    upper = text.upper()
-    words = set(upper.replace("?", " ").replace(".", " ").replace(",", " ").split())
-
-    for acronym in ASK_ALLOWED_ACRONYMS:
-        if acronym in words:
-            return True
-
-    return False
-
-
-def filter_ask_ai_key_terms_strict(key_terms, question_text, answer_text, context_text=""):
-    """
-    Strict filter for Translator Ask AI.
-
-    Normal live-caption key term filter can allow domain terms like BE/PDE/ARE
-    when the selected domain is school/event. That is useful sometimes for
-    class captions, but it is dangerous for Ask AI because it can show:
-        BE = Business Engineering
-    even when the captured question never mentioned BE.
-
-    This filter only allows a term when it is directly supported by:
-    - the translator's question/captured text,
-    - the AI answer,
-    - or the recent lecture text.
-    No domain-only allowance.
-    """
-    combined = f"{question_text or ''}\n{answer_text or ''}\n{context_text or ''}"
-    combined_lower = combined.lower()
-    filtered = []
-    seen = set()
-
-    for item in key_terms or []:
-        term = str(item.get("term", item.get("jp", ""))).strip()
-        meaning = str(item.get("meaning", item.get("en", ""))).strip()
-
-        if not term:
-            continue
-
-        line = normalize_key_term_line(term, meaning)
-
-        if not line:
-            continue
-
-        normalized_term = line.split("=", 1)[0].strip()
-        normalized_meaning = line.split("=", 1)[1].strip() if "=" in line else meaning
-
-        candidates = [
-            term,
-            meaning,
-            normalized_term,
-            normalized_meaning,
-        ]
-
-        supported = False
-
-        for value in candidates:
-            value = (value or "").strip()
-
-            if not value:
-                continue
-
-            if value in combined or value.lower() in combined_lower:
-                supported = True
-                break
-
-        # Allow acronyms only if the acronym itself appears in the captured text/context.
-        if not supported and normalized_term.upper() in ASK_ALLOWED_ACRONYMS:
-            if normalized_term.upper() in combined.upper():
-                supported = True
-
-        if not supported:
-            continue
-
-        key = (normalized_term, normalized_meaning)
-
-        if key in seen:
-            continue
-
-        filtered.append({
-            "term": normalized_term,
-            "meaning": normalized_meaning,
-        })
-        seen.add(key)
-
-        if len(filtered) >= 4:
-            break
-
-    return filtered
-
-
-
-
-def parse_ask_ai_json(text):
-    base = {
-        "answer": "",
-        "key_terms": [],
-        "unclear": False,
-        "raw_text": text or "",
-    }
-    if not text:
-        return base
-
-    cleaned = str(text).strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned.replace("```json", "", 1).strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.replace("```", "", 1).strip()
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3].strip()
-
-    start_idx = cleaned.find("{")
-    end_idx = cleaned.rfind("}")
-    if start_idx >= 0 and end_idx > start_idx:
-        cleaned = cleaned[start_idx:end_idx + 1].strip()
-
-    try:
-        data = json.loads(cleaned)
-        return {
-            "answer": str(data.get("answer", "")).strip(),
-            "key_terms": data.get("key_terms", []),
-            "unclear": bool(data.get("unclear", False)),
-            "raw_text": text or "",
-        }
-    except Exception:
-        return base
-
-
-def ask_ai_worker(result_queue, api_key, model_name, question_text, context_text, domain_context):
-    """
-    Separate assistant for the interpreter/translator.
-    It answers the translator's question and does NOT overwrite live captions.
-    """
-    try:
-        client = Groq(api_key=api_key)
-        question_text = compact_text(question_text, 350)
-        context_text = compact_text(context_text, 900)
-        domain_context = compact_text(domain_context, 450)
-
-        if not question_text:
-            raise RuntimeError("Ask AI question is empty.")
-
-        prompt = f"""
-Return ONLY JSON. No markdown.
-
-You are helping a live interpreter.
-The interpreter asks a short Japanese question or says a difficult term.
-Use the lecture context to answer briefly.
-
-Output max 3 key terms.
-Keep answer short.
-
-Important:
-- The domain/context is only background, not proof.
-- Do NOT output BE, PDE, ARE, BINUS, Summer Course, CATIA, TTC, or any term unless the question or recent lecture actually mentions/supports it.
-- If the captured question is unclear or unrelated, answer: "No clear technical term captured. Please ask again." and return key_terms=[].
-
-Context:
-{domain_context}
-
-Recent lecture:
-{context_text}
-
-Interpreter question / term:
-{question_text}
-
-JSON:
-{{
-  "answer": "short English answer for the interpreter",
-  "key_terms": [
-    {{"term": "Japanese term or acronym", "meaning": "English meaning"}}
-  ],
-  "unclear": false
-}}
-""".strip()
-
-        messages = [
-            {"role": "system", "content": "You are a concise interpreter support assistant. Return only JSON."},
-            {"role": "user", "content": prompt},
-        ]
-
-        text = ""
-        last_error = ""
-
-        for response_format in [{"type": "json_object"}, None]:
-            try:
-                kwargs = {
-                    "model": model_name,
-                    "messages": messages,
-                    "temperature": 0.0,
-                    "max_tokens": 350,
-                }
-                if response_format is not None:
-                    kwargs["response_format"] = response_format
-                completion = client.chat.completions.create(**kwargs)
-                text = completion.choices[0].message.content or ""
-                if text.strip():
-                    break
-            except Exception as e:
-                last_error = str(e)
-                continue
-
-        if not text.strip():
-            raise RuntimeError(last_error or "Groq Ask AI returned empty text.")
-
-        parsed = parse_ask_ai_json(text)
-        if not parsed.get("answer") and not parsed.get("key_terms"):
-            parsed["answer"] = "I could not get a clear answer. Try asking with one technical term."
-
-        result_queue.put({
-            "type": "ask_ai_answer",
-            "answer": parsed.get("answer", ""),
-            "key_terms": parsed.get("key_terms", []),
-            "unclear": bool(parsed.get("unclear", False)),
-            "question": question_text,
-            "raw_response_preview": text[:500],
-        })
-    except Exception as e:
-        result_queue.put({
-            "type": "ask_ai_error",
-            "message": shorten_error_for_ui(str(e)),
-        })
-
-
 # ============================================================
-# Selected domain context for Gemini helper
+# Selected domain context for Groq helper
 # ============================================================
 
 def make_selected_domain_context(domain_mode):
     """
-    Fixed background context sent to Gemini 3.1 helper AI.
+    Fixed background context sent to the Groq helper AI.
     This makes the sidebar Technical domain actually guide correction,
     not only rule-based cleanup.
     """
@@ -3400,8 +2377,6 @@ Correction priorities:
 
 def parse_llm_json(text):
     empty = {
-        "main_idea": "",
-        "say_it_simply": "",
         "corrected_japanese_original": "",
         "corrected_english_caption": "",
         "is_unclear": False,
@@ -3436,8 +2411,6 @@ def parse_llm_json(text):
         data = json.loads(cleaned)
 
         return {
-            "main_idea": str(data.get("main_idea", "")).strip(),
-            "say_it_simply": str(data.get("say_it_simply", "")).strip(),
             "corrected_japanese_original": str(data.get("corrected_japanese_original", "")).strip(),
             "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
             "is_unclear": (
@@ -3519,8 +2492,6 @@ Matched glossary:
 
 JSON:
 {{
-  "main_idea": "",
-  "say_it_simply": "",
   "corrected_japanese_original": "",
   "corrected_english_caption": "",
   "is_unclear": false,
@@ -3576,8 +2547,6 @@ JSON:
 
         result_queue.put({
             "type": "llm_hint",
-            "main_idea": parsed.get("main_idea", ""),
-            "say_it_simply": parsed.get("say_it_simply", ""),
             "corrected_japanese_original": parsed.get("corrected_japanese_original", ""),
             "corrected_english_caption": parsed.get("corrected_english_caption", ""),
             "is_unclear": bool(parsed.get("is_unclear", False)),
@@ -3652,7 +2621,6 @@ def soniox_live_worker(
     terms_file,
     domain_mode,
     caption_reset_seconds,
-    source_language_mode=SOURCE_LANG_JA_ONLY,
 ):
     ws = None
 
@@ -3704,28 +2672,10 @@ def soniox_live_worker(
         else:
             domain_text = "Japanese technical classroom interpretation"
 
-        language_mode_text = (
-            source_language_mode
-            if source_language_mode in SOURCE_LANGUAGE_OPTIONS
-            else SOURCE_LANG_JA_ONLY
-        )
-
         task_text = (
             "Advanced Japanese-only mode. The target source speech is Japanese technical classroom speech. "
             "Do not force unrelated English or Indonesian into Japanese. Translate valid Japanese into English."
         )
-
-        if language_mode_text == SOURCE_LANG_AUTO_DEBUG:
-            task_text = (
-                "Auto-detect/debug mode. Transcribe detected speech and translate to English. "
-                "This mode is for microphone testing only; non-Japanese text may appear."
-            )
-
-        elif language_mode_text == SOURCE_LANG_FORCE_JA:
-            task_text = (
-                "Forced Japanese legacy mode. Treat incoming speech as Japanese technical classroom speech "
-                "and translate it into English. This can create fake Japanese if the user speaks English or Indonesian."
-            )
 
         config = {
             "api_key": api_key,
@@ -3748,7 +2698,7 @@ def soniox_live_worker(
                     },
                     {
                         "key": "source_language_mode",
-                        "value": language_mode_text,
+                        "value": SOURCE_LANG_JA_ONLY,
                     },
                     {
                         "key": "task",
@@ -3771,15 +2721,9 @@ def soniox_live_worker(
             },
         }
 
-        if language_mode_text == SOURCE_LANG_JA_ONLY:
-            # Hint Japanese, but do NOT force it. This reduces fake Japanese
-            # when English/Indonesian is spoken during testing.
-            config["language_hints"] = ["ja"]
-
-        elif language_mode_text == SOURCE_LANG_FORCE_JA:
-            # Legacy escape hatch. Use only if Soniox fails to hear Japanese.
-            config["language_hints"] = ["ja"]
-            config["language"] = "ja"
+        # Hint Japanese, but do NOT force it. This reduces fake Japanese
+        # when English/Indonesian is spoken during testing.
+        config["language_hints"] = ["ja"]
 
         # Drop stale audio frames before opening a fresh Soniox connection.
         # This avoids sending old buffered frames from a previous WebRTC session.
@@ -4005,8 +2949,7 @@ def soniox_live_worker(
                 # Translation tokens are target-language English, so filtering them
                 # as non-Japanese makes the English caption stop early.
                 if (
-                    is_japanese_only_source_mode(source_language_mode)
-                    and not is_translation_token
+                    not is_translation_token
                     and not is_allowed_soniox_language(token_language)
                 ):
                     continue
@@ -4095,23 +3038,7 @@ with st.sidebar:
     )
     st.caption(f"Helper AI fixed context: {domain_mode}")
 
-    source_language_mode = st.selectbox(
-        "Input language mode",
-        SOURCE_LANGUAGE_OPTIONS,
-        index=0,
-        help=(
-            "Japanese only = best for the real lecture/demo. "
-            "Auto detect / debug = test mic with English/Indonesian too. "
-            "Force Japanese legacy = old behavior, but it can turn English/Indonesian into fake Japanese."
-        ),
-    )
-
-    if source_language_mode == SOURCE_LANG_JA_ONLY:
-        st.caption("Source mode: Soniox language identification + Japanese filter. Not forced.")
-    elif source_language_mode == SOURCE_LANG_AUTO_DEBUG:
-        st.caption("Source mode: debug. Non-Japanese can appear.")
-    else:
-        st.caption("Source mode: forced Japanese legacy. Use only if Soniox fails to hear Japanese.")
+    st.caption("Source mode: Soniox language identification + Japanese filter. Not forced.")
 
     main_display_mode = st.radio(
         "Main display",
@@ -4182,12 +3109,8 @@ with st.sidebar:
         value=True,
     )
 
-    llm_model_name = st.selectbox(
-        "Groq helper model",
-        LLM_MODEL_OPTIONS,
-        index=0,
-        help="Use llama-3.1-8b-instant first. It is the fastest/free-friendly helper model.",
-    )
+    llm_model_name = GROQ_HELPER_FAST
+    st.caption(f"Groq helper model: {llm_model_name}")
 
     llm_budget_mode = st.selectbox(
         "AI helper budget mode",
@@ -4284,8 +3207,6 @@ defaults = {
     "llm_thread": None,
     "llm_running": False,
     "llm_error": "",
-    "llm_main_idea": "",
-    "llm_say_it_simply": "",
     "llm_corrected_japanese_original": "",
     "llm_corrected_english_caption": "",
     "llm_corrected_source_text": "",
@@ -4300,20 +3221,6 @@ defaults = {
     "llm_context_chunks": [],
 
     "self_context_text": "",
-    "ask_ai_question": "",
-    "ask_ai_answer": "",
-    "ask_ai_terms": [],
-    "ask_ai_error": "",
-    "ask_ai_running": False,
-    "ask_ai_result_queue": queue.Queue(),
-    "ask_ai_thread": None,
-    "ask_ai_last_time": "",
-    "ask_ai_last_question": "",
-    "ask_latest_capture_active": False,
-    "ask_latest_capture_baseline_original": "",
-    "ask_latest_capture_baseline_translation": "",
-    "ask_latest_capture_started_at": 0.0,
-    "ask_latest_notice": "",
 }
 
 for key, value in defaults.items():
@@ -4381,7 +3288,26 @@ rtc_configuration = RTCConfiguration(
                     "stun:stun3.l.google.com:19302",
                     "stun:stun4.l.google.com:19302",
                 ]
-            }
+            },
+            # Open Relay Project free/shared TURN fallback, used when a direct
+            # STUN connection can't be established (common on Streamlit Cloud).
+            # Public demo credentials, not rate-guaranteed: swap for a paid
+            # provider (e.g. Metered.ca) if this becomes unreliable.
+            {
+                "urls": "turn:openrelay.metered.ca:80",
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": "turn:openrelay.metered.ca:443",
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": "turn:openrelay.metered.ca:443?transport=tcp",
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
         ]
     }
 )
@@ -4463,9 +3389,6 @@ if toggle_clicked:
         st.session_state.soniox_thread = None
         st.session_state.mic_wait_start_time = 0.0
         st.session_state.mic_wait_notice = ""
-        # Do not recreate the WebRTC component on every stop.
-        st.session_state.ask_latest_capture_active = False
-        st.session_state.ask_latest_notice = ""
 
         st.rerun()
 
@@ -4504,8 +3427,6 @@ if clear_clicked:
     st.session_state.llm_budget_reached = False
 
     st.session_state.llm_context_chunks = []
-    st.session_state.llm_main_idea = ""
-    st.session_state.llm_say_it_simply = ""
     st.session_state.llm_corrected_japanese_original = ""
     st.session_state.llm_corrected_english_caption = ""
     st.session_state.llm_corrected_source_text = ""
@@ -4517,23 +3438,6 @@ if clear_clicked:
     st.session_state.llm_last_source_text = ""
     st.session_state.llm_cooldown_until = 0.0
     st.session_state.llm_last_finish_time = ""
-    st.session_state.ask_ai_question = ""
-    st.session_state.ask_ai_answer = ""
-    st.session_state.ask_ai_terms = []
-    st.session_state.ask_ai_error = ""
-    st.session_state.ask_ai_running = False
-    st.session_state.ask_ai_last_time = ""
-    st.session_state.ask_ai_last_question = ""
-
-    if st.session_state.ask_latest_capture_active:
-        st.session_state.ask_latest_notice = (
-            "Listening mode ON. Speak your difficult Japanese term, then press the green button again."
-        )
-    st.session_state.ask_latest_capture_active = False
-    st.session_state.ask_latest_capture_baseline_original = ""
-    st.session_state.ask_latest_capture_baseline_translation = ""
-    st.session_state.ask_latest_capture_started_at = 0.0
-    st.session_state.ask_latest_notice = ""
 
     if st.session_state.soniox_running:
         st.session_state.soniox_control_queue.put("clear")
@@ -4548,7 +3452,6 @@ if clear_clicked:
 # The app is now key-terms-first.
 # If the speaker/interpreter says one short Japanese word and pauses,
 # the normal live key-term pipeline handles it automatically.
-
 
 
 # ============================================================
@@ -4617,8 +3520,6 @@ if (
         st.session_state.llm_budget_reached = False
 
         st.session_state.llm_context_chunks = []
-        st.session_state.llm_main_idea = ""
-        st.session_state.llm_say_it_simply = ""
         st.session_state.llm_corrected_japanese_original = ""
         st.session_state.llm_corrected_english_caption = ""
         st.session_state.llm_corrected_source_text = ""
@@ -4631,12 +3532,6 @@ if (
         st.session_state.llm_last_call_time = 0.0
         st.session_state.llm_cooldown_until = 0.0
         st.session_state.llm_last_finish_time = ""
-        st.session_state.ask_ai_answer = ""
-        st.session_state.ask_ai_terms = []
-        st.session_state.ask_ai_error = ""
-        st.session_state.ask_ai_running = False
-        st.session_state.ask_ai_last_time = ""
-        st.session_state.ask_ai_last_question = ""
 
         processor = processor_probe
 
@@ -4655,7 +3550,6 @@ if (
             terms_file,
             domain_mode,
             float(reset_seconds),
-            source_language_mode,
         )
 
         st.session_state.soniox_thread = threading.Thread(
@@ -4695,9 +3589,8 @@ while not st.session_state.soniox_result_queue.empty():
             continue
 
         # Japanese-only guard:
-        # Do not display or translate Indonesian/English/other-language speech
-        # unless Auto detect / debug is selected.
-        if JAPANESE_ONLY_MODE and is_japanese_only_source_mode(source_language_mode):
+        # Do not display or translate Indonesian/English/other-language speech.
+        if JAPANESE_ONLY_MODE:
             if original and not looks_like_valid_japanese_for_display(original):
                 st.session_state.debug_messages.append(
                     f"Ignored non-Japanese or low-quality Soniox text: {original[:80]}"
@@ -4840,8 +3733,6 @@ while not st.session_state.soniox_result_queue.empty():
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
         st.session_state.llm_context_chunks = []
-        st.session_state.llm_main_idea = ""
-        st.session_state.llm_say_it_simply = ""
         st.session_state.llm_corrected_japanese_original = ""
         st.session_state.llm_corrected_english_caption = ""
         st.session_state.llm_corrected_source_text = ""
@@ -4898,8 +3789,6 @@ while not st.session_state.llm_result_queue.empty():
     item_type = item.get("type")
 
     if item_type == "llm_hint":
-        st.session_state.llm_main_idea = item.get("main_idea", "")
-        st.session_state.llm_say_it_simply = item.get("say_it_simply", "")
         st.session_state.llm_corrected_japanese_original = item.get("corrected_japanese_original", "")
         st.session_state.llm_corrected_english_caption = item.get("corrected_english_caption", "")
         st.session_state.llm_corrected_source_text = item.get("source_text", "")
@@ -4993,7 +3882,6 @@ while not st.session_state.llm_result_queue.empty():
 # ============================================================
 
 # Ask AI UI has been removed. Groq is used only for the live key-term helper.
-
 
 
 # ============================================================
@@ -5292,21 +4180,6 @@ elif st.session_state.correction_status == "pending" and st.session_state.live_t
 
 if use_llm_hints:
     if st.session_state.llm_running:
-        simple_text = "Generating simple interpreter sentence..."
-    elif st.session_state.llm_say_it_simply:
-        simple_text = apply_llm_corrections(
-            st.session_state.llm_say_it_simply,
-            st.session_state.llm_corrections,
-        )
-    elif st.session_state.llm_main_idea:
-        simple_text = apply_llm_corrections(
-            st.session_state.llm_main_idea,
-            st.session_state.llm_corrections,
-        )
-    else:
-        simple_text = "Waiting for enough lecture context..."
-
-    if st.session_state.llm_running:
         llm_terms_text = "Checking key terms..."
     elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
         llm_terms_text = "No key terms yet."
@@ -5330,9 +4203,6 @@ if use_llm_hints:
             meaning = str(item.get("meaning", "")).strip()
             reading = str(item.get("reading", "")).strip()
 
-            term = apply_llm_corrections(term, st.session_state.llm_corrections)
-            meaning = apply_llm_corrections(meaning, st.session_state.llm_corrections)
-
             line = format_key_term_line(term, meaning, show_term_meaning, reading)
 
             if line and line not in llm_terms_lines:
@@ -5349,7 +4219,6 @@ if use_llm_hints:
         llm_terms_text = "No key terms yet."
 
 else:
-    simple_text = ""
     llm_terms_text = ""
 
 safe_original = html.escape(display_japanese)
@@ -5464,8 +4333,6 @@ if show_debug:
             f"enabled={use_llm_hints}\n"
             f"running={st.session_state.llm_running}\n"
             f"pending_visual_reset={st.session_state.pending_visual_reset}\n"
-            f"main_idea={st.session_state.llm_main_idea}\n"
-            f"say_it_simply={st.session_state.llm_say_it_simply}\n"
             f"corrected_japanese_original={st.session_state.llm_corrected_japanese_original}\n"
             f"corrected_english_caption={st.session_state.llm_corrected_english_caption}\n"
             f"ai_patch_source_latest={extract_latest_pair_from_llm_source(st.session_state.llm_corrected_source_text)}\n"
@@ -5478,9 +4345,6 @@ if show_debug:
             f"cooldown_remaining={max(0.0, st.session_state.get('llm_cooldown_until', 0.0) - time.time()):.1f}s\n"
             f"last_finish={st.session_state.get('llm_last_finish_time', '')}"
         )
-
-        st.write("Gemini audio chunk bytes:")
-        st.code(str(GEMINI_LIVE_AUDIO_CHUNK_BYTES))
 
         st.write("Japanese-only mode:")
         st.code(str(JAPANESE_ONLY_MODE))
@@ -5496,18 +4360,6 @@ if show_debug:
             st.session_state.soniox_error
             if st.session_state.soniox_error
             else "No error"
-        )
-
-        st.write("Ask AI:")
-        st.code(
-            f"running={st.session_state.ask_ai_running}\n"
-            f"question={st.session_state.ask_ai_last_question}\n"
-            f"answer={st.session_state.ask_ai_answer}\n"
-            f"terms={st.session_state.ask_ai_terms}\n"
-            f"error={st.session_state.ask_ai_error}\n"
-            f"capture_active={st.session_state.ask_latest_capture_active}\n"
-            f"capture_baseline={st.session_state.ask_latest_capture_baseline_original}\n"
-            f"capture_notice={st.session_state.ask_latest_notice}"
         )
 
 
