@@ -3879,8 +3879,14 @@ while not st.session_state.llm_result_queue.empty():
                 domain_mode=domain_mode,
             )
 
-            st.session_state.live_original = corrected_base_original
-            st.session_state.live_translation = corrected_base_translation
+            # Same rule as the display-time guard: never persist an English
+            # translation with no Japanese source behind it. Without this,
+            # a merge that drops the Japanese side (e.g. the AI source text
+            # was never valid Japanese) permanently corrupts live_original,
+            # not just this one render.
+            if corrected_base_original.strip() or not corrected_base_translation.strip():
+                st.session_state.live_original = corrected_base_original
+                st.session_state.live_translation = corrected_base_translation
 
             # The correction above just changed live_original/live_translation,
             # which would otherwise look like "new" text on the next render and
@@ -3895,8 +3901,8 @@ while not st.session_state.llm_result_queue.empty():
             if st.session_state.soniox_running:
                 st.session_state.soniox_control_queue.put({
                     "type": "set_base_caption",
-                    "original": corrected_base_original,
-                    "translation": corrected_base_translation,
+                    "original": st.session_state.live_original,
+                    "translation": st.session_state.live_translation,
                 })
 
         else:
