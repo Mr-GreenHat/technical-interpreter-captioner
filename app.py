@@ -3882,6 +3882,16 @@ while not st.session_state.llm_result_queue.empty():
             st.session_state.live_original = corrected_base_original
             st.session_state.live_translation = corrected_base_translation
 
+            # The correction above just changed live_original/live_translation,
+            # which would otherwise look like "new" text on the next render and
+            # immediately re-trigger another Groq call on the AI's own output.
+            # Mark this post-correction state as already checked.
+            st.session_state.llm_last_source_text = build_slim_llm_context(
+                st.session_state.llm_context_chunks,
+                st.session_state.live_original,
+                st.session_state.live_translation,
+            )
+
             if st.session_state.soniox_running:
                 st.session_state.soniox_control_queue.put({
                     "type": "set_base_caption",
