@@ -574,6 +574,13 @@ def filter_llm_key_terms_for_current_caption(key_terms, original_text, translati
             domain_mode,
         ):
             continue
+        else:
+            # Groq's own key_terms never carry a source_match. Stamp one now
+            # that it's confirmed present, so it gets the same hold-for-the-
+            # segment treatment as glossary-matched terms instead of being
+            # re-validated (and pruned) on every single render.
+            item = dict(item)
+            item["source_match"] = term
 
         filtered.append(item)
 
