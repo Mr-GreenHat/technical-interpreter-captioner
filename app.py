@@ -2923,6 +2923,23 @@ def soniox_live_worker(
             non_final_translation = ""
             endpoint_detected = False
 
+            # If this Soniox message contains a source token that gets rejected
+            # for being non-Japanese, its paired translation token(s) in the same
+            # message are for that same foreign speech and must not leak through
+            # just because translation tokens aren't language-gated below.
+            saw_rejected_source_token = any(
+                token.get("text", "")
+                and token.get("text", "") != "<end>"
+                and token.get("translation_status") not in ["translation", "translated"]
+                and not is_allowed_soniox_language(
+                    token.get("language")
+                    or token.get("language_code")
+                    or token.get("detected_language")
+                    or token.get("source_language")
+                )
+                for token in tokens
+            )
+
             for token in tokens:
                 text = token.get("text", "")
 
@@ -2952,6 +2969,12 @@ def soniox_live_worker(
                     not is_translation_token
                     and not is_allowed_soniox_language(token_language)
                 ):
+                    continue
+
+                # A translation token riding alongside a rejected non-Japanese
+                # source token in this same message is a translation of that
+                # foreign speech, not of confirmed Japanese. Drop it too.
+                if is_translation_token and saw_rejected_source_token:
                     continue
 
                 if is_translation_token:
