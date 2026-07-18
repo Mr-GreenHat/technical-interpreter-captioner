@@ -85,6 +85,12 @@ MOBILE_MIC_START_TIMEOUT_SECONDS = 25.0
 # Ignore accidental Spanish/English/other-language recognition.
 JAPANESE_ONLY_MODE = True
 
+# A translation-only update (no new Japanese in this message) is only trusted
+# if real Japanese arrived this recently. Without this, background speech in
+# another language can produce a translation that rides in on the fact that
+# *some* Japanese existed earlier in the segment, even minutes ago.
+TRANSLATION_WITHOUT_SOURCE_MAX_LAG_SECONDS = 2.5
+
 SOURCE_LANG_JA_ONLY = "Japanese only"
 
 # Helper / correction AI
@@ -3212,6 +3218,7 @@ defaults = {
 
     "live_original": "",
     "live_translation": "",
+    "last_japanese_token_time": 0.0,
     "caption_history": [],
     "soniox_running": False,
     "soniox_error": "",
@@ -3444,6 +3451,7 @@ if clear_clicked:
     st.session_state.mic_wait_notice = ""
     st.session_state.live_original = ""
     st.session_state.live_translation = ""
+    st.session_state.last_japanese_token_time = 0.0
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
     st.session_state.soniox_error = ""
@@ -3538,6 +3546,7 @@ if (
         st.session_state.debug_messages = []
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
+        st.session_state.last_japanese_token_time = 0.0
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
         st.session_state.pending_visual_reset = False
@@ -3631,16 +3640,34 @@ while not st.session_state.soniox_result_queue.empty():
                 st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
                 continue
 
-            if translation and not original and not looks_like_valid_japanese_for_display(st.session_state.live_original):
-                st.session_state.debug_messages.append(
-                    f"Ignored translation without Japanese source: {translation[:80]}"
+            if original:
+                st.session_state.last_japanese_token_time = time.time()
+
+            if translation and not original:
+                # A translation-only update is only trusted if real Japanese
+                # arrived recently. "Some Japanese existed earlier in this
+                # segment" is not proof this translation belongs to it —
+                # background speech in another language can otherwise ride
+                # in on an old, already-confirmed Japanese source.
+                last_japanese_time = float(
+                    st.session_state.get("last_japanese_token_time", 0.0) or 0.0
                 )
-                st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
-                continue
+                japanese_recent_enough = (
+                    last_japanese_time > 0
+                    and time.time() - last_japanese_time <= TRANSLATION_WITHOUT_SOURCE_MAX_LAG_SECONDS
+                )
+
+                if not japanese_recent_enough:
+                    st.session_state.debug_messages.append(
+                        f"Ignored translation without recent Japanese source: {translation[:80]}"
+                    )
+                    st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+                    continue
 
         if st.session_state.pending_visual_reset and (original or translation):
             st.session_state.live_original = ""
             st.session_state.live_translation = ""
+            st.session_state.last_japanese_token_time = 0.0
             st.session_state.caption_history = []
             st.session_state.llm_corrected_japanese_original = ""
             st.session_state.llm_corrected_english_caption = ""
@@ -3765,6 +3792,7 @@ while not st.session_state.soniox_result_queue.empty():
     elif item_type == "cleared":
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
+        st.session_state.last_japanese_token_time = 0.0
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
         st.session_state.llm_context_chunks = []
