@@ -76,7 +76,10 @@ SONIOX_SILENCE_KEEPALIVE_SECONDS = 0.25
 SONIOX_SILENCE_KEEPALIVE_BYTES = b"\x00\x00" * 4800  # 100 ms at 48 kHz mono s16le
 
 # iPhone/Safari needs a new user tap after refresh before microphone capture.
-MOBILE_MIC_START_TIMEOUT_SECONDS = 8.0
+# Kept generous because real ICE/TURN negotiation can take longer than a few
+# seconds on slower networks; too short a timeout tears down a connection
+# that was still actively negotiating and restarts it in an endless loop.
+MOBILE_MIC_START_TIMEOUT_SECONDS = 25.0
 
 # Japanese-only safety:
 # Ignore accidental Spanish/English/other-language recognition.
@@ -3506,14 +3509,14 @@ if (
             st.session_state.mic_wait_start_time = 0.0
             st.session_state.mic_wait_notice = ""
             st.session_state.mobile_mic_failure_message = (
-                "Microphone did not restart after refresh. "
-                "Tap Start Translation once to enable the iPhone microphone."
+                "Microphone did not start. Check that mic access is allowed "
+                "for this site in your browser, then press Start Translation again."
             )
             st.rerun()
         else:
             st.session_state.mic_wait_notice = (
                 "Waiting for browser microphone audio... "
-                "On iPhone, allow mic access and speak once."
+                "Allow mic access if prompted, then speak once."
             )
 
     else:
