@@ -3638,6 +3638,23 @@ while not st.session_state.soniox_result_queue.empty():
                 st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
                 continue
 
+        if st.session_state.pending_visual_reset and (original or translation):
+            st.session_state.live_original = ""
+            st.session_state.live_translation = ""
+            st.session_state.caption_history = []
+            st.session_state.llm_corrected_japanese_original = ""
+            st.session_state.llm_corrected_english_caption = ""
+            st.session_state.llm_corrected_source_text = ""
+            st.session_state.llm_is_unclear = False
+            st.session_state.llm_unclear_reason = ""
+            st.session_state.llm_key_terms = []
+            st.session_state.llm_corrections = []
+            st.session_state.caption_stage = "raw_started"
+            st.session_state.last_helper_fix_time = ""
+            st.session_state.last_ai_check_time = ""
+            st.session_state.correction_status = "pending"
+            st.session_state.pending_visual_reset = False
+
         if original or translation:
             st.session_state.live_token_version += 1
             prepare_next_ai_check_after_new_live_text()
@@ -3647,6 +3664,8 @@ while not st.session_state.soniox_result_queue.empty():
 
             # First layer: check our glossary immediately.
             # This makes terms like 三角形 = triangle appear without waiting for Groq.
+            # Runs after the reset-clear above, so a fresh segment's own terms
+            # do not get detected here only to be wiped by that clear.
             instant_detected_terms = extract_key_terms_for_llm(
                 original or st.session_state.live_original,
                 translation or st.session_state.live_translation,
@@ -3669,23 +3688,6 @@ while not st.session_state.soniox_result_queue.empty():
                 instant_key_terms,
                 max_terms=5,
             )
-
-        if st.session_state.pending_visual_reset and (original or translation):
-            st.session_state.live_original = ""
-            st.session_state.live_translation = ""
-            st.session_state.caption_history = []
-            st.session_state.llm_corrected_japanese_original = ""
-            st.session_state.llm_corrected_english_caption = ""
-            st.session_state.llm_corrected_source_text = ""
-            st.session_state.llm_is_unclear = False
-            st.session_state.llm_unclear_reason = ""
-            st.session_state.llm_key_terms = []
-            st.session_state.llm_corrections = []
-            st.session_state.caption_stage = "raw_started"
-            st.session_state.last_helper_fix_time = ""
-            st.session_state.last_ai_check_time = ""
-            st.session_state.correction_status = "pending"
-            st.session_state.pending_visual_reset = False
 
         if original:
             # If the Japanese source changed a lot but no matching new English
