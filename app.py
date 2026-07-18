@@ -4109,7 +4109,7 @@ if (
         st.session_state.llm_corrected_source_text,
     )
 ):
-    corrected_original, corrected_translation = merge_ai_result_into_live_caption(
+    merged_original, merged_translation = merge_ai_result_into_live_caption(
         live_original=st.session_state.live_original,
         live_translation=caption_text,
         ai_source_text=st.session_state.llm_corrected_source_text,
@@ -4118,6 +4118,12 @@ if (
         corrections=st.session_state.llm_corrections,
         domain_mode=domain_mode,
     )
+
+    # Never let an AI merge show an English translation with no Japanese
+    # source behind it. Keep the pre-merge text instead of accepting a
+    # merge result that dropped the Japanese side but kept the English side.
+    if merged_original.strip() or not merged_translation.strip():
+        corrected_original, corrected_translation = merged_original, merged_translation
 
 corrected_original = light_original_cleanup(corrected_original)
 corrected_translation = light_caption_cleanup(corrected_translation)
