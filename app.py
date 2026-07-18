@@ -91,6 +91,11 @@ JAPANESE_ONLY_MODE = True
 # *some* Japanese existed earlier in the segment, even minutes ago.
 TRANSLATION_WITHOUT_SOURCE_MAX_LAG_SECONDS = 2.5
 
+# Key terms hold independently of caption segment resets. A term only drops
+# off once it hasn't been confirmed in the live Japanese text for this long,
+# not the instant a pause triggers a new caption segment.
+KEY_TERM_STALE_SECONDS = 45.0
+
 SOURCE_LANG_JA_ONLY = "Japanese only"
 
 # Helper / correction AI
@@ -686,12 +691,15 @@ def merge_key_terms_preserve_order(primary_terms, secondary_terms, max_terms=5):
         if key in seen:
             continue
 
+        added_at = float(item.get("added_at", time.time()) or time.time())
+
         merged.append({
             "term": term,
             "meaning": meaning,
             "reading": item.get("reading", ""),
             "source_match": item.get("source_match", item.get("matched_candidate", "")),
-            "added_at": float(item.get("added_at", time.time()) or time.time()),
+            "added_at": added_at,
+            "last_confirmed_at": float(item.get("last_confirmed_at", added_at) or added_at),
         })
         seen.add(key)
 
@@ -2237,19 +2245,25 @@ def key_term_display_allowed(item, source_text):
     """
     Prevent delete/reappear while still blocking unsupported Groq hallucinations.
 
-    - Glossary terms with source_match hold for the entire current caption
-      segment, so partial STT changes do not make them blink. They are only
-      cleared when a new segment starts after a reset (see pending_visual_reset).
-    - Groq-only terms with no source_match must be supported by the current
-      Japanese source immediately.
+    - A term literally present in the current caption is always shown, and
+      refreshes its own staleness clock.
+    - Otherwise, a term with a source_match holds for KEY_TERM_STALE_SECONDS
+      since it was last actually confirmed present, independent of caption
+      segment resets. A short pause between sentences on the same topic
+      should not instantly wipe the term list.
+    - Groq-only terms with no source_match must be supported immediately.
     """
     source_match = str(item.get("source_match", item.get("matched_candidate", ""))).strip()
 
     if key_term_supported_by_source(item, source_text):
+        item["last_confirmed_at"] = time.time()
         return True
 
     if source_match:
-        return True
+        last_confirmed = float(
+            item.get("last_confirmed_at", item.get("added_at", 0.0)) or 0.0
+        )
+        return (time.time() - last_confirmed) <= KEY_TERM_STALE_SECONDS
 
     return False
 
@@ -3674,7 +3688,10 @@ while not st.session_state.soniox_result_queue.empty():
             st.session_state.llm_corrected_source_text = ""
             st.session_state.llm_is_unclear = False
             st.session_state.llm_unclear_reason = ""
-            st.session_state.llm_key_terms = []
+            # llm_key_terms is deliberately NOT cleared here. Key terms now
+            # hold on their own staleness clock (KEY_TERM_STALE_SECONDS),
+            # independent of caption segment resets, so a short pause between
+            # sentences on the same topic does not wipe the term list.
             st.session_state.llm_corrections = []
             st.session_state.caption_stage = "raw_started"
             st.session_state.last_helper_fix_time = ""
