@@ -4205,23 +4205,22 @@ elif st.session_state.correction_status == "pending" and st.session_state.live_t
 
 
 if use_llm_hints:
-    if st.session_state.llm_running:
-        llm_terms_text = "Checking key terms..."
-    elif st.session_state.live_translation and not st.session_state.llm_key_terms and st.session_state.correction_status in ["pending", "checking"]:
-        llm_terms_text = "No key terms yet."
-    elif st.session_state.llm_key_terms:
-        # Final UI guard:
-        # Keep source-matched glossary terms stable for a short time, but block
-        # unsupported Groq hallucinations like ABS immediately.
-        current_llm_key_terms = [
-            item
-            for item in st.session_state.llm_key_terms
-            if key_term_display_allowed(item, display_japanese)
-        ]
+    # Final UI guard:
+    # Keep source-matched glossary terms stable for a short time, but block
+    # unsupported Groq hallucinations like ABS immediately.
+    current_llm_key_terms = [
+        item
+        for item in st.session_state.llm_key_terms
+        if key_term_display_allowed(item, display_japanese)
+    ]
 
-        # Also prune the stored list, so old terms do not survive forever.
-        st.session_state.llm_key_terms = current_llm_key_terms
+    # Also prune the stored list, so old terms do not survive forever.
+    st.session_state.llm_key_terms = current_llm_key_terms
 
+    if current_llm_key_terms:
+        # A background AI check running does not mean the currently displayed
+        # terms are stale, so keep showing them instead of blanking to a
+        # "checking" placeholder on every periodic re-check.
         llm_terms_lines = []
 
         for item in current_llm_key_terms[:8]:
@@ -4237,10 +4236,9 @@ if use_llm_hints:
             if len(llm_terms_lines) >= 5:
                 break
 
-        if llm_terms_lines:
-            llm_terms_text = "\n".join(llm_terms_lines)
-        else:
-            llm_terms_text = "No key terms yet."
+        llm_terms_text = "\n".join(llm_terms_lines) if llm_terms_lines else "No key terms yet."
+    elif st.session_state.llm_running:
+        llm_terms_text = "Checking key terms..."
     else:
         llm_terms_text = "No key terms yet."
 
