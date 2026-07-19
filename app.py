@@ -3517,7 +3517,7 @@ if clear_clicked:
 
 
 # ============================================================
-# Auto-start Soniox after WebRTC mic is actually sending audio
+# Auto-start Soniox as soon as the mic connection exists
 # ============================================================
 
 if (
@@ -3526,17 +3526,116 @@ if (
     and not st.session_state.soniox_running
     and webrtc_ctx.audio_processor
 ):
+    # Start Soniox immediately, in parallel with the browser mic connection
+    # still coming up, instead of waiting to confirm audio first. This is
+    # what makes the status go green (and speech start being sent) right
+    # away instead of serializing "wait for mic" then "wait for Soniox".
+    # Anything said before real audio frames arrive just buffers in the
+    # queue (see drain_backlog below) and gets sent once it's ready, so
+    # nothing said during startup is lost. mic_wait_start_time is kept as
+    # the anchor for the watchdog below, which still catches a mic that
+    # never actually starts (e.g. the iOS Safari refresh bug).
+    processor = webrtc_ctx.audio_processor
+
+    st.session_state.soniox_stop_event = threading.Event()
+    st.session_state.soniox_result_queue = queue.Queue()
+    st.session_state.soniox_control_queue = queue.Queue()
+    st.session_state.soniox_error = ""
+    st.session_state.debug_messages = []
+    st.session_state.live_original = ""
+    st.session_state.live_translation = ""
+    st.session_state.last_japanese_token_time = 0.0
+    st.session_state.caption_history = []
+    st.session_state.last_update_time = ""
+    st.session_state.pending_visual_reset = False
+    st.session_state.caption_stage = "idle"
+    st.session_state.last_raw_input_time = ""
+    st.session_state.last_raw_translation_time = ""
+    st.session_state.last_helper_fix_time = ""
+    st.session_state.last_ai_check_time = ""
+    st.session_state.correction_status = "idle"
+    st.session_state.live_token_version = 0
+    st.session_state.last_llm_checked_token_version = -1
+    st.session_state.llm_calls_this_session = 0
+    st.session_state.llm_budget_reached = False
+
+    st.session_state.llm_context_chunks = []
+    st.session_state.llm_corrected_japanese_original = ""
+    st.session_state.llm_corrected_english_caption = ""
+    st.session_state.llm_corrected_source_text = ""
+    st.session_state.llm_is_unclear = False
+    st.session_state.llm_unclear_reason = ""
+    st.session_state.llm_key_terms = []
+    st.session_state.llm_corrections = []
+    st.session_state.llm_error = ""
+    st.session_state.llm_last_source_text = ""
+    st.session_state.llm_last_call_time = 0.0
+    st.session_state.llm_cooldown_until = 0.0
+    st.session_state.llm_last_finish_time = ""
+
+    st.session_state.soniox_running = True
+    st.session_state.pending_start_translation = False
+    st.session_state.mic_wait_notice = ""
+    # Anchors the watchdog below: how long has it been since we started,
+    # with no confirmed audio yet.
+    st.session_state.mic_wait_start_time = time.time()
+
+    # Only drain queued audio on a reconnect within the same mic
+    # connection (Stop then Start again), where audio kept accumulating
+    # while stopped. A genuinely fresh mic connection has nothing stale
+    # to drop, and draining it would discard whatever was already said
+    # while the connection was still coming up.
+    drain_backlog = (
+        st.session_state.get("soniox_started_for_generation")
+        == st.session_state.mic_generation
+    )
+
+    worker_target = soniox_live_worker
+    worker_args = (
+        processor.audio_queue,
+        st.session_state.soniox_result_queue,
+        st.session_state.soniox_stop_event,
+        st.session_state.soniox_control_queue,
+        api_key,
+        terms_file,
+        domain_mode,
+        float(reset_seconds),
+        drain_backlog,
+    )
+
+    st.session_state.soniox_thread = threading.Thread(
+        target=worker_target,
+        args=worker_args,
+        daemon=True,
+    )
+
+    st.session_state.soniox_thread.start()
+    st.session_state.soniox_started_for_generation = st.session_state.mic_generation
+
+# ============================================================
+# Watchdog: recover if the mic connection never actually sends audio
+# ============================================================
+
+if (
+    st.session_state.soniox_running
+    and webrtc_ctx.audio_processor
+    and st.session_state.get("mic_wait_start_time", 0.0)
+):
     processor_probe = webrtc_ctx.audio_processor
     mic_frame_count = int(getattr(processor_probe, "frame_count", 0) or 0)
-    mic_level = float(getattr(processor_probe, "last_audio_level", 0.0) or 0.0)
-    wait_started = float(st.session_state.get("mic_wait_start_time", 0.0) or 0.0)
-    waited = time.time() - wait_started if wait_started else 0.0
 
-    if mic_frame_count <= 0:
+    if mic_frame_count > 0:
+        # Confirmed working; stop watching.
+        st.session_state.mic_wait_start_time = 0.0
+    else:
+        waited = time.time() - float(st.session_state.mic_wait_start_time)
+
         if waited > MOBILE_MIC_START_TIMEOUT_SECONDS:
             # iOS Safari does not automatically restart microphone capture
-            # after refresh. Return to stopped state so the next Start button
-            # press is a real user gesture and rebuild the WebRTC component.
+            # after refresh, and some other environments can silently never
+            # deliver audio either. Return to stopped state so the next
+            # Start button press is a real user gesture and rebuilds the
+            # WebRTC component.
             st.session_state.app_active = False
             st.session_state.pending_start_translation = False
             st.session_state.soniox_running = False
@@ -3549,91 +3648,6 @@ if (
                 "for this site in your browser, then press Start Translation again."
             )
             st.rerun()
-        else:
-            st.session_state.mic_wait_notice = (
-                "Waiting for browser microphone audio... "
-                "Allow mic access if prompted, then speak once."
-            )
-
-    else:
-        st.session_state.mic_wait_notice = (
-            f"Mic audio detected. Frames: {mic_frame_count}, level: {mic_level:.1f}"
-        )
-
-        st.session_state.soniox_stop_event = threading.Event()
-        st.session_state.soniox_result_queue = queue.Queue()
-        st.session_state.soniox_control_queue = queue.Queue()
-        st.session_state.soniox_error = ""
-        st.session_state.debug_messages = []
-        st.session_state.live_original = ""
-        st.session_state.live_translation = ""
-        st.session_state.last_japanese_token_time = 0.0
-        st.session_state.caption_history = []
-        st.session_state.last_update_time = ""
-        st.session_state.pending_visual_reset = False
-        st.session_state.caption_stage = "idle"
-        st.session_state.last_raw_input_time = ""
-        st.session_state.last_raw_translation_time = ""
-        st.session_state.last_helper_fix_time = ""
-        st.session_state.last_ai_check_time = ""
-        st.session_state.correction_status = "idle"
-        st.session_state.live_token_version = 0
-        st.session_state.last_llm_checked_token_version = -1
-        st.session_state.llm_calls_this_session = 0
-        st.session_state.llm_budget_reached = False
-
-        st.session_state.llm_context_chunks = []
-        st.session_state.llm_corrected_japanese_original = ""
-        st.session_state.llm_corrected_english_caption = ""
-        st.session_state.llm_corrected_source_text = ""
-        st.session_state.llm_is_unclear = False
-        st.session_state.llm_unclear_reason = ""
-        st.session_state.llm_key_terms = []
-        st.session_state.llm_corrections = []
-        st.session_state.llm_error = ""
-        st.session_state.llm_last_source_text = ""
-        st.session_state.llm_last_call_time = 0.0
-        st.session_state.llm_cooldown_until = 0.0
-        st.session_state.llm_last_finish_time = ""
-
-        processor = processor_probe
-
-        st.session_state.soniox_running = True
-        st.session_state.pending_start_translation = False
-        st.session_state.mic_wait_notice = ""
-        st.session_state.mic_wait_start_time = 0.0
-
-        # Only drain queued audio on a reconnect within the same mic
-        # connection (Stop then Start again), where audio kept accumulating
-        # while stopped. A genuinely fresh mic connection has nothing stale
-        # to drop, and draining it would discard whatever was already said
-        # while the connection was still coming up.
-        drain_backlog = (
-            st.session_state.get("soniox_started_for_generation")
-            == st.session_state.mic_generation
-        )
-
-        worker_target = soniox_live_worker
-        worker_args = (
-            processor.audio_queue,
-            st.session_state.soniox_result_queue,
-            st.session_state.soniox_stop_event,
-            st.session_state.soniox_control_queue,
-            api_key,
-            terms_file,
-            domain_mode,
-            float(reset_seconds),
-            drain_backlog,
-        )
-
-        st.session_state.soniox_thread = threading.Thread(
-            target=worker_target,
-            args=worker_args,
-            daemon=True,
-        )
-
-        st.session_state.soniox_thread.start()
-        st.session_state.soniox_started_for_generation = st.session_state.mic_generation
 
 # ============================================================
 # Pull Soniox results into UI state
