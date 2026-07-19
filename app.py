@@ -2651,6 +2651,7 @@ def soniox_live_worker(
     terms_file,
     domain_mode,
     caption_reset_seconds,
+    drain_backlog=True,
 ):
     ws = None
 
@@ -2755,13 +2756,18 @@ def soniox_live_worker(
         # when English/Indonesian is spoken during testing.
         config["language_hints"] = ["ja"]
 
-        # Drop stale audio frames before opening a fresh Soniox connection.
-        # This avoids sending old buffered frames from a previous WebRTC session.
-        try:
-            while True:
-                audio_queue.get_nowait()
-        except queue.Empty:
-            pass
+        # Drop stale audio frames before opening a fresh Soniox connection,
+        # but only on a reconnect (Stop then Start again keeps the same mic
+        # connection running, so audio keeps piling up in the queue while
+        # stopped). On a genuine first start there is nothing stale to drop,
+        # and draining here would throw away whatever the speaker already
+        # said while the connection was still coming up.
+        if drain_backlog:
+            try:
+                while True:
+                    audio_queue.get_nowait()
+            except queue.Empty:
+                pass
 
         ws = websocket.create_connection(SONIOX_WS_URL, timeout=10)
         ws.settimeout(0.5)
@@ -3227,6 +3233,7 @@ defaults = {
     "pending_start_translation": False,
     "mic_instance_id": 0,
     "mic_generation": 0,
+    "soniox_started_for_generation": None,
     "mobile_mic_failure_message": "",
     "current_engine": "",
 
@@ -3596,6 +3603,16 @@ if (
         st.session_state.mic_wait_notice = ""
         st.session_state.mic_wait_start_time = 0.0
 
+        # Only drain queued audio on a reconnect within the same mic
+        # connection (Stop then Start again), where audio kept accumulating
+        # while stopped. A genuinely fresh mic connection has nothing stale
+        # to drop, and draining it would discard whatever was already said
+        # while the connection was still coming up.
+        drain_backlog = (
+            st.session_state.get("soniox_started_for_generation")
+            == st.session_state.mic_generation
+        )
+
         worker_target = soniox_live_worker
         worker_args = (
             processor.audio_queue,
@@ -3606,6 +3623,7 @@ if (
             terms_file,
             domain_mode,
             float(reset_seconds),
+            drain_backlog,
         )
 
         st.session_state.soniox_thread = threading.Thread(
@@ -3615,6 +3633,7 @@ if (
         )
 
         st.session_state.soniox_thread.start()
+        st.session_state.soniox_started_for_generation = st.session_state.mic_generation
 
 # ============================================================
 # Pull Soniox results into UI state
