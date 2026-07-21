@@ -5,8 +5,9 @@ import json
 import queue
 import threading
 import time
-import asyncio
-import base64
+import io
+import wave
+import re
 import logging
 import urllib.parse
 import urllib.request
@@ -16,8 +17,6 @@ import numpy as np
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
-from google import genai
-from google.genai import types
 from groq import Groq
 
 
@@ -30,7 +29,7 @@ from groq import Groq
 #   AttributeError: 'NoneType' object has no attribute 'sendto'
 #   AttributeError: 'NoneType' object has no attribute 'call_exception_handler'
 # It happens when aioice retries STUN on a datagram transport that has already
-# been closed. It is cleanup noise, not a Gemini/Groq failure.
+# been closed. It is cleanup noise, not a Groq/Whisper failure.
 
 try:
     from asyncio import selector_events
@@ -72,22 +71,26 @@ MAX_TRANSLATION_CHARS = 480
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
-# Gemini Live low-latency audio send settings.
-# Audio is resampled once, correctly, in AudioProcessor.
-# 40 ms at 16 kHz mono int16 = 1280 bytes.
-GEMINI_LIVE_INPUT_SAMPLE_RATE = 16000
-GEMINI_LIVE_AUDIO_CHUNK_MS = 40
-GEMINI_LIVE_AUDIO_CHUNK_BYTES = int(
-    GEMINI_LIVE_INPUT_SAMPLE_RATE
-    * (GEMINI_LIVE_AUDIO_CHUNK_MS / 1000.0)
-    * 2  # signed 16-bit mono PCM
-)
-GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
-GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
+# Groq Whisper receives mono 16 kHz signed PCM16 packaged as WAV.
+AUDIO_INPUT_SAMPLE_RATE = 16000
+PCM_BYTES_PER_SAMPLE = 2
+
+# Groq free-plan Whisper is limited to 20 requests/minute, so keep calls
+# at least a little more than three seconds apart. Phrase-end silence can
+# trigger an early flush only when this minimum interval has elapsed.
+GROQ_STT_MODEL_ACCURATE = "whisper-large-v3"
+GROQ_STT_MODEL_FAST = "whisper-large-v3-turbo"
+GROQ_TRANSLATION_MODEL = "llama-3.1-8b-instant"
+GROQ_DEFAULT_CHUNK_SECONDS = 3.6
+GROQ_MIN_REQUEST_INTERVAL_SECONDS = 3.1
+GROQ_ENDPOINT_SILENCE_SECONDS = 0.65
+GROQ_MIN_AUDIO_SECONDS = 0.8
+GROQ_AUDIO_OVERLAP_SECONDS = 0.35
+GROQ_VAD_RMS_THRESHOLD = 180.0
 
 # Bound the queue so a slow network cannot create minutes of delayed audio.
-# At roughly 20 ms per WebRTC frame, 200 chunks is about four seconds.
-AUDIO_QUEUE_MAX_CHUNKS = 200
+# At roughly 20 ms per WebRTC frame, 250 chunks is about five seconds.
+AUDIO_QUEUE_MAX_CHUNKS = 250
 
 # iPhone/Safari needs a new user tap after refresh before microphone capture.
 # Kept generous because real ICE/TURN negotiation can take longer than a few
@@ -112,12 +115,11 @@ KEY_TERM_STALE_SECONDS = 45.0
 
 SOURCE_LANG_JA_ONLY = "Japanese only"
 
-# Helper / correction AI
-# Main transcription/translation returns to Gemini Live Translate.
-# Second AI correction/cleanup uses Groq because it is fast and has a usable free tier.
+# Main pipeline: Groq Whisper Japanese STT followed by Groq text translation.
+# The optional second pass uses the same fast Llama model more cautiously.
 GROQ_HELPER_FAST = "llama-3.1-8b-instant"
 
-ENGINE_GEMINI_LIVE = "Gemini Live Translate + Groq correction"
+ENGINE_GROQ_WHISPER = "Groq Whisper STT + Groq translation"
 
 MAX_LLM_CONTEXT_CHUNKS = 2
 MAX_GROQ_CONTEXT_CHARS = 1100
@@ -125,7 +127,7 @@ MAX_GROQ_TRANSLATION_CHARS = 450
 MAX_GROQ_GLOSSARY_TERMS = 5
 
 # Helper AI safety net.
-# Gemini Live Translate keeps running, but Groq
+# Main Groq captions keep running, but optional second-pass
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
     "High Accuracy": {
@@ -138,7 +140,7 @@ LLM_BUDGET_MODES = {
         "interval": 25.0,
         "min_chars": 60,
         "session_limit": 300,
-        "description": "Recommended default for Gemini + Groq key-term support.",
+        "description": "Recommended only when a second correction pass is necessary.",
     },
     "Saver": {
         "interval": 60.0,
@@ -1148,12 +1150,12 @@ def friendly_live_error(message):
     lower = message.lower()
 
     if "request timeout" in lower or "timed out" in lower:
-        return "Gemini Live connection timed out. Press Start Translation again."
+        return "Groq speech request timed out. Press Start Translation again."
 
     if "write operation timed out" in lower or "audio send error" in lower:
-        return "Gemini Live audio connection stopped. Press Start Translation again."
+        return "Groq speech processing stopped. Press Start Translation again."
 
-    return "Gemini Live connection stopped. Press Start Translation again."
+    return "Groq live caption worker stopped. Press Start Translation again."
 
 
 def looks_like_valid_japanese_for_display(text):
@@ -1171,14 +1173,20 @@ def looks_like_valid_japanese_for_display(text):
         return False
 
     if not is_japanese_text(text):
-        return False
+        normalized_acronym = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+        allowed_acronyms = {
+            "AEB", "TTC", "ADAS", "ABS", "ECU", "CAN", "PWM", "PID",
+            "IPM", "YOLO", "ARE", "PDE", "BE", "CATIA", "CAD",
+        }
+        if normalized_acronym not in allowed_acronyms:
+            return False
 
-    if is_filler_only_japanese(text):
+    if is_japanese_text(text) and is_filler_only_japanese(text):
         return False
 
     # If Japanese ratio is very low, it is probably mostly English/noise.
     # Japanese sentence with acronyms like CAD still passes because ratio is usually > 0.15.
-    if japanese_char_ratio(text) < 0.15:
+    if is_japanese_text(text) and japanese_char_ratio(text) < 0.15:
         return False
 
     vague = normalize_for_filler_check(text)
@@ -1538,7 +1546,7 @@ def light_domain_context_cleanup(original_text, translation_text, domain_mode):
     Example:
     - 勝ち方 normally means "way to win", so we should not always replace it.
     - But in a CAD / product design classroom, when the lecture mentions
-      parts, sketches, Pad, constraints, or modeling, 勝ち方 is often Gemini
+      parts, sketches, Pad, constraints, or modeling, 勝ち方 is often Whisper
       mishearing CATIA / キャティア.
     """
     original_text = (original_text or "").strip()
@@ -2521,7 +2529,7 @@ def llm_hint_worker(
         prompt = f"""
 Return ONLY JSON. No markdown.
 
-You are the second AI after Gemini Live Translate.
+You are the optional second-pass corrector after Groq Whisper transcription and Groq translation.
 Main purpose: help an interpreter by extracting difficult key terms.
 Also fix caption text only when the correction is obvious.
 
@@ -2633,20 +2641,14 @@ JSON:
 # ============================================================
 
 class AudioProcessor:
-    """Convert browser audio to Gemini-ready PCM exactly once.
-
-    WebRTC commonly supplies 48 kHz audio. The old implementation converted
-    it to 48 kHz PCM and later kept every third sample. That decimation had no
-    anti-alias filtering and could damage consonants and short Japanese sounds.
-    PyAV now performs proper mono 16 kHz resampling before data enters the queue.
-    """
+    """Convert browser audio to mono 16 kHz PCM16 exactly once."""
 
     def __init__(self):
         self.audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_MAX_CHUNKS)
         self.resampler = av.AudioResampler(
             format="s16",
             layout="mono",
-            rate=GEMINI_LIVE_INPUT_SAMPLE_RATE,
+            rate=AUDIO_INPUT_SAMPLE_RATE,
         )
         self.frame_count = 0
         self.dropped_audio_chunks = 0
@@ -2685,7 +2687,6 @@ class AudioProcessor:
                 if audio.size == 0:
                     continue
 
-                # Explicit little-endian, contiguous signed PCM16.
                 pcm16 = np.ascontiguousarray(audio, dtype="<i2")
                 self._put_latest_audio(pcm16.tobytes())
 
@@ -2693,9 +2694,8 @@ class AudioProcessor:
                 self.last_audio_time = time.time()
 
                 try:
-                    # Cast before abs so -32768 does not overflow int16.
                     self.last_audio_level = float(
-                        np.mean(np.abs(pcm16.astype(np.int32)))
+                        np.sqrt(np.mean(np.square(pcm16.astype(np.float32))))
                     )
                 except Exception:
                     self.last_audio_level = 0.0
@@ -2707,85 +2707,308 @@ class AudioProcessor:
 
 
 # ============================================================
-# Gemini Live Translate worker
+# Groq Whisper live-caption worker
 # ============================================================
 
-def append_stream_text(old_text, new_text, max_chars=800, is_japanese=False):
-    """
-    Japanese never gets a space inserted between chunks (the script doesn't
-    use them). English does, unless old_text already ends in whitespace —
-    including right after a "." since streamed chunks often start a new
-    sentence, and skipping the space there would glue them together
-    ("explained.The" instead of "explained. The").
-    """
-    old_text = old_text or ""
-    new_text = new_text or ""
+def pcm16_rms(pcm_bytes):
+    if not pcm_bytes:
+        return 0.0
 
-    if not new_text:
-        return old_text.strip()
+    samples = np.frombuffer(pcm_bytes, dtype="<i2")
+    if samples.size == 0:
+        return 0.0
 
-    if not old_text:
-        return new_text.strip()
+    values = samples.astype(np.float32)
+    return float(np.sqrt(np.mean(values * values)))
 
-    if is_japanese or old_text[-1] in [" ", "\n"]:
-        combined = old_text + new_text
+
+def pcm16_to_wav_bytes(pcm_bytes, sample_rate=AUDIO_INPUT_SAMPLE_RATE):
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(PCM_BYTES_PER_SAMPLE)
+        wav_file.setframerate(int(sample_rate))
+        wav_file.writeframes(pcm_bytes)
+    return output.getvalue()
+
+
+def normalize_domain_name(domain_mode):
+    domain = (domain_mode or "auto").strip().lower()
+    if domain in {"school/event", "event"}:
+        return "school"
+    return domain
+
+
+def glossary_entry_matches_domain(entry, domain_mode):
+    selected = normalize_domain_name(domain_mode)
+    entry_domain = normalize_domain_name(entry.get("domain", ""))
+
+    if selected == "auto":
+        return True
+    if not entry_domain:
+        return True
+    return entry_domain == selected
+
+
+def build_whisper_prompt(glossary_entries, domain_mode, self_context="", previous_text=""):
+    """Build a short Whisper spelling prompt; Groq limits it to 224 tokens."""
+    selected_domain = normalize_domain_name(domain_mode)
+    shared_terms = ["BINUS ASO", "CATIA", "AEB", "TTC"]
+    domain_priority = {
+        "school": [
+            "サマーコース", "BINUS", "BINUS ASO", "BINUS大学", "ARE", "PDE", "BE",
+        ],
+        "cad": [
+            "CATIA", "治具", "三次元モデル", "スケッチ", "寸法拘束",
+            "幾何拘束", "完全拘束", "Pad", "フィレット", "面取り", "三面図",
+        ],
+        "product design": [
+            "CATIA", "治具", "三次元モデル", "寸法拘束", "幾何拘束",
+            "設計意図", "加工性", "三面図",
+        ],
+        "automotive": [
+            "AEB", "TTC", "車間距離", "相対速度", "制動力", "慣性補償制御",
+            "ゲイン調整", "拘束条件", "ロータリーエンジン", "アペックスシール",
+        ],
+    }
+
+    if selected_domain == "auto":
+        priority_terms = []
+        for values in domain_priority.values():
+            priority_terms.extend(values)
     else:
-        combined = old_text + " " + new_text
+        priority_terms = shared_terms + domain_priority.get(selected_domain, [])
 
-    while "  " in combined:
-        combined = combined.replace("  ", " ")
+    terms = []
+    seen = set()
 
-    if len(combined) > max_chars:
-        combined = combined[-max_chars:]
+    for term in priority_terms:
+        if term not in seen:
+            terms.append(term)
+            seen.add(term)
 
-    return combined.strip()
+    for entry in glossary_entries or []:
+        if not glossary_entry_matches_domain(entry, domain_mode):
+            continue
+
+        jp = str(entry.get("jp", "")).strip()
+        if not jp or jp in seen or len(jp) > 28:
+            continue
+
+        terms.append(jp)
+        seen.add(jp)
+
+        if len(terms) >= 32:
+            break
+
+    context = compact_text(self_context, 90)
+    previous = compact_text(previous_text, 70)
+    pieces = ["日本語の技術講義。用語を正確に表記する。"]
+
+    if context:
+        pieces.append(f"話題: {context}")
+    if previous:
+        pieces.append(f"直前: {previous}")
+    if terms:
+        pieces.append("用語: " + "、".join(terms))
+
+    # Stay conservative under the documented 224-token prompt limit.
+    return compact_text(" ".join(pieces), 360)
 
 
-def make_gemini_live_sdk_config(target_language_code="en"):
-    """
-    SDK config for Gemini Live Translate.
-    """
-    return types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        translation_config=types.TranslationConfig(
-            target_language_code=target_language_code,
-            echo_target_language=True,
-        ),
+def apply_glossary_source_corrections(text, glossary_entries, domain_mode):
+    """Apply safe CSV common_wrong -> canonical Japanese corrections."""
+    corrected = light_original_cleanup(text or "")
+    replacements = []
+
+    for entry in glossary_entries or []:
+        if not glossary_entry_matches_domain(entry, domain_mode):
+            continue
+
+        canonical = str(entry.get("jp", "")).strip()
+        wrong_values = str(entry.get("common_wrong", "")).strip()
+
+        if not canonical or not wrong_values:
+            continue
+
+        for wrong in wrong_values.split(";"):
+            wrong = wrong.strip()
+            if len(wrong) < 2 or wrong == canonical:
+                continue
+
+            # Do not shorten valid variants such as 三角形 -> 三角.
+            if wrong.startswith(canonical) or canonical.startswith(wrong):
+                continue
+
+            replacements.append((wrong, canonical))
+
+    replacements.sort(key=lambda item: len(item[0]), reverse=True)
+
+    for wrong, canonical in replacements:
+        if all(ord(ch) < 128 for ch in wrong):
+            corrected = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(wrong)}(?![A-Za-z0-9])",
+                canonical,
+                corrected,
+                flags=re.IGNORECASE,
+            )
+        else:
+            corrected = corrected.replace(wrong, canonical)
+
+    corrected = light_original_cleanup(corrected)
+    corrected, _ = light_domain_context_cleanup(corrected, "", domain_mode)
+    return corrected.strip()
+
+
+def merge_overlapping_japanese(previous_text, new_text, max_chars=MAX_ORIGINAL_CHARS * 2):
+    previous = (previous_text or "").strip()
+    new = (new_text or "").strip()
+
+    if not previous:
+        return new
+    if not new:
+        return previous
+    if new in previous:
+        return previous
+    if previous in new:
+        return trim_caption_soft(new, max_chars)
+
+    max_overlap = min(len(previous), len(new), 80)
+    overlap = 0
+
+    for size in range(max_overlap, 1, -1):
+        if previous[-size:] == new[:size]:
+            overlap = size
+            break
+
+    if overlap:
+        combined = previous + new[overlap:]
+    else:
+        # Whisper chunks usually end at phrase boundaries. Avoid gluing two
+        # independent phrases without punctuation when no overlap is found.
+        separator = "" if previous.endswith(("。", "？", "！", "、")) else "。"
+        combined = previous + separator + new
+
+    return trim_caption_soft(combined, max_chars)
+
+
+def matched_translation_glossary(text, glossary_entries, domain_mode, max_terms=16):
+    matches = []
+    seen = set()
+
+    for entry in glossary_entries or []:
+        if not glossary_entry_matches_domain(entry, domain_mode):
+            continue
+
+        jp = str(entry.get("jp", "")).strip()
+        en = str(entry.get("en", "")).strip()
+
+        if not jp or not en or jp not in (text or ""):
+            continue
+
+        key = (jp, en)
+        if key in seen:
+            continue
+
+        matches.append(f"{jp} = {en}")
+        seen.add(key)
+
+        if len(matches) >= max_terms:
+            break
+
+    return matches
+
+
+def clean_plain_translation(text):
+    cleaned = (text or "").strip()
+    for prefix in ["English:", "Translation:", "English translation:"]:
+        if cleaned.lower().startswith(prefix.lower()):
+            cleaned = cleaned[len(prefix):].strip()
+    cleaned = cleaned.strip('"').strip()
+    return light_caption_cleanup(cleaned)
+
+
+def translate_japanese_with_groq(
+    client,
+    japanese_text,
+    previous_japanese,
+    glossary_entries,
+    domain_mode,
+    self_context,
+):
+    glossary_lines = matched_translation_glossary(
+        japanese_text,
+        glossary_entries,
+        domain_mode,
     )
 
+    domain_context = make_compact_domain_context(domain_mode, self_context)
+    glossary_block = "\n".join(glossary_lines) if glossary_lines else "None"
+    previous = compact_text(previous_japanese, 180)
 
-def gemini_live_translate_worker(
+    system_prompt = (
+        "You are a precise Japanese-to-English technical caption translator. "
+        "Translate only the current Japanese caption. Preserve actors, actions, "
+        "negation, numbers, technical meaning, and acronyms. Use the glossary "
+        "exactly when its Japanese term appears. Do not explain, summarize, "
+        "guess missing speech, or add labels. Output English only."
+    )
+
+    user_prompt = (
+        f"{domain_context}\n\n"
+        f"Required glossary:\n{glossary_block}\n\n"
+        f"Previous Japanese context (do not translate):\n{previous or 'None'}\n\n"
+        f"Current Japanese caption:\n{japanese_text}"
+    )
+
+    completion = client.chat.completions.create(
+        model=GROQ_TRANSLATION_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_tokens=320,
+    )
+
+    output = completion.choices[0].message.content or ""
+    return clean_plain_translation(output)
+
+
+def transcribe_japanese_chunk(
+    client,
+    pcm_bytes,
+    model_name,
+    whisper_prompt,
+):
+    wav_bytes = pcm16_to_wav_bytes(pcm_bytes)
+    transcription = client.audio.transcriptions.create(
+        file=("live_caption.wav", wav_bytes, "audio/wav"),
+        model=model_name,
+        language="ja",
+        prompt=whisper_prompt,
+        response_format="json",
+        temperature=0.0,
+    )
+    return str(getattr(transcription, "text", "") or "").strip()
+
+
+def groq_whisper_translate_worker(
     audio_queue,
     result_queue,
     stop_event,
     control_queue,
     api_key,
-    target_language_code="en",
+    glossary_entries,
+    domain_mode="auto",
+    self_context="",
+    stt_model=GROQ_STT_MODEL_ACCURATE,
+    chunk_seconds=GROQ_DEFAULT_CHUNK_SECONDS,
     caption_reset_seconds=DEFAULT_RESET_SECONDS,
     drain_backlog=True,
 ):
-    """
-    Gemini Live Translate worker using the official google-genai SDK.
+    """Chunk microphone audio, transcribe Japanese, then translate to English."""
 
-    Emits the same result_queue message shapes as the previous Soniox worker
-    (tokens / page_reset / cleared / debug / error / stopped), so the
-    draining loop and everything downstream of it (filler gate, Japanese-only
-    gate, glossary/key-term extraction, Groq correction) needs no changes.
-
-    Deliberately does not re-implement a Japanese-only gate here: the main
-    thread's looks_like_valid_japanese_for_display()/should_skip_as_filler()
-    already do that, with a stronger check (char ratio, filler stripping,
-    vague-fragment rejection) than anything practical to do per-chunk here.
-    """
-
-    # Drop stale audio frames before opening a fresh Gemini session, but only
-    # on a reconnect (Stop then Start again keeps the same mic connection
-    # running, so audio keeps piling up in the queue while stopped). On a
-    # genuine first start there is nothing stale to drop, and draining here
-    # would throw away whatever the speaker already said while the
-    # connection was still coming up.
     if drain_backlog:
         try:
             while True:
@@ -2793,258 +3016,220 @@ def gemini_live_translate_worker(
         except queue.Empty:
             pass
 
-    async def run_live_session():
-        client = genai.Client(api_key=api_key)
-        config = make_gemini_live_sdk_config(target_language_code)
+    client = Groq(api_key=api_key)
+    sample_rate = AUDIO_INPUT_SAMPLE_RATE
+    bytes_per_second = sample_rate * PCM_BYTES_PER_SAMPLE
+    max_chunk_bytes = max(
+        int(GROQ_MIN_AUDIO_SECONDS * bytes_per_second),
+        int(float(chunk_seconds) * bytes_per_second),
+    )
+    min_audio_bytes = int(GROQ_MIN_AUDIO_SECONDS * bytes_per_second)
+    overlap_bytes = int(GROQ_AUDIO_OVERLAP_SECONDS * bytes_per_second)
 
-        result_queue.put({
-            "type": "debug",
-            "message": "Connecting to Gemini Live Translate...",
-        })
+    audio_buffer = bytearray()
+    live_original = ""
+    live_translation = ""
+    previous_completed_japanese = ""
+    last_voice_time = 0.0
+    last_request_time = 0.0
+    speech_seen_in_buffer = False
+    reset_sent = False
+    consecutive_errors = 0
+    reset_seconds_local = float(caption_reset_seconds)
 
-        live_original = ""
-        live_translation = ""
-        last_text_time = time.time()
-        reset_sent = False
-        first_input_seen = False
-        first_output_seen = False
-
-        async with client.aio.live.connect(
-            model=GEMINI_LIVE_TRANSLATE_MODEL,
-            config=config,
-        ) as session:
-            result_queue.put({
-                "type": "debug",
-                "message": "Gemini Live Translate session started.",
-            })
-
-            async def send_audio_loop():
-                nonlocal live_original
-                nonlocal live_translation
-                nonlocal last_text_time
-                nonlocal reset_sent
-                nonlocal first_input_seen
-                nonlocal first_output_seen
-
-                pcm16_buffer = bytearray()
-                last_send_time = time.time()
-
-                while not stop_event.is_set():
-                    while control_queue is not None and not control_queue.empty():
-                        try:
-                            command = control_queue.get_nowait()
-
-                            if command == "clear":
-                                # Clear the worker's internal accumulated text too.
-                                # Otherwise old text can return after pressing Clear Captions.
-                                pcm16_buffer = bytearray()
-                                live_original = ""
-                                live_translation = ""
-                                last_text_time = time.time()
-                                reset_sent = False
-                                first_input_seen = False
-                                first_output_seen = False
-                                result_queue.put({"type": "cleared"})
-
-                            elif isinstance(command, dict) and command.get("type") == "set_base_caption":
-                                # After AI correction is applied, do NOT clear the text.
-                                # Use the corrected text as the new worker base, so
-                                # the next live tokens continue from the fixed caption.
-                                live_original = command.get("original", "") or live_original
-                                live_translation = command.get("translation", "") or live_translation
-                                pcm16_buffer = bytearray()
-                                last_text_time = time.time()
-                                reset_sent = False
-                                first_input_seen = bool(live_original)
-                                first_output_seen = bool(live_translation)
-                                result_queue.put({
-                                    "type": "debug",
-                                    "message": "Gemini worker base updated after AI correction.",
-                                })
-
-                        except queue.Empty:
-                            break
-
-                    try:
-                        # AudioProcessor already provides mono 16 kHz PCM16.
-                        pcm16 = await asyncio.to_thread(
-                            audio_queue.get,
-                            True,
-                            0.05,
-                        )
-
-                        if pcm16:
-                            pcm16_buffer.extend(pcm16)
-
-                    except queue.Empty:
-                        pass
-
-                    # Low latency: send about 40 ms of 16 kHz mono int16 audio
-                    # per packet. This helps Gemini receive speech earlier.
-                    now = time.time()
-                    should_send = (
-                        len(pcm16_buffer) >= GEMINI_LIVE_AUDIO_CHUNK_BYTES
-                        or (
-                            pcm16_buffer
-                            and now - last_send_time >= GEMINI_LIVE_AUDIO_FLUSH_SECONDS
-                        )
-                    )
-
-                    if not should_send:
-                        await asyncio.sleep(0.005)
-                        continue
-
-                    chunk = bytes(pcm16_buffer[:GEMINI_LIVE_AUDIO_CHUNK_BYTES])
-                    pcm16_buffer = pcm16_buffer[GEMINI_LIVE_AUDIO_CHUNK_BYTES:]
-                    last_send_time = now
-
-                    try:
-                        await session.send_realtime_input(
-                            audio=types.Blob(
-                                data=chunk,
-                                mime_type=(
-                                    f"audio/pcm;rate={GEMINI_LIVE_INPUT_SAMPLE_RATE}"
-                                ),
-                            )
-                        )
-                    except Exception as e:
-                        message = f"Audio send error: {e}"
-                        if not stop_event.is_set():
-                            if is_connection_noise_error(message):
-                                result_queue.put({"type": "debug", "message": message})
-                            else:
-                                result_queue.put({"type": "error", "message": message})
-                        break
-
-                    await asyncio.sleep(0.003)
-
-            async def receive_loop():
-                nonlocal live_original
-                nonlocal live_translation
-                nonlocal last_text_time
-                nonlocal reset_sent
-                nonlocal first_input_seen
-                nonlocal first_output_seen
-
-                async for response in session.receive():
-                    if stop_event.is_set():
-                        break
-
-                    server_content = getattr(response, "server_content", None)
-
-                    if not server_content:
-                        continue
-
-                    input_transcription = getattr(server_content, "input_transcription", None)
-                    output_transcription = getattr(server_content, "output_transcription", None)
-
-                    input_text = ""
-                    output_text = ""
-
-                    if input_transcription:
-                        input_text = getattr(input_transcription, "text", "") or ""
-
-                    if output_transcription:
-                        output_text = getattr(output_transcription, "text", "") or ""
-
-                    if input_text or output_text:
-                        last_text_time = time.time()
-                        reset_sent = False
-
-                    if input_text:
-                        if not first_input_seen:
-                            first_input_seen = True
-                            result_queue.put({
-                                "type": "debug",
-                                "message": "Gemini Live Japanese input transcription started.",
-                            })
-
-                        live_original = append_stream_text(
-                            live_original,
-                            light_original_cleanup(input_text),
-                            max_chars=MAX_ORIGINAL_CHARS * 2,
-                            is_japanese=True,
-                        )
-
-                        # Show Japanese immediately, even before English translation arrives.
-                        result_queue.put({
-                            "type": "tokens",
-                            "original": live_original,
-                            "translation": live_translation,
-                            "endpoint": False,
-                        })
-
-                    if output_text:
-                        if not first_output_seen:
-                            first_output_seen = True
-                            result_queue.put({
-                                "type": "debug",
-                                "message": "Gemini Live English output translation started.",
-                            })
-
-                        live_translation = append_stream_text(
-                            live_translation,
-                            light_caption_cleanup(output_text),
-                            max_chars=MAX_TRANSLATION_CHARS * 2,
-                        )
-
-                        # English appears when Gemini finishes/streams translation.
-                        result_queue.put({
-                            "type": "tokens",
-                            "original": live_original,
-                            "translation": live_translation,
-                            "endpoint": False,
-                        })
-
-            async def reset_watchdog_loop():
-                nonlocal live_original
-                nonlocal live_translation
-                nonlocal last_text_time
-                nonlocal reset_sent
-
-                while not stop_event.is_set():
-                    await asyncio.sleep(0.25)
-
-                    if not live_original and not live_translation:
-                        continue
-
-                    if time.time() - last_text_time >= float(caption_reset_seconds) and not reset_sent:
-                        result_queue.put({"type": "page_reset"})
-                        live_original = ""
-                        live_translation = ""
-                        reset_sent = True
-
-            send_task = asyncio.create_task(send_audio_loop())
-            receive_task = asyncio.create_task(receive_loop())
-            reset_task = asyncio.create_task(reset_watchdog_loop())
-
-            done, pending = await asyncio.wait(
-                [send_task, receive_task, reset_task],
-                return_when=asyncio.FIRST_EXCEPTION,
-            )
-
-            for task in pending:
-                task.cancel()
-
-            for task in done:
-                error = task.exception()
-                if error:
-                    raise error
+    result_queue.put({
+        "type": "debug",
+        "message": f"Groq Whisper worker started with {stt_model}.",
+    })
 
     try:
-        asyncio.run(run_live_session())
+        while not stop_event.is_set():
+            # Apply UI commands without restarting the worker.
+            while control_queue is not None and not control_queue.empty():
+                try:
+                    command = control_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-    except Exception as e:
+                if command == "clear":
+                    audio_buffer = bytearray()
+                    live_original = ""
+                    live_translation = ""
+                    previous_completed_japanese = ""
+                    last_voice_time = 0.0
+                    speech_seen_in_buffer = False
+                    reset_sent = False
+                    result_queue.put({"type": "cleared"})
+
+                elif isinstance(command, dict) and command.get("type") == "set_base_caption":
+                    live_original = str(command.get("original", "") or live_original)
+                    live_translation = str(command.get("translation", "") or live_translation)
+                    result_queue.put({
+                        "type": "debug",
+                        "message": "Groq worker base updated after optional AI correction.",
+                    })
+
+                elif isinstance(command, dict) and command.get("type") == "set_reset_seconds":
+                    try:
+                        reset_seconds_local = float(command.get("value", reset_seconds_local))
+                    except Exception:
+                        pass
+
+            now = time.time()
+            pcm_chunk = b""
+
+            try:
+                pcm_chunk = audio_queue.get(timeout=0.05)
+            except queue.Empty:
+                pass
+
+            if pcm_chunk:
+                audio_buffer.extend(pcm_chunk)
+                level = pcm16_rms(pcm_chunk)
+
+                if level >= GROQ_VAD_RMS_THRESHOLD:
+                    last_voice_time = now
+                    speech_seen_in_buffer = True
+                    reset_sent = False
+
+            silence_seconds = (
+                now - last_voice_time
+                if last_voice_time > 0
+                else 999999.0
+            )
+            request_interval_ok = (
+                last_request_time <= 0
+                or now - last_request_time >= GROQ_MIN_REQUEST_INTERVAL_SECONDS
+            )
+
+            full_chunk_ready = (
+                speech_seen_in_buffer
+                and len(audio_buffer) >= max_chunk_bytes
+                and request_interval_ok
+            )
+            endpoint_ready = (
+                speech_seen_in_buffer
+                and len(audio_buffer) >= min_audio_bytes
+                and silence_seconds >= GROQ_ENDPOINT_SILENCE_SECONDS
+                and request_interval_ok
+            )
+
+            if full_chunk_ready or endpoint_ready:
+                if endpoint_ready:
+                    request_pcm = bytes(audio_buffer)
+                    audio_buffer = bytearray()
+                    speech_seen_in_buffer = False
+                else:
+                    request_pcm = bytes(audio_buffer[:max_chunk_bytes])
+                    consume_bytes = max(1, max_chunk_bytes - overlap_bytes)
+                    audio_buffer = audio_buffer[consume_bytes:]
+                    speech_seen_in_buffer = bool(audio_buffer)
+
+                # Skip obvious silence/noise requests.
+                if pcm16_rms(request_pcm) < GROQ_VAD_RMS_THRESHOLD * 0.55:
+                    if endpoint_ready:
+                        audio_buffer = bytearray()
+                    continue
+
+                last_request_time = time.time()
+
+                try:
+                    whisper_prompt = build_whisper_prompt(
+                        glossary_entries,
+                        domain_mode,
+                        self_context,
+                        previous_text=live_original or previous_completed_japanese,
+                    )
+                    raw_japanese = transcribe_japanese_chunk(
+                        client,
+                        request_pcm,
+                        stt_model,
+                        whisper_prompt,
+                    )
+                    corrected_japanese = apply_glossary_source_corrections(
+                        raw_japanese,
+                        glossary_entries,
+                        domain_mode,
+                    )
+
+                    if not looks_like_valid_japanese_for_display(corrected_japanese):
+                        result_queue.put({
+                            "type": "debug",
+                            "message": f"Ignored low-quality Whisper text: {corrected_japanese[:100]}",
+                        })
+                        continue
+
+                    new_live_original = merge_overlapping_japanese(
+                        live_original,
+                        corrected_japanese,
+                    )
+                    translation = translate_japanese_with_groq(
+                        client=client,
+                        japanese_text=new_live_original,
+                        previous_japanese=previous_completed_japanese,
+                        glossary_entries=glossary_entries,
+                        domain_mode=domain_mode,
+                        self_context=self_context,
+                    )
+
+                    live_original = new_live_original
+                    live_translation = translation
+                    consecutive_errors = 0
+
+                    result_queue.put({
+                        "type": "tokens",
+                        "original": live_original,
+                        "translation": live_translation,
+                        "endpoint": bool(endpoint_ready),
+                    })
+
+                except Exception as exc:
+                    consecutive_errors += 1
+                    message = shorten_error_for_ui(str(exc), 240)
+                    result_queue.put({
+                        "type": "debug",
+                        "message": f"Groq request failed ({consecutive_errors}): {message}",
+                    })
+
+                    if consecutive_errors >= 3:
+                        result_queue.put({
+                            "type": "error",
+                            "message": f"Groq speech/translation error: {message}",
+                        })
+                        consecutive_errors = 0
+
+            # After the final phrase has been processed, mark the visible page
+            # complete. The main UI keeps it visible until new speech arrives.
+            if (
+                live_original
+                and not reset_sent
+                and not speech_seen_in_buffer
+                and len(audio_buffer) < min_audio_bytes
+                and silence_seconds >= reset_seconds_local
+            ):
+                previous_completed_japanese = live_original
+                result_queue.put({"type": "page_reset"})
+                live_original = ""
+                live_translation = ""
+                audio_buffer = bytearray()
+                reset_sent = True
+
+            # Prevent endless accumulation of pure room noise.
+            if (
+                not speech_seen_in_buffer
+                and not live_original
+                and len(audio_buffer) > max_chunk_bytes
+            ):
+                audio_buffer = bytearray()
+
+    except Exception as exc:
         if not stop_event.is_set():
             result_queue.put({
                 "type": "error",
-                "message": f"Gemini Live error: {e}",
+                "message": f"Groq live worker error: {exc}",
             })
-
     finally:
-        result_queue.put({
-            "type": "stopped",
-        })
+        result_queue.put({"type": "stopped"})
 
 
 # ============================================================
@@ -3059,8 +3244,8 @@ st.set_page_config(
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English live captions using Gemini Live Translate, "
-    "with preprocessing/glossary first and Groq as an optional helper."
+    "Japanese → English phrase captions using Groq Whisper STT, "
+    "CSV glossary correction, and Groq text translation."
 )
 
 
@@ -3071,9 +3256,9 @@ st.caption(
 with st.sidebar:
     st.header("Settings")
 
-    translation_engine = ENGINE_GEMINI_LIVE
-    st.info("Translation engine: Gemini Live Translate")
-    st.caption("Second AI helper: Groq correction")
+    translation_engine = ENGINE_GROQ_WHISPER
+    st.info("Translation engine: Groq Whisper + Groq translation")
+    st.caption("Captions update by phrase, not character-by-character.")
 
     domain_mode = st.selectbox(
         "Technical domain",
@@ -3081,9 +3266,39 @@ with st.sidebar:
         index=0,
         help="Choose the real class topic. Use 'school/event' only for Summer Course/BINUS topics.",
     )
-    st.caption(f"Helper AI fixed context: {domain_mode}")
+    st.caption(f"Selected technical context: {domain_mode}")
 
-    st.caption("Source mode: Gemini language understanding + Japanese filter. Not forced.")
+    st.caption("Source mode: Japanese is forced in Whisper for better accuracy and latency.")
+
+    stt_quality = st.selectbox(
+        "Whisper recognition model",
+        [
+            "High accuracy (whisper-large-v3)",
+            "Faster (whisper-large-v3-turbo)",
+        ],
+        index=0,
+        help=(
+            "Use High accuracy for technical Japanese. Turbo is cheaper/faster "
+            "but is slightly less accurate."
+        ),
+    )
+    stt_model_name = (
+        GROQ_STT_MODEL_FAST
+        if "turbo" in stt_quality.lower()
+        else GROQ_STT_MODEL_ACCURATE
+    )
+
+    stt_chunk_seconds = st.slider(
+        "Caption audio chunk",
+        min_value=3.2,
+        max_value=6.0,
+        value=GROQ_DEFAULT_CHUNK_SECONDS,
+        step=0.2,
+        help=(
+            "Shorter is faster but uses more API requests. Keep it at 3.2 seconds "
+            "or longer to stay below Groq's typical free Whisper RPM limit."
+        ),
+    )
 
     microphone_profile = st.selectbox(
         "Microphone processing",
@@ -3144,7 +3359,7 @@ with st.sidebar:
         value=st.session_state.get("self_context_text", ""),
         height=80,
         placeholder="Example: Today is about automotive braking and inertia compensation.",
-        help="This is sent only to Groq helper/Ask AI, not shown to audience.",
+        help="This guides Whisper spelling and English translation. It is not shown to the audience.",
     )
     st.session_state.self_context_text = self_context
 
@@ -3185,15 +3400,16 @@ with st.sidebar:
 
     st.divider()
 
-    st.write("LLM Interpreter Support")
+    st.write("Optional Second Pass")
 
     use_llm_hints = st.checkbox(
-        "Use LLM support",
-        value=True,
+        "Use optional second-pass correction",
+        value=False,
+        help="Usually leave this off first. The main pipeline already uses Whisper plus glossary-aware translation.",
     )
 
     llm_model_name = GROQ_HELPER_FAST
-    st.caption(f"Groq helper model: {llm_model_name}")
+    st.caption(f"Second-pass model: {llm_model_name}")
 
     llm_budget_mode = st.selectbox(
         "AI helper budget mode",
@@ -3246,6 +3462,9 @@ with st.sidebar:
         f"Loaded {len(context_terms)} glossary terms and "
         f"{len(translation_terms)} translation mappings."
     )
+
+    active_glossary_entries = load_glossary_entries(terms_file)
+    st.caption(f"Whisper spelling prompt will use the selected domain and up to 32 terms.")
 
 
 # ============================================================
@@ -3324,7 +3543,7 @@ if st.session_state.current_engine and st.session_state.current_engine != transl
     st.rerun()
 
 if not st.session_state.current_engine:
-    st.session_state.current_engine = ENGINE_GEMINI_LIVE
+    st.session_state.current_engine = ENGINE_GROQ_WHISPER
 
 
 if float(reset_seconds) != float(st.session_state.last_reset_seconds):
@@ -3341,22 +3560,16 @@ if float(reset_seconds) != float(st.session_state.last_reset_seconds):
 # API keys
 # ============================================================
 
-gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
 groq_api_key = safe_get_secret_or_env("GROQ_API_KEY")
 
-if not gemini_api_key:
+if not groq_api_key:
     st.error(
-        "GEMINI_API_KEY is not set.\n\n"
-        "Gemini Live Translate needs a Gemini API key for Japanese STT/translation. "
+        "GROQ_API_KEY is not set.\n\n"
+        "The main Whisper transcription and English translation both require it. "
         "For Streamlit Cloud, add this in Secrets:\n\n"
-        'GEMINI_API_KEY = "your_gemini_api_key_here"'
+        'GROQ_API_KEY = "your_groq_api_key_here"'
     )
     st.stop()
-
-if use_llm_hints and not groq_api_key:
-    st.warning(
-        "GROQ_API_KEY is not set. Second AI correction is disabled until you add it."
-    )
 
 
 # ============================================================
@@ -3384,7 +3597,7 @@ else:
 webrtc_ctx = webrtc_streamer(
     # Stable key prevents repeated WebRTC peer-connection destruction/recreation.
     # Use the manual Reset mic connection button below if a hard reset is needed.
-    key=f"gemini-live-caption-mic-{st.session_state.mic_generation}",
+    key=f"groq-whisper-caption-mic-{st.session_state.mic_generation}",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -3519,7 +3732,7 @@ if clear_clicked:
 
 
 # ============================================================
-# Auto-start Gemini Live Translate as soon as the mic connection exists
+# Auto-start Groq Whisper captions as soon as the mic connection exists
 # ============================================================
 
 if (
@@ -3528,11 +3741,11 @@ if (
     and not st.session_state.live_running
     and webrtc_ctx.audio_processor
 ):
-    # Start Gemini Live Translate immediately, in parallel with the browser
+    # Start the Groq Whisper worker immediately, in parallel with the browser
     # mic connection still coming up, instead of waiting to confirm audio
     # first. This is what makes the status go green (and speech start being
     # sent) right away instead of serializing "wait for mic" then "wait for
-    # Gemini". Anything said before real audio frames arrive just buffers in
+    # Groq worker". Anything said before real audio frames arrive buffers in
     # the queue and gets sent once it's ready, so nothing said during
     # startup is lost. mic_wait_start_time is kept as
     # the anchor for the watchdog below, which still catches a mic that
@@ -3592,14 +3805,18 @@ if (
         == st.session_state.mic_generation
     )
 
-    worker_target = gemini_live_translate_worker
+    worker_target = groq_whisper_translate_worker
     worker_args = (
         processor.audio_queue,
         st.session_state.live_result_queue,
         st.session_state.live_stop_event,
         st.session_state.live_control_queue,
-        gemini_api_key,
-        "en",
+        groq_api_key,
+        active_glossary_entries,
+        domain_mode,
+        self_context,
+        stt_model_name,
+        float(stt_chunk_seconds),
         float(reset_seconds),
         drain_backlog,
     )
@@ -3651,7 +3868,7 @@ if (
             st.rerun()
 
 # ============================================================
-# Pull Gemini Live results into UI state
+# Pull Groq Whisper results into UI state
 # ============================================================
 
 while not st.session_state.live_result_queue.empty():
@@ -4131,12 +4348,12 @@ if st.session_state.mobile_mic_failure_message:
     st.warning(st.session_state.mobile_mic_failure_message)
 
 if st.session_state.live_running:
-    st.success("Gemini Live Translate running.")
+    st.success("Groq Whisper live captions running.")
 elif st.session_state.app_active:
     if st.session_state.mic_wait_notice:
         st.info(st.session_state.mic_wait_notice)
     else:
-        st.info("Starting Gemini Live Translate...")
+        st.info("Starting Groq Whisper captions...")
 else:
     st.info("Live translation stopped.")
 
@@ -4405,8 +4622,14 @@ if show_debug:
         st.write("Microphone processing profile:")
         st.code(microphone_profile)
 
-        st.write("Gemini input sample rate:")
-        st.code(f"{GEMINI_LIVE_INPUT_SAMPLE_RATE} Hz")
+        st.write("Whisper input sample rate:")
+        st.code(f"{AUDIO_INPUT_SAMPLE_RATE} Hz")
+
+        st.write("Whisper model:")
+        st.code(stt_model_name)
+
+        st.write("Audio chunk target:")
+        st.code(f"{stt_chunk_seconds:.1f} seconds")
 
         if webrtc_ctx.audio_processor:
             st.write("Mic processor frame count:")
@@ -4508,7 +4731,7 @@ if show_debug:
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
 
-        st.write("Gemini Live error:")
+        st.write("Groq live-caption error:")
         st.code(
             st.session_state.live_error
             if st.session_state.live_error
