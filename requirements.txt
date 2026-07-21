@@ -1,9 +1,7 @@
 streamlit
 streamlit-webrtc
 streamlit-autorefresh
-websocket-client
 av
 numpy
 google-genai
 groq
-websocket-client

@@ -5,6 +5,7 @@ import json
 import queue
 import threading
 import time
+import asyncio
 import base64
 import logging
 import urllib.parse
@@ -13,9 +14,10 @@ import urllib.request
 import av
 import numpy as np
 import streamlit as st
-import websocket
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
+from google import genai
+from google.genai import types
 from groq import Groq
 
 
@@ -28,7 +30,7 @@ from groq import Groq
 #   AttributeError: 'NoneType' object has no attribute 'sendto'
 #   AttributeError: 'NoneType' object has no attribute 'call_exception_handler'
 # It happens when aioice retries STUN on a datagram transport that has already
-# been closed. It is cleanup noise, not a Soniox/Groq failure.
+# been closed. It is cleanup noise, not a Gemini/Groq failure.
 
 try:
     from asyncio import selector_events
@@ -62,7 +64,6 @@ except Exception:
     pass
 
 
-SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"  
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
 DEFAULT_RESET_SECONDS = 3.0
@@ -71,11 +72,11 @@ MAX_TRANSLATION_CHARS = 480
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
-# Soniox expects a steady raw s16le audio stream after connection.
-# If WebRTC has not produced frames yet, send short silence frames so Soniox
-# does not close with "Audio data decode timeout".
-SONIOX_SILENCE_KEEPALIVE_SECONDS = 0.25
-SONIOX_SILENCE_KEEPALIVE_BYTES = b"\x00\x00" * 4800  # 100 ms at 48 kHz mono s16le
+# Gemini Live low-latency audio send settings.
+# 40 ms at 16 kHz mono int16 = 1280 bytes.
+GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
+GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
+GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
 
 # iPhone/Safari needs a new user tap after refresh before microphone capture.
 # Kept generous because real ICE/TURN negotiation can take longer than a few
@@ -101,11 +102,11 @@ KEY_TERM_STALE_SECONDS = 45.0
 SOURCE_LANG_JA_ONLY = "Japanese only"
 
 # Helper / correction AI
-# Main transcription/translation returns to Soniox.
+# Main transcription/translation returns to Gemini Live Translate.
 # Second AI correction/cleanup uses Groq because it is fast and has a usable free tier.
 GROQ_HELPER_FAST = "llama-3.1-8b-instant"
 
-ENGINE_SONIOX = "Soniox STT + Soniox translation + Groq correction"
+ENGINE_GEMINI_LIVE = "Gemini Live Translate + Groq correction"
 
 MAX_LLM_CONTEXT_CHUNKS = 2
 MAX_GROQ_CONTEXT_CHARS = 1100
@@ -113,7 +114,7 @@ MAX_GROQ_TRANSLATION_CHARS = 450
 MAX_GROQ_GLOSSARY_TERMS = 5
 
 # Helper AI safety net.
-# Soniox live transcription/translation keeps running, but Groq
+# Gemini Live Translate keeps running, but Groq
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
     "High Accuracy": {
@@ -126,7 +127,7 @@ LLM_BUDGET_MODES = {
         "interval": 25.0,
         "min_chars": 60,
         "session_limit": 300,
-        "description": "Recommended default for Soniox + Groq key-term support.",
+        "description": "Recommended default for Gemini + Groq key-term support.",
     },
     "Saver": {
         "interval": 60.0,
@@ -826,83 +827,6 @@ def merge_key_terms_preserve_order(primary_terms, secondary_terms, max_terms=5):
     return merged
 
 
-def filter_soniox_context_terms_for_domain(context_terms, translation_terms, domain_mode):
-    """
-    In Auto mode, do not bias Soniox toward Summer Course/BINUS.
-    Use 'school/event' when you actually need those terms.
-    """
-    domain = (domain_mode or "auto").lower()
-
-    if domain in ["school", "school/event", "event"]:
-        return context_terms, translation_terms
-
-    def keep_text(value):
-        return not contains_any_text(value or "", SCHOOL_TERM_WORDS)
-
-    filtered_context_terms = [
-        term
-        for term in context_terms or []
-        if keep_text(term)
-    ]
-
-    filtered_translation_terms = []
-
-    for item in translation_terms or []:
-        source = item.get("source", "")
-        target = item.get("target", "")
-
-        if keep_text(source) and keep_text(target):
-            filtered_translation_terms.append(item)
-
-    return filtered_context_terms, filtered_translation_terms
-
-
-def make_soniox_important_term_text(domain_mode):
-    """
-    Soniox context should be small and neutral.
-    Do not push unrelated terms too strongly, or STT may hallucinate them.
-    The real key-term truth comes from preprocessing + glossary after STT.
-    """
-    domain = (domain_mode or "auto").lower()
-
-    if domain == "automotive":
-        parts = [
-            "TTC means Time To Collision.",
-            "AEB means Autonomous Emergency Braking.",
-            "慣性補償 means inertia compensation.",
-            "ロータリーエンジン means rotary engine.",
-            "アペックスシール means apex seal.",
-        ]
-
-    elif domain in ["cad", "product design"]:
-        parts = [
-            "CAD means Computer-Aided Design.",
-            "治具 means jig.",
-            "三面図 means three-view drawing.",
-            "寸法拘束 means dimensional constraint.",
-            "幾何拘束 means geometric constraint.",
-            "面取り means chamfering.",
-            "三角形 means triangle.",
-        ]
-
-    elif domain in ["school", "school/event", "event"]:
-        parts = [
-            "サマーコース means Summer Course.",
-            "ビヌス大学 means BINUS University.",
-            "ARE means Automotive and Robotics Engineering.",
-            "PDE means Product Design Engineering.",
-            "BE means Business Engineering.",
-        ]
-
-    else:
-        parts = [
-            "Japanese technical classroom interpretation.",
-            "Only Japanese speech should be transcribed and translated.",
-        ]
-
-    return " ".join(parts)
-
-
 def glossary_candidate_matches(candidate, text, is_translation=False):
     """
     Preprocessing matcher.
@@ -1188,19 +1112,6 @@ def should_skip_as_filler(original, translation):
     return False
 
 
-def is_allowed_soniox_language(language_value):
-    """
-    If Soniox token language metadata exists, only accept Japanese.
-    If metadata is absent, return True and let the text gates decide.
-    """
-    language_value = str(language_value or "").strip().lower()
-
-    if not language_value:
-        return True
-
-    return language_value.startswith("ja") or language_value in ["jpn", "japanese"]
-
-
 def is_connection_noise_error(message):
     message = str(message or "").lower()
     noisy_parts = [
@@ -1217,7 +1128,7 @@ def is_connection_noise_error(message):
     return any(part in message for part in noisy_parts)
 
 
-def friendly_soniox_error(message):
+def friendly_live_error(message):
     message = str(message or "").strip()
 
     if not message:
@@ -1225,19 +1136,13 @@ def friendly_soniox_error(message):
 
     lower = message.lower()
 
-    if "audio data decode timeout" in lower or "audio data decode" in lower:
-        return (
-            "Soniox did not receive valid mic audio fast enough. "
-            "Check the mic permission, then press Start Translation again."
-        )
-
     if "request timeout" in lower or "timed out" in lower:
-        return "Soniox connection timed out. Press Start Translation again."
+        return "Gemini Live connection timed out. Press Start Translation again."
 
     if "write operation timed out" in lower or "audio send error" in lower:
-        return "Soniox audio connection stopped. Press Start Translation again."
+        return "Gemini Live audio connection stopped. Press Start Translation again."
 
-    return "Soniox connection stopped. Press Start Translation again."
+    return "Gemini Live connection stopped. Press Start Translation again."
 
 
 def looks_like_valid_japanese_for_display(text):
@@ -2605,7 +2510,7 @@ def llm_hint_worker(
         prompt = f"""
 Return ONLY JSON. No markdown.
 
-You are the second AI after Soniox.
+You are the second AI after Gemini Live Translate.
 Main purpose: help an interpreter by extracting difficult key terms.
 Also fix caption text only when the correction is obvious.
 
@@ -2619,7 +2524,7 @@ Rules:
 - Context/domain is background only, not evidence.
 - Do not invent facts.
 - If no key term, key_terms = [].
-- Keep corrected captions close to Soniox text.
+- Keep corrected captions close to the live transcription text.
 - If no correction needed, copy the current text.
 
 Context:
@@ -2756,423 +2661,346 @@ class AudioProcessor:
 
 
 # ============================================================
-# Soniox worker
+# Gemini Live Translate worker
 # ============================================================
 
-def soniox_live_worker(
+def downsample_pcm48_to_pcm16(pcm48_bytes):
+    """
+    Browser/WebRTC audio arrives as 48 kHz mono PCM16 (see AudioProcessor).
+    Gemini Live Translate expects raw 16-bit PCM mono at 16 kHz.
+    This simple downsampler keeps every 3rd sample.
+
+    It is not studio-quality resampling, but good enough for speech.
+    """
+    if not pcm48_bytes:
+        return b""
+
+    audio = np.frombuffer(pcm48_bytes, dtype=np.int16)
+
+    if audio.size == 0:
+        return b""
+
+    audio16 = audio[::3].astype(np.int16)
+    return audio16.tobytes()
+
+
+def append_stream_text(old_text, new_text, max_chars=800):
+    old_text = old_text or ""
+    new_text = new_text or ""
+
+    if not new_text:
+        return old_text.strip()
+
+    if old_text and old_text[-1] not in [" ", "\n", "。", "、", ".", "?", "!", "！", "？"]:
+        combined = old_text + " " + new_text
+    else:
+        combined = old_text + new_text
+
+    while "  " in combined:
+        combined = combined.replace("  ", " ")
+
+    if len(combined) > max_chars:
+        combined = combined[-max_chars:]
+
+    return combined.strip()
+
+
+def make_gemini_live_sdk_config(target_language_code="en"):
+    """
+    SDK config for Gemini Live Translate.
+    """
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        translation_config=types.TranslationConfig(
+            target_language_code=target_language_code,
+            echo_target_language=True,
+        ),
+    )
+
+
+def gemini_live_translate_worker(
     audio_queue,
     result_queue,
     stop_event,
     control_queue,
     api_key,
-    terms_file,
-    domain_mode,
-    caption_reset_seconds,
+    target_language_code="en",
+    caption_reset_seconds=DEFAULT_RESET_SECONDS,
     drain_backlog=True,
 ):
-    ws = None
+    """
+    Gemini Live Translate worker using the official google-genai SDK.
 
-    try:
-        context_terms, translation_terms = load_soniox_context_terms(terms_file)
-        context_terms, translation_terms = filter_soniox_context_terms_for_domain(
-            context_terms,
-            translation_terms,
-            domain_mode,
-        )
+    Emits the same result_queue message shapes as the previous Soniox worker
+    (tokens / page_reset / cleared / debug / error / stopped), so the
+    draining loop and everything downstream of it (filler gate, Japanese-only
+    gate, glossary/key-term extraction, Groq correction) needs no changes.
 
-        if domain_mode == "auto":
-            domain_text = (
-                "Advanced Japanese-only technical classroom interpretation. "
-                "Possible topics: automotive engineering, CAD, product design, vehicle systems, "
-                "braking systems, vehicle control, TTC, Time To Collision, AEB, "
-                "inertia compensation, jig, mechanical drawing, three-view drawing, "
-                "dimensional constraint, geometric constraint, Pad, Fillet, Chamfer, rotary engine, apex seal"
-            )
+    Deliberately does not re-implement a Japanese-only gate here: the main
+    thread's looks_like_valid_japanese_for_display()/should_skip_as_filler()
+    already do that, with a stronger check (char ratio, filler stripping,
+    vague-fragment rejection) than anything practical to do per-chunk here.
+    """
 
-        elif domain_mode == "automotive":
-            domain_text = (
-                "Japanese automotive engineering class, vehicle systems, braking systems, "
-                "drivetrain, suspension, steering, ADAS, AEB, TTC, Time To Collision, "
-                "vehicle control, inertia compensation, rotary engine, rotor, apex seal, reciprocating engine"
-            )
+    # Drop stale audio frames before opening a fresh Gemini session, but only
+    # on a reconnect (Stop then Start again keeps the same mic connection
+    # running, so audio keeps piling up in the queue while stopped). On a
+    # genuine first start there is nothing stale to drop, and draining here
+    # would throw away whatever the speaker already said while the
+    # connection was still coming up.
+    if drain_backlog:
+        try:
+            while True:
+                audio_queue.get_nowait()
+        except queue.Empty:
+            pass
 
-        elif domain_mode == "cad":
-            domain_text = (
-                "Advanced Japanese-only CAD/mechanical drawing class. "
-                "CAD, jig, fixture, three-view drawing, mechanical drawing, sketch constraints, dimensional constraints, "
-                "geometric constraints, fully constrained sketch, degrees of freedom, Pad, extrusion, "
-                "Hole, fillet, chamfering, projection drawing, product modeling"
-            )
-
-        elif domain_mode == "product design":
-            domain_text = (
-                "Japanese product design class, CAD modeling, design process, design intent, "
-                "dimensions, materials, usability, strength, manufacturability, cost, product development, prototyping"
-            )
-
-        elif domain_mode in ["school", "school/event", "event"]:
-            domain_text = (
-                "Japanese school event interpretation, Summer Course, BINUS, BINUS ASO, "
-                "BINUS University, students coming to Japan, lectures, internships, training, Japanese culture, "
-                "ARE, PDE, BE majors"
-            )
-
-        else:
-            domain_text = "Japanese technical classroom interpretation"
-
-        task_text = (
-            "Advanced Japanese-only mode. The target source speech is Japanese technical classroom speech. "
-            "Do not force unrelated English or Indonesian into Japanese. Translate valid Japanese into English."
-        )
-
-        config = {
-            "api_key": api_key,
-            "model": "stt-rt-v5",
-            "audio_format": "s16le",
-            "sample_rate": 48000,
-            "num_channels": 1,
-            "enable_language_identification": True,
-            "enable_endpoint_detection": True,
-            "max_endpoint_delay_ms": 800,
-            "context": {
-                "general": [
-                    {
-                        "key": "domain",
-                        "value": domain_text,
-                    },
-                    {
-                        "key": "important_term",
-                        "value": make_soniox_important_term_text(domain_mode),
-                    },
-                    {
-                        "key": "source_language_mode",
-                        "value": SOURCE_LANG_JA_ONLY,
-                    },
-                    {
-                        "key": "task",
-                        "value": task_text,
-                    },
-                    {
-                        "key": "style",
-                        "value": (
-                            "Use short, readable English captions. "
-                            "Preserve technical terms accurately."
-                        ),
-                    },
-                ],
-                "terms": context_terms,
-                "translation_terms": translation_terms,
-            },
-            "translation": {
-                "type": "one_way",
-                "target_language": "en",
-            },
-        }
-
-        # Hint Japanese, but do NOT force it. This reduces fake Japanese
-        # when English/Indonesian is spoken during testing.
-        config["language_hints"] = ["ja"]
-
-        # Drop stale audio frames before opening a fresh Soniox connection,
-        # but only on a reconnect (Stop then Start again keeps the same mic
-        # connection running, so audio keeps piling up in the queue while
-        # stopped). On a genuine first start there is nothing stale to drop,
-        # and draining here would throw away whatever the speaker already
-        # said while the connection was still coming up.
-        if drain_backlog:
-            try:
-                while True:
-                    audio_queue.get_nowait()
-            except queue.Empty:
-                pass
-
-        ws = websocket.create_connection(SONIOX_WS_URL, timeout=10)
-        ws.settimeout(0.5)
-        ws.send(json.dumps(config))
+    async def run_live_session():
+        client = genai.Client(api_key=api_key)
+        config = make_gemini_live_sdk_config(target_language_code)
 
         result_queue.put({
             "type": "debug",
-            "message": "Connected to Soniox.",
+            "message": "Connecting to Gemini Live Translate...",
         })
 
-        final_original = ""
-        final_translation = ""
-        last_token_time = time.time()
-        current_reset_seconds = float(caption_reset_seconds)
+        live_original = ""
+        live_translation = ""
+        last_text_time = time.time()
         reset_sent = False
+        first_input_seen = False
+        first_output_seen = False
 
-        def send_audio():
-            last_audio_send_time = 0.0
-            sent_silence_keepalive = False
+        async with client.aio.live.connect(
+            model=GEMINI_LIVE_TRANSLATE_MODEL,
+            config=config,
+        ) as session:
+            result_queue.put({
+                "type": "debug",
+                "message": "Gemini Live Translate session started.",
+            })
 
-            while not stop_event.is_set():
-                try:
-                    audio_bytes = audio_queue.get(timeout=0.1)
+            async def send_audio_loop():
+                nonlocal live_original
+                nonlocal live_translation
+                nonlocal last_text_time
+                nonlocal reset_sent
+                nonlocal first_input_seen
+                nonlocal first_output_seen
 
-                    if audio_bytes:
-                        ws.send_binary(audio_bytes)
-                        last_audio_send_time = time.time()
-                        sent_silence_keepalive = False
+                pcm16_buffer = bytearray()
+                last_send_time = time.time()
 
-                except queue.Empty:
-                    # If WebRTC is not producing frames yet, Soniox may close
-                    # with "Audio data decode timeout". Send a tiny silence
-                    # frame as a keepalive until real mic audio arrives.
-                    now = time.time()
-
-                    if (
-                        now - last_audio_send_time
-                        >= SONIOX_SILENCE_KEEPALIVE_SECONDS
-                    ):
+                while not stop_event.is_set():
+                    while control_queue is not None and not control_queue.empty():
                         try:
-                            ws.send_binary(SONIOX_SILENCE_KEEPALIVE_BYTES)
-                            last_audio_send_time = now
+                            command = control_queue.get_nowait()
 
-                            if not sent_silence_keepalive:
+                            if command == "clear":
+                                # Clear the worker's internal accumulated text too.
+                                # Otherwise old text can return after pressing Clear Captions.
+                                pcm16_buffer = bytearray()
+                                live_original = ""
+                                live_translation = ""
+                                last_text_time = time.time()
+                                reset_sent = False
+                                first_input_seen = False
+                                first_output_seen = False
+                                result_queue.put({"type": "cleared"})
+
+                            elif isinstance(command, dict) and command.get("type") == "set_base_caption":
+                                # After AI correction is applied, do NOT clear the text.
+                                # Use the corrected text as the new worker base, so
+                                # the next live tokens continue from the fixed caption.
+                                live_original = command.get("original", "") or live_original
+                                live_translation = command.get("translation", "") or live_translation
+                                pcm16_buffer = bytearray()
+                                last_text_time = time.time()
+                                reset_sent = False
+                                first_input_seen = bool(live_original)
+                                first_output_seen = bool(live_translation)
                                 result_queue.put({
                                     "type": "debug",
-                                    "message": "Sent silence audio keepalive while waiting for mic frames.",
+                                    "message": "Gemini worker base updated after AI correction.",
                                 })
-                                sent_silence_keepalive = True
 
-                        except Exception as e:
-                            message = f"Audio send error: {e}"
-                            if not stop_event.is_set():
-                                if is_connection_noise_error(message):
-                                    result_queue.put({
-                                        "type": "debug",
-                                        "message": message,
-                                    })
-                                else:
-                                    result_queue.put({
-                                        "type": "error",
-                                        "message": message,
-                                    })
+                        except queue.Empty:
                             break
 
-                    continue
+                    try:
+                        pcm48 = await asyncio.to_thread(audio_queue.get, True, 0.05)
 
-                except Exception as e:
-                    message = f"Audio send error: {e}"
-                    if not stop_event.is_set():
-                        if is_connection_noise_error(message):
+                        if pcm48:
+                            pcm16 = downsample_pcm48_to_pcm16(pcm48)
+
+                            if pcm16:
+                                pcm16_buffer.extend(pcm16)
+
+                    except queue.Empty:
+                        pass
+
+                    # Low latency: send about 40 ms of 16 kHz mono int16 audio
+                    # per packet. This helps Gemini receive speech earlier.
+                    now = time.time()
+                    should_send = (
+                        len(pcm16_buffer) >= GEMINI_LIVE_AUDIO_CHUNK_BYTES
+                        or (
+                            pcm16_buffer
+                            and now - last_send_time >= GEMINI_LIVE_AUDIO_FLUSH_SECONDS
+                        )
+                    )
+
+                    if not should_send:
+                        await asyncio.sleep(0.005)
+                        continue
+
+                    chunk = bytes(pcm16_buffer[:GEMINI_LIVE_AUDIO_CHUNK_BYTES])
+                    pcm16_buffer = pcm16_buffer[GEMINI_LIVE_AUDIO_CHUNK_BYTES:]
+                    last_send_time = now
+
+                    try:
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                data=chunk,
+                                mime_type="audio/pcm;rate=16000",
+                            )
+                        )
+                    except Exception as e:
+                        message = f"Audio send error: {e}"
+                        if not stop_event.is_set():
+                            if is_connection_noise_error(message):
+                                result_queue.put({"type": "debug", "message": message})
+                            else:
+                                result_queue.put({"type": "error", "message": message})
+                        break
+
+                    await asyncio.sleep(0.003)
+
+            async def receive_loop():
+                nonlocal live_original
+                nonlocal live_translation
+                nonlocal last_text_time
+                nonlocal reset_sent
+                nonlocal first_input_seen
+                nonlocal first_output_seen
+
+                async for response in session.receive():
+                    if stop_event.is_set():
+                        break
+
+                    server_content = getattr(response, "server_content", None)
+
+                    if not server_content:
+                        continue
+
+                    input_transcription = getattr(server_content, "input_transcription", None)
+                    output_transcription = getattr(server_content, "output_transcription", None)
+
+                    input_text = ""
+                    output_text = ""
+
+                    if input_transcription:
+                        input_text = getattr(input_transcription, "text", "") or ""
+
+                    if output_transcription:
+                        output_text = getattr(output_transcription, "text", "") or ""
+
+                    if input_text or output_text:
+                        last_text_time = time.time()
+                        reset_sent = False
+
+                    if input_text:
+                        if not first_input_seen:
+                            first_input_seen = True
                             result_queue.put({
                                 "type": "debug",
-                                "message": message,
+                                "message": "Gemini Live Japanese input transcription started.",
                             })
-                        else:
-                            result_queue.put({
-                                "type": "error",
-                                "message": message,
-                            })
-                    break
 
-            try:
-                ws.send_binary(b"")
-            except Exception:
-                pass
+                        live_original = append_stream_text(
+                            live_original,
+                            light_original_cleanup(input_text),
+                            max_chars=MAX_ORIGINAL_CHARS * 2,
+                        )
 
-        sender_thread = threading.Thread(target=send_audio, daemon=True)
-        sender_thread.start()
-
-        while not stop_event.is_set():
-            while control_queue is not None and not control_queue.empty():
-                try:
-                    command = control_queue.get_nowait()
-
-                    if command == "clear":
-                        # Clear worker-side accumulated text so old captions do not return.
-                        final_original = ""
-                        final_translation = ""
-                        last_token_time = time.time()
-                        reset_sent = False
-                        result_queue.put({"type": "cleared"})
-
-                    elif isinstance(command, dict) and command.get("type") == "set_base_caption":
-                        # After AI correction is applied, do NOT clear the text.
-                        # Use the corrected text as the new worker base, so
-                        # the next live tokens continue from the fixed caption.
-                        final_original = command.get("original", "") or final_original
-                        final_translation = command.get("translation", "") or final_translation
-                        last_token_time = time.time()
-                        reset_sent = False
+                        # Show Japanese immediately, even before English translation arrives.
                         result_queue.put({
-                            "type": "debug",
-                            "message": "Soniox worker base updated after AI correction.",
+                            "type": "tokens",
+                            "original": live_original,
+                            "translation": live_translation,
+                            "endpoint": False,
                         })
 
-                    elif isinstance(command, dict):
-                        if command.get("type") == "set_reset_seconds":
-                            current_reset_seconds = float(
-                                command.get("value", current_reset_seconds)
-                            )
+                    if output_text:
+                        if not first_output_seen:
+                            first_output_seen = True
                             result_queue.put({
                                 "type": "debug",
-                                "message": f"Reset seconds changed to {current_reset_seconds}",
+                                "message": "Gemini Live English output translation started.",
                             })
 
-                except queue.Empty:
-                    break
+                        live_translation = append_stream_text(
+                            live_translation,
+                            light_caption_cleanup(output_text),
+                            max_chars=MAX_TRANSLATION_CHARS * 2,
+                        )
 
-            try:
-                msg = ws.recv()
+                        # English appears when Gemini finishes/streams translation.
+                        result_queue.put({
+                            "type": "tokens",
+                            "original": live_original,
+                            "translation": live_translation,
+                            "endpoint": False,
+                        })
 
-            except websocket.WebSocketTimeoutException:
-                if (
-                    (final_original or final_translation)
-                    and not reset_sent
-                    and time.time() - last_token_time > current_reset_seconds
-                ):
-                    result_queue.put({"type": "page_reset"})
-                    reset_sent = True
-                continue
+            async def reset_watchdog_loop():
+                nonlocal live_original
+                nonlocal live_translation
+                nonlocal last_text_time
+                nonlocal reset_sent
 
-            except Exception as e:
-                if not stop_event.is_set():
-                    result_queue.put({
-                        "type": "error",
-                        "message": f"WebSocket receive error: {e}",
-                    })
-                break
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.25)
 
-            if not msg:
-                continue
+                    if not live_original and not live_translation:
+                        continue
 
-            try:
-                data = json.loads(msg)
-            except json.JSONDecodeError:
-                continue
+                    if time.time() - last_text_time >= float(caption_reset_seconds) and not reset_sent:
+                        result_queue.put({"type": "page_reset"})
+                        live_original = ""
+                        live_translation = ""
+                        reset_sent = True
 
-            if data.get("error_code"):
-                soniox_message = data.get("error_message", "Unknown Soniox error")
-                result_queue.put({
-                    "type": "error",
-                    "message": soniox_message,
-                })
-                break
+            send_task = asyncio.create_task(send_audio_loop())
+            receive_task = asyncio.create_task(receive_loop())
+            reset_task = asyncio.create_task(reset_watchdog_loop())
 
-            if data.get("finished"):
-                break
-
-            tokens = data.get("tokens", [])
-
-            has_real_token = any(
-                token.get("text", "") and token.get("text", "") != "<end>"
-                for token in tokens
+            done, pending = await asyncio.wait(
+                [send_task, receive_task, reset_task],
+                return_when=asyncio.FIRST_EXCEPTION,
             )
 
-            if has_real_token:
-                now = time.time()
+            for task in pending:
+                task.cancel()
 
-                if now - last_token_time > current_reset_seconds:
-                    final_original = ""
-                    final_translation = ""
-                    result_queue.put({"type": "page_reset"})
+            for task in done:
+                error = task.exception()
+                if error:
+                    raise error
 
-                reset_sent = False
-                last_token_time = now
-
-            non_final_original = ""
-            non_final_translation = ""
-            endpoint_detected = False
-
-            # If this Soniox message contains a source token that gets rejected
-            # for being non-Japanese, its paired translation token(s) in the same
-            # message are for that same foreign speech and must not leak through
-            # just because translation tokens aren't language-gated below.
-            saw_rejected_source_token = any(
-                token.get("text", "")
-                and token.get("text", "") != "<end>"
-                and token.get("translation_status") not in ["translation", "translated"]
-                and not is_allowed_soniox_language(
-                    token.get("language")
-                    or token.get("language_code")
-                    or token.get("detected_language")
-                    or token.get("source_language")
-                )
-                for token in tokens
-            )
-
-            for token in tokens:
-                text = token.get("text", "")
-
-                if not text:
-                    continue
-
-                if text == "<end>":
-                    endpoint_detected = True
-                    continue
-
-                status = token.get("translation_status")
-                is_final = token.get("is_final", False)
-                is_translation_token = status in ["translation", "translated"]
-
-                token_language = (
-                    token.get("language")
-                    or token.get("language_code")
-                    or token.get("detected_language")
-                    or token.get("source_language")
-                )
-
-                # Important:
-                # Only source/original tokens must pass the Japanese language gate.
-                # Translation tokens are target-language English, so filtering them
-                # as non-Japanese makes the English caption stop early.
-                if (
-                    not is_translation_token
-                    and not is_allowed_soniox_language(token_language)
-                ):
-                    continue
-
-                # A translation token riding alongside a rejected non-Japanese
-                # source token in this same message is a translation of that
-                # foreign speech, not of confirmed Japanese. Drop it too.
-                if is_translation_token and saw_rejected_source_token:
-                    continue
-
-                if is_translation_token:
-                    if is_final:
-                        final_translation += text
-                    else:
-                        non_final_translation += text
-                else:
-                    if is_final:
-                        final_original += text
-                    else:
-                        non_final_original += text
-
-            current_original = (final_original + non_final_original).strip()
-            current_original = strip_leading_japanese_fillers(current_original)
-            current_original = light_original_cleanup(current_original)
-
-            current_translation = (final_translation + non_final_translation).strip()
-            current_translation = light_caption_cleanup(current_translation)
-
-            if should_skip_as_filler(current_original, current_translation):
-                continue
-
-            if current_original or current_translation:
-                result_queue.put({
-                    "type": "tokens",
-                    "original": current_original,
-                    "translation": current_translation,
-                    "endpoint": endpoint_detected,
-                })
+    try:
+        asyncio.run(run_live_session())
 
     except Exception as e:
         if not stop_event.is_set():
             result_queue.put({
                 "type": "error",
-                "message": str(e),
+                "message": f"Gemini Live error: {e}",
             })
 
     finally:
-        try:
-            if ws is not None:
-                ws.close()
-        except Exception:
-            pass
-
         result_queue.put({
             "type": "stopped",
         })
@@ -3190,7 +3018,7 @@ st.set_page_config(
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English live captions using Soniox STT/translation, "
+    "Japanese → English live captions using Gemini Live Translate, "
     "with preprocessing/glossary first and Groq as an optional helper."
 )
 
@@ -3202,8 +3030,8 @@ st.caption(
 with st.sidebar:
     st.header("Settings")
 
-    translation_engine = ENGINE_SONIOX
-    st.info("Translation engine: Soniox STT + translation")
+    translation_engine = ENGINE_GEMINI_LIVE
+    st.info("Translation engine: Gemini Live Translate")
     st.caption("Second AI helper: Groq correction")
 
     domain_mode = st.selectbox(
@@ -3214,7 +3042,7 @@ with st.sidebar:
     )
     st.caption(f"Helper AI fixed context: {domain_mode}")
 
-    st.caption("Source mode: Soniox language identification + Japanese filter. Not forced.")
+    st.caption("Source mode: Gemini language understanding + Japanese filter. Not forced.")
 
     main_display_mode = st.radio(
         "Main display",
@@ -3350,7 +3178,7 @@ defaults = {
     "pending_start_translation": False,
     "mic_instance_id": 0,
     "mic_generation": 0,
-    "soniox_started_for_generation": None,
+    "live_started_for_generation": None,
     "mobile_mic_failure_message": "",
     "current_engine": "",
 
@@ -3358,12 +3186,12 @@ defaults = {
     "live_translation": "",
     "last_japanese_token_time": 0.0,
     "caption_history": [],
-    "soniox_running": False,
-    "soniox_error": "",
-    "soniox_result_queue": queue.Queue(),
-    "soniox_control_queue": queue.Queue(),
-    "soniox_stop_event": threading.Event(),
-    "soniox_thread": None,
+    "live_running": False,
+    "live_error": "",
+    "live_result_queue": queue.Queue(),
+    "live_control_queue": queue.Queue(),
+    "live_stop_event": threading.Event(),
+    "live_thread": None,
     "debug_messages": [],
     "mic_wait_start_time": 0.0,
     "mic_wait_notice": "",
@@ -3409,22 +3237,22 @@ for key, value in defaults.items():
 if st.session_state.current_engine and st.session_state.current_engine != translation_engine:
     st.session_state.app_active = False
     st.session_state.pending_start_translation = False
-    st.session_state.soniox_running = False
-    st.session_state.soniox_stop_event.set()
+    st.session_state.live_running = False
+    st.session_state.live_stop_event.set()
     # Keep the WebRTC component stable. Recreating it repeatedly can leave
     # old aioice STUN retry timers behind on Streamlit Cloud.
     st.session_state.current_engine = translation_engine
     st.rerun()
 
 if not st.session_state.current_engine:
-    st.session_state.current_engine = ENGINE_SONIOX
+    st.session_state.current_engine = ENGINE_GEMINI_LIVE
 
 
 if float(reset_seconds) != float(st.session_state.last_reset_seconds):
     st.session_state.last_reset_seconds = float(reset_seconds)
 
-    if st.session_state.soniox_running:
-        st.session_state.soniox_control_queue.put({
+    if st.session_state.live_running:
+        st.session_state.live_control_queue.put({
             "type": "set_reset_seconds",
             "value": float(reset_seconds),
         })
@@ -3434,14 +3262,15 @@ if float(reset_seconds) != float(st.session_state.last_reset_seconds):
 # API keys
 # ============================================================
 
-api_key = safe_get_secret_or_env("SONIOX_API_KEY")
+gemini_api_key = safe_get_secret_or_env("GEMINI_API_KEY")
 groq_api_key = safe_get_secret_or_env("GROQ_API_KEY")
 
-if not api_key:
+if not gemini_api_key:
     st.error(
-        "SONIOX_API_KEY is not set.\n\n"
-        "Soniox mode needs Soniox for Japanese STT/translation. For Streamlit Cloud, add this in Secrets:\n\n"
-        'SONIOX_API_KEY = "your_soniox_api_key_here"'
+        "GEMINI_API_KEY is not set.\n\n"
+        "Gemini Live Translate needs a Gemini API key for Japanese STT/translation. "
+        "For Streamlit Cloud, add this in Secrets:\n\n"
+        'GEMINI_API_KEY = "your_gemini_api_key_here"'
     )
     st.stop()
 
@@ -3476,7 +3305,7 @@ else:
 webrtc_ctx = webrtc_streamer(
     # Stable key prevents repeated WebRTC peer-connection destruction/recreation.
     # Use the manual Reset mic connection button below if a hard reset is needed.
-    key=f"soniox-live-caption-mic-{st.session_state.mic_generation}",
+    key=f"gemini-live-caption-mic-{st.session_state.mic_generation}",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -3523,42 +3352,42 @@ reset_mic_clicked = st.button(
 if reset_mic_clicked:
     st.session_state.app_active = False
     st.session_state.pending_start_translation = False
-    st.session_state.soniox_running = False
+    st.session_state.live_running = False
     st.session_state.mic_generation += 1
     st.session_state.mobile_mic_failure_message = (
         "Mic connection reset. Tap Start Translation to enable the microphone again."
     )
-    st.session_state.soniox_stop_event.set()
-    st.session_state.soniox_result_queue = queue.Queue()
-    st.session_state.soniox_control_queue = queue.Queue()
-    st.session_state.soniox_thread = None
+    st.session_state.live_stop_event.set()
+    st.session_state.live_result_queue = queue.Queue()
+    st.session_state.live_control_queue = queue.Queue()
+    st.session_state.live_thread = None
     st.session_state.mic_wait_start_time = 0.0
     st.session_state.mic_wait_notice = ""
-    st.session_state.soniox_error = ""
+    st.session_state.live_error = ""
     st.rerun()
 
 if toggle_clicked:
     if st.session_state.app_active:
         st.session_state.app_active = False
         st.session_state.pending_start_translation = False
-        st.session_state.soniox_running = False
-        st.session_state.soniox_stop_event.set()
-        st.session_state.soniox_result_queue = queue.Queue()
-        st.session_state.soniox_control_queue = queue.Queue()
-        st.session_state.soniox_thread = None
+        st.session_state.live_running = False
+        st.session_state.live_stop_event.set()
+        st.session_state.live_result_queue = queue.Queue()
+        st.session_state.live_control_queue = queue.Queue()
+        st.session_state.live_thread = None
         st.session_state.mic_wait_start_time = 0.0
         st.session_state.mic_wait_notice = ""
 
         st.rerun()
 
     else:
-        st.session_state.soniox_stop_event = threading.Event()
-        st.session_state.soniox_result_queue = queue.Queue()
-        st.session_state.soniox_control_queue = queue.Queue()
-        st.session_state.soniox_thread = None
+        st.session_state.live_stop_event = threading.Event()
+        st.session_state.live_result_queue = queue.Queue()
+        st.session_state.live_control_queue = queue.Queue()
+        st.session_state.live_thread = None
         st.session_state.app_active = True
         st.session_state.pending_start_translation = True
-        st.session_state.soniox_error = ""
+        st.session_state.live_error = ""
         st.session_state.mobile_mic_failure_message = ""
         st.session_state.mic_wait_start_time = time.time()
         st.session_state.mic_wait_notice = "Waiting for browser microphone audio..."
@@ -3573,7 +3402,7 @@ if clear_clicked:
     st.session_state.last_japanese_token_time = 0.0
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
-    st.session_state.soniox_error = ""
+    st.session_state.live_error = ""
     st.session_state.pending_visual_reset = False
     st.session_state.caption_stage = "idle"
     st.session_state.last_raw_input_time = ""
@@ -3599,8 +3428,8 @@ if clear_clicked:
     st.session_state.llm_cooldown_until = 0.0
     st.session_state.llm_last_finish_time = ""
 
-    if st.session_state.soniox_running:
-        st.session_state.soniox_control_queue.put("clear")
+    if st.session_state.live_running:
+        st.session_state.live_control_queue.put("clear")
         st.session_state.debug_messages.append("Clear requested.")
         st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
 
@@ -3615,30 +3444,30 @@ if clear_clicked:
 
 
 # ============================================================
-# Auto-start Soniox as soon as the mic connection exists
+# Auto-start Gemini Live Translate as soon as the mic connection exists
 # ============================================================
 
 if (
     st.session_state.pending_start_translation
     and st.session_state.app_active
-    and not st.session_state.soniox_running
+    and not st.session_state.live_running
     and webrtc_ctx.audio_processor
 ):
-    # Start Soniox immediately, in parallel with the browser mic connection
-    # still coming up, instead of waiting to confirm audio first. This is
-    # what makes the status go green (and speech start being sent) right
-    # away instead of serializing "wait for mic" then "wait for Soniox".
-    # Anything said before real audio frames arrive just buffers in the
-    # queue (see drain_backlog below) and gets sent once it's ready, so
-    # nothing said during startup is lost. mic_wait_start_time is kept as
+    # Start Gemini Live Translate immediately, in parallel with the browser
+    # mic connection still coming up, instead of waiting to confirm audio
+    # first. This is what makes the status go green (and speech start being
+    # sent) right away instead of serializing "wait for mic" then "wait for
+    # Gemini". Anything said before real audio frames arrive just buffers in
+    # the queue and gets sent once it's ready, so nothing said during
+    # startup is lost. mic_wait_start_time is kept as
     # the anchor for the watchdog below, which still catches a mic that
     # never actually starts (e.g. the iOS Safari refresh bug).
     processor = webrtc_ctx.audio_processor
 
-    st.session_state.soniox_stop_event = threading.Event()
-    st.session_state.soniox_result_queue = queue.Queue()
-    st.session_state.soniox_control_queue = queue.Queue()
-    st.session_state.soniox_error = ""
+    st.session_state.live_stop_event = threading.Event()
+    st.session_state.live_result_queue = queue.Queue()
+    st.session_state.live_control_queue = queue.Queue()
+    st.session_state.live_error = ""
     st.session_state.debug_messages = []
     st.session_state.live_original = ""
     st.session_state.live_translation = ""
@@ -3671,7 +3500,7 @@ if (
     st.session_state.llm_cooldown_until = 0.0
     st.session_state.llm_last_finish_time = ""
 
-    st.session_state.soniox_running = True
+    st.session_state.live_running = True
     st.session_state.pending_start_translation = False
     st.session_state.mic_wait_notice = ""
     # Anchors the watchdog below: how long has it been since we started,
@@ -3684,38 +3513,37 @@ if (
     # to drop, and draining it would discard whatever was already said
     # while the connection was still coming up.
     drain_backlog = (
-        st.session_state.get("soniox_started_for_generation")
+        st.session_state.get("live_started_for_generation")
         == st.session_state.mic_generation
     )
 
-    worker_target = soniox_live_worker
+    worker_target = gemini_live_translate_worker
     worker_args = (
         processor.audio_queue,
-        st.session_state.soniox_result_queue,
-        st.session_state.soniox_stop_event,
-        st.session_state.soniox_control_queue,
-        api_key,
-        terms_file,
-        domain_mode,
+        st.session_state.live_result_queue,
+        st.session_state.live_stop_event,
+        st.session_state.live_control_queue,
+        gemini_api_key,
+        "en",
         float(reset_seconds),
         drain_backlog,
     )
 
-    st.session_state.soniox_thread = threading.Thread(
+    st.session_state.live_thread = threading.Thread(
         target=worker_target,
         args=worker_args,
         daemon=True,
     )
 
-    st.session_state.soniox_thread.start()
-    st.session_state.soniox_started_for_generation = st.session_state.mic_generation
+    st.session_state.live_thread.start()
+    st.session_state.live_started_for_generation = st.session_state.mic_generation
 
 # ============================================================
 # Watchdog: recover if the mic connection never actually sends audio
 # ============================================================
 
 if (
-    st.session_state.soniox_running
+    st.session_state.live_running
     and webrtc_ctx.audio_processor
     and st.session_state.get("mic_wait_start_time", 0.0)
 ):
@@ -3736,8 +3564,8 @@ if (
             # WebRTC component.
             st.session_state.app_active = False
             st.session_state.pending_start_translation = False
-            st.session_state.soniox_running = False
-            st.session_state.soniox_stop_event.set()
+            st.session_state.live_running = False
+            st.session_state.live_stop_event.set()
             st.session_state.mic_generation += 1
             st.session_state.mic_wait_start_time = 0.0
             st.session_state.mic_wait_notice = ""
@@ -3748,11 +3576,11 @@ if (
             st.rerun()
 
 # ============================================================
-# Pull Soniox results into UI state
+# Pull Gemini Live results into UI state
 # ============================================================
 
-while not st.session_state.soniox_result_queue.empty():
-    item = st.session_state.soniox_result_queue.get()
+while not st.session_state.live_result_queue.empty():
+    item = st.session_state.live_result_queue.get()
     item_type = item.get("type")
 
     if item_type == "tokens":
@@ -3780,7 +3608,7 @@ while not st.session_state.soniox_result_queue.empty():
         if JAPANESE_ONLY_MODE:
             if original and not looks_like_valid_japanese_for_display(original):
                 st.session_state.debug_messages.append(
-                    f"Ignored non-Japanese or low-quality Soniox text: {original[:80]}"
+                    f"Ignored non-Japanese or low-quality live text: {original[:80]}"
                 )
                 st.session_state.debug_messages = st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
                 continue
@@ -3890,7 +3718,7 @@ while not st.session_state.soniox_result_queue.empty():
                 st.session_state.correction_status = "waiting_for_english"
 
         if translation:
-            # Use current Soniox translation directly.
+            # Use current live translation directly.
             # Keeping an older, longer translation made English and Japanese
             # captions become different conversations.
             st.session_state.live_translation = translation
@@ -3980,15 +3808,15 @@ while not st.session_state.soniox_result_queue.empty():
                 st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
             )
         else:
-            st.session_state.soniox_error = error_message
-        st.session_state.soniox_running = False
+            st.session_state.live_error = error_message
+        st.session_state.live_running = False
         st.session_state.app_active = False
         st.session_state.pending_start_translation = False
         st.session_state.mic_wait_start_time = 0.0
         st.session_state.mic_wait_notice = ""
 
     elif item_type == "stopped":
-        st.session_state.soniox_running = False
+        st.session_state.live_running = False
 
 
 # ============================================================
@@ -4045,7 +3873,7 @@ while not st.session_state.llm_result_queue.empty():
 
             # Important:
             # Do NOT replace the whole live caption with the second-AI answer.
-            # The second AI may have corrected an older segment while new Soniox
+            # The second AI may have corrected an older segment while new live
             # text has already arrived. Patch only the source segment the AI saw.
             corrected_base_original, corrected_base_translation = merge_ai_result_into_live_caption(
                 live_original=st.session_state.live_original,
@@ -4076,8 +3904,8 @@ while not st.session_state.llm_result_queue.empty():
                 st.session_state.live_translation,
             )
 
-            if st.session_state.soniox_running:
-                st.session_state.soniox_control_queue.put({
+            if st.session_state.live_running:
+                st.session_state.live_control_queue.put({
                     "type": "set_base_caption",
                     "original": st.session_state.live_original,
                     "translation": st.session_state.live_translation,
@@ -4148,7 +3976,7 @@ if use_llm_hints and groq_api_key:
     )
 
     if (
-        st.session_state.soniox_running
+        st.session_state.live_running
         and translated_text_ready
         and enough_text
         and changed_text
@@ -4217,7 +4045,7 @@ if use_llm_hints:
         st.session_state.correction_status = "off"
     elif st.session_state.llm_calls_this_session >= int(llm_session_limit):
         st.session_state.llm_budget_reached = True
-        if st.session_state.soniox_running:
+        if st.session_state.live_running:
             st.session_state.correction_status = "budget_reached"
 
 # ============================================================
@@ -4227,21 +4055,21 @@ if use_llm_hints:
 if st.session_state.mobile_mic_failure_message:
     st.warning(st.session_state.mobile_mic_failure_message)
 
-if st.session_state.soniox_running:
-    st.success("Soniox STT/translation running.")
+if st.session_state.live_running:
+    st.success("Gemini Live Translate running.")
 elif st.session_state.app_active:
     if st.session_state.mic_wait_notice:
         st.info(st.session_state.mic_wait_notice)
     else:
-        st.info("Starting Soniox STT/translation...")
+        st.info("Starting Gemini Live Translate...")
 else:
     st.info("Live translation stopped.")
 
-if st.session_state.soniox_error:
+if st.session_state.live_error:
     if show_error_details or show_debug:
-        st.error(st.session_state.soniox_error)
+        st.error(st.session_state.live_error)
     else:
-        st.caption(friendly_soniox_error(st.session_state.soniox_error))
+        st.caption(friendly_live_error(st.session_state.live_error))
 
 if use_llm_hints and st.session_state.llm_error:
     if show_error_details or show_debug:
@@ -4592,10 +4420,10 @@ if show_debug:
         st.write("Mic instance:")
         st.code(str(st.session_state.mic_instance_id))
 
-        st.write("Soniox error:")
+        st.write("Gemini Live error:")
         st.code(
-            st.session_state.soniox_error
-            if st.session_state.soniox_error
+            st.session_state.live_error
+            if st.session_state.live_error
             else "No error"
         )
 
@@ -4836,6 +4664,6 @@ st.html(caption_html)
 # Live refresh
 # ============================================================
 
-if st.session_state.app_active or st.session_state.soniox_running:
+if st.session_state.app_active or st.session_state.live_running:
     time.sleep(0.2)
     st.rerun()
