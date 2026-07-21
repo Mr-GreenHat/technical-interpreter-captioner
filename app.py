@@ -7,6 +7,8 @@ import threading
 import time
 import base64
 import logging
+import urllib.parse
+import urllib.request
 
 import av
 import numpy as np
@@ -291,6 +293,121 @@ def safe_get_secret_or_env(key):
         value = os.getenv(key)
 
     return value
+
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_metered_ice_servers(api_key):
+    """
+    Fetch temporary STUN/TURN credentials from Metered.
+
+    The API key stays on the Streamlit server. It is not sent to browser code.
+    Returned ICE credentials are cached for 30 minutes.
+    """
+    api_key = str(api_key or "").strip()
+
+    if not api_key:
+        return [], "METERED_TURN_API_KEY is missing."
+
+    query = urllib.parse.urlencode({"apiKey": api_key})
+    url = (
+        "https://translation.metered.live/api/v1/turn/credentials?"
+        + query
+    )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "technical-interpreter-captioner/1.0",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = response.read().decode("utf-8")
+            data = json.loads(payload)
+
+    except Exception as exc:
+        return [], f"Could not fetch Metered TURN credentials: {exc}"
+
+    if not isinstance(data, list):
+        return [], "Metered TURN API returned an unexpected response."
+
+    ice_servers = []
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        urls = item.get("urls")
+
+        if not urls:
+            continue
+
+        server = {"urls": urls}
+
+        username = item.get("username")
+        credential = item.get("credential")
+
+        if username:
+            server["username"] = str(username)
+
+        if credential:
+            server["credential"] = str(credential)
+
+        ice_servers.append(server)
+
+    if not ice_servers:
+        return [], "Metered TURN API returned no ICE servers."
+
+    return ice_servers, ""
+
+
+def build_rtc_configuration():
+    """
+    Build the browser WebRTC ICE configuration.
+
+    Primary:
+        Metered temporary TURN/STUN credentials.
+
+    Fallback:
+        Google STUN only. This may work on desktop Wi-Fi, but mobile networks
+        often require TURN.
+    """
+    metered_api_key = safe_get_secret_or_env("METERED_TURN_API_KEY")
+    metered_servers, metered_error = fetch_metered_ice_servers(metered_api_key)
+
+    if metered_servers:
+        return (
+            RTCConfiguration({
+                "iceServers": metered_servers,
+                "iceTransportPolicy": "all",
+            }),
+            True,
+            "",
+            metered_servers,
+        )
+
+    fallback_servers = [
+        {
+            "urls": [
+                "stun:stun.l.google.com:19302",
+                "stun:stun1.l.google.com:19302",
+            ]
+        }
+    ]
+
+    return (
+        RTCConfiguration({
+            "iceServers": fallback_servers,
+            "iceTransportPolicy": "all",
+        }),
+        False,
+        metered_error,
+        fallback_servers,
+    )
 
 
 # ============================================================
@@ -3338,44 +3455,23 @@ if use_llm_hints and not groq_api_key:
 # Microphone / WebRTC
 # ============================================================
 
-rtc_configuration = RTCConfiguration(
-    {
-        "iceServers": [
-            {
-                "urls": [
-                    "stun:stun.l.google.com:19302",
-                    "stun:stun1.l.google.com:19302",
-                    "stun:stun2.l.google.com:19302",
-                    "stun:stun3.l.google.com:19302",
-                    "stun:stun4.l.google.com:19302",
-                ]
-            },
-            # Open Relay Project free/shared TURN fallback, used when a direct
-            # STUN connection can't be established (common on Streamlit Cloud).
-            # Public demo credentials, not rate-guaranteed: swap for a paid
-            # provider (e.g. Metered.ca) if this becomes unreliable.
-            # Confirmed NOT the cause of the "connects but no audio" issue
-            # (still happened with TURN disabled), so this stays enabled.
-            {
-                "urls": "turn:openrelay.metered.ca:80",
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-            {
-                "urls": "turn:openrelay.metered.ca:443",
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-            {
-                "urls": "turn:openrelay.metered.ca:443?transport=tcp",
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-        ]
-    }
+rtc_configuration, turn_server_ready, turn_error, active_ice_servers = (
+    build_rtc_configuration()
 )
 
+
 st.subheader("Microphone")
+
+if turn_server_ready:
+    st.caption("Mobile WebRTC relay: Metered TURN connected.")
+else:
+    st.warning(
+        "Metered TURN is unavailable, so the app is using STUN-only fallback. "
+        "Phones and mobile networks may not work."
+    )
+
+    if turn_error and show_debug:
+        st.code(turn_error)
 
 webrtc_ctx = webrtc_streamer(
     # Stable key prevents repeated WebRTC peer-connection destruction/recreation.
@@ -4396,6 +4492,12 @@ if show_debug:
 
         st.write("WebRTC mic generation:")
         st.code(str(st.session_state.get("mic_generation", 0)))
+
+        st.write("Metered TURN connected:")
+        st.code(str(turn_server_ready))
+
+        st.write("TURN fetch error:")
+        st.code(str(turn_error))
 
         if webrtc_ctx.audio_processor:
             st.write("Mic processor frame count:")
