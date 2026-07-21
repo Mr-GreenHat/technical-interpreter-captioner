@@ -73,10 +73,21 @@ MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
 # Gemini Live low-latency audio send settings.
+# Audio is resampled once, correctly, in AudioProcessor.
 # 40 ms at 16 kHz mono int16 = 1280 bytes.
-GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
+GEMINI_LIVE_INPUT_SAMPLE_RATE = 16000
+GEMINI_LIVE_AUDIO_CHUNK_MS = 40
+GEMINI_LIVE_AUDIO_CHUNK_BYTES = int(
+    GEMINI_LIVE_INPUT_SAMPLE_RATE
+    * (GEMINI_LIVE_AUDIO_CHUNK_MS / 1000.0)
+    * 2  # signed 16-bit mono PCM
+)
 GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
 GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
+
+# Bound the queue so a slow network cannot create minutes of delayed audio.
+# At roughly 20 ms per WebRTC frame, 200 chunks is about four seconds.
+AUDIO_QUEUE_MAX_CHUNKS = 200
 
 # iPhone/Safari needs a new user tap after refresh before microphone capture.
 # Kept generous because real ICE/TURN negotiation can take longer than a few
@@ -2622,16 +2633,47 @@ JSON:
 # ============================================================
 
 class AudioProcessor:
+    """Convert browser audio to Gemini-ready PCM exactly once.
+
+    WebRTC commonly supplies 48 kHz audio. The old implementation converted
+    it to 48 kHz PCM and later kept every third sample. That decimation had no
+    anti-alias filtering and could damage consonants and short Japanese sounds.
+    PyAV now performs proper mono 16 kHz resampling before data enters the queue.
+    """
+
     def __init__(self):
-        self.audio_queue = queue.Queue()
+        self.audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_MAX_CHUNKS)
         self.resampler = av.AudioResampler(
             format="s16",
             layout="mono",
-            rate=48000,
+            rate=GEMINI_LIVE_INPUT_SAMPLE_RATE,
         )
         self.frame_count = 0
+        self.dropped_audio_chunks = 0
         self.last_audio_time = 0.0
         self.last_audio_level = 0.0
+
+    def _put_latest_audio(self, audio_bytes):
+        """Keep latency bounded by dropping the oldest chunk if necessary."""
+        if not audio_bytes:
+            return
+
+        try:
+            self.audio_queue.put_nowait(audio_bytes)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self.audio_queue.get_nowait()
+            self.dropped_audio_chunks += 1
+        except queue.Empty:
+            pass
+
+        try:
+            self.audio_queue.put_nowait(audio_bytes)
+        except queue.Full:
+            self.dropped_audio_chunks += 1
 
     def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
         try:
@@ -2643,19 +2685,23 @@ class AudioProcessor:
                 if audio.size == 0:
                     continue
 
-                pcm16 = audio.astype(np.int16)
-                self.audio_queue.put(pcm16.tobytes())
+                # Explicit little-endian, contiguous signed PCM16.
+                pcm16 = np.ascontiguousarray(audio, dtype="<i2")
+                self._put_latest_audio(pcm16.tobytes())
 
                 self.frame_count += 1
                 self.last_audio_time = time.time()
 
                 try:
-                    self.last_audio_level = float(np.abs(pcm16).mean())
+                    # Cast before abs so -32768 does not overflow int16.
+                    self.last_audio_level = float(
+                        np.mean(np.abs(pcm16.astype(np.int32)))
+                    )
                 except Exception:
                     self.last_audio_level = 0.0
 
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug("Audio processing error: %s", exc)
 
         return frame
 
@@ -2663,26 +2709,6 @@ class AudioProcessor:
 # ============================================================
 # Gemini Live Translate worker
 # ============================================================
-
-def downsample_pcm48_to_pcm16(pcm48_bytes):
-    """
-    Browser/WebRTC audio arrives as 48 kHz mono PCM16 (see AudioProcessor).
-    Gemini Live Translate expects raw 16-bit PCM mono at 16 kHz.
-    This simple downsampler keeps every 3rd sample.
-
-    It is not studio-quality resampling, but good enough for speech.
-    """
-    if not pcm48_bytes:
-        return b""
-
-    audio = np.frombuffer(pcm48_bytes, dtype=np.int16)
-
-    if audio.size == 0:
-        return b""
-
-    audio16 = audio[::3].astype(np.int16)
-    return audio16.tobytes()
-
 
 def append_stream_text(old_text, new_text, max_chars=800, is_japanese=False):
     """
@@ -2840,13 +2866,15 @@ def gemini_live_translate_worker(
                             break
 
                     try:
-                        pcm48 = await asyncio.to_thread(audio_queue.get, True, 0.05)
+                        # AudioProcessor already provides mono 16 kHz PCM16.
+                        pcm16 = await asyncio.to_thread(
+                            audio_queue.get,
+                            True,
+                            0.05,
+                        )
 
-                        if pcm48:
-                            pcm16 = downsample_pcm48_to_pcm16(pcm48)
-
-                            if pcm16:
-                                pcm16_buffer.extend(pcm16)
+                        if pcm16:
+                            pcm16_buffer.extend(pcm16)
 
                     except queue.Empty:
                         pass
@@ -2874,7 +2902,9 @@ def gemini_live_translate_worker(
                         await session.send_realtime_input(
                             audio=types.Blob(
                                 data=chunk,
-                                mime_type="audio/pcm;rate=16000",
+                                mime_type=(
+                                    f"audio/pcm;rate={GEMINI_LIVE_INPUT_SAMPLE_RATE}"
+                                ),
                             )
                         )
                     except Exception as e:
@@ -3054,6 +3084,44 @@ with st.sidebar:
     st.caption(f"Helper AI fixed context: {domain_mode}")
 
     st.caption("Source mode: Gemini language understanding + Japanese filter. Not forced.")
+
+    microphone_profile = st.selectbox(
+        "Microphone processing",
+        [
+            "Technical speech (recommended)",
+            "Raw microphone",
+            "Speakerphone / strong echo control",
+        ],
+        index=0,
+        help=(
+            "Technical speech keeps noise suppression but disables browser "
+            "echo cancellation and automatic gain, which can clip short "
+            "Japanese syllables. Use Raw with a close external microphone. "
+            "Use Speakerphone only when loudspeaker echo is a real problem."
+        ),
+    )
+
+    if microphone_profile == "Raw microphone":
+        microphone_audio_constraints = {
+            "channelCount": 1,
+            "echoCancellation": False,
+            "noiseSuppression": False,
+            "autoGainControl": False,
+        }
+    elif microphone_profile == "Speakerphone / strong echo control":
+        microphone_audio_constraints = {
+            "channelCount": 1,
+            "echoCancellation": True,
+            "noiseSuppression": True,
+            "autoGainControl": True,
+        }
+    else:
+        microphone_audio_constraints = {
+            "channelCount": 1,
+            "echoCancellation": False,
+            "noiseSuppression": True,
+            "autoGainControl": False,
+        }
 
     main_display_mode = st.radio(
         "Main display",
@@ -3321,11 +3389,7 @@ webrtc_ctx = webrtc_streamer(
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
         "video": False,
-        "audio": {
-            "echoCancellation": True,
-            "noiseSuppression": True,
-            "autoGainControl": True,
-        },
+        "audio": microphone_audio_constraints,
     },
     audio_processor_factory=AudioProcessor,
     async_processing=True,
@@ -4338,11 +4402,24 @@ if show_debug:
         st.write("TURN fetch error:")
         st.code(str(turn_error))
 
+        st.write("Microphone processing profile:")
+        st.code(microphone_profile)
+
+        st.write("Gemini input sample rate:")
+        st.code(f"{GEMINI_LIVE_INPUT_SAMPLE_RATE} Hz")
+
         if webrtc_ctx.audio_processor:
             st.write("Mic processor frame count:")
             st.code(str(getattr(webrtc_ctx.audio_processor, "frame_count", 0)))
             st.write("Mic processor audio level:")
             st.code(str(getattr(webrtc_ctx.audio_processor, "last_audio_level", 0.0)))
+            st.write("Dropped stale audio chunks:")
+            st.code(str(getattr(webrtc_ctx.audio_processor, "dropped_audio_chunks", 0)))
+            try:
+                st.write("Audio queue size:")
+                st.code(str(webrtc_ctx.audio_processor.audio_queue.qsize()))
+            except Exception:
+                pass
 
         st.write("Last LLM checked token version:")
         st.code(str(st.session_state.last_llm_checked_token_version))
