@@ -2765,15 +2765,22 @@ def make_gemini_live_sdk_config(system_instruction_text):
     """
     SDK config for the general Gemini Live API (not the translate-only
     endpoint), so we can prime it with domain vocabulary via
-    system_instruction. TEXT response modality avoids the audio-synthesis
-    latency that AUDIO responses would add before a translation shows up.
+    system_instruction.
+
+    response_modalities=["TEXT"] would avoid the audio-synthesis latency AUDIO
+    responses add, but gemini-3.1-flash-live-preview currently rejects TEXT
+    outright (WebSocket 1007 "invalid argument" on connect — a known, widely
+    reported issue, not specific to this app). AUDIO + output_audio_transcription
+    is the documented workaround: still text in the end, just paced by how long
+    the model takes to synthesize speech first.
     """
     return types.LiveConnectConfig(
-        response_modalities=["TEXT"],
+        response_modalities=["AUDIO"],
         system_instruction=types.Content(
             parts=[types.Part(text=system_instruction_text)]
         ),
         input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
     )
 
 
@@ -2959,20 +2966,13 @@ def gemini_live_translate_worker(
                     input_text = ""
                     output_text = ""
 
+                    output_transcription = getattr(server_content, "output_transcription", None)
+
                     if input_transcription:
                         input_text = getattr(input_transcription, "text", "") or ""
 
-                    # General Live API: the translation is the model's own
-                    # generated text turn, not a transcript of synthesized
-                    # audio (there is no audio step with response_modalities
-                    # ["TEXT"]). Try the SDK's text convenience attribute
-                    # first, then fall back to walking the model_turn parts.
-                    output_text = getattr(response, "text", "") or ""
-
-                    if not output_text:
-                        model_turn = getattr(server_content, "model_turn", None)
-                        for part in getattr(model_turn, "parts", None) or []:
-                            output_text += getattr(part, "text", "") or ""
+                    if output_transcription:
+                        output_text = getattr(output_transcription, "text", "") or ""
 
                     if input_text or output_text:
                         last_text_time = time.time()
