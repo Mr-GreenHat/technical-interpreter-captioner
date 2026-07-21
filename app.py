@@ -76,7 +76,7 @@ MAX_DEBUG_MESSAGES = 10
 # 40 ms at 16 kHz mono int16 = 1280 bytes.
 GEMINI_LIVE_AUDIO_CHUNK_BYTES = 1280
 GEMINI_LIVE_AUDIO_FLUSH_SECONDS = 0.05
-GEMINI_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview"
+GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
 # iPhone/Safari needs a new user tap after refresh before microphone capture.
 # Kept generous because real ICE/TURN negotiation can take longer than a few
@@ -2423,6 +2423,52 @@ Correction priorities:
 """.strip()
 
 
+def build_gemini_system_instruction(domain_mode, terms_file):
+    """
+    Primes the Gemini Live session with this class's domain/vocabulary, since
+    the general Live API (unlike the dedicated translate-only endpoint) has no
+    built-in glossary/context feature of its own. This is what keeps jargon
+    like 慣性 (inertia) from being misheard as an unrelated common word like
+    感染 (infection).
+    """
+    domain = (domain_mode or "auto").lower()
+
+    role_text = """
+You are a live Japanese-to-English captioning translator for a technical
+engineering classroom, not a conversational assistant.
+
+Output contract:
+- Respond with ONLY the English translation of the Japanese speech you just heard.
+- No commentary, no questions, no repeating the Japanese, no small talk.
+- If there is silence, noise, or no real Japanese speech, output nothing.
+""".strip()
+
+    domain_text = make_selected_domain_context(domain_mode)
+
+    entries = load_glossary_entries(terms_file)
+
+    if domain not in ["school", "school/event", "event"]:
+        entries = [item for item in entries if item.get("domain") != "school"]
+
+    glossary_lines = []
+    for item in entries[:60]:
+        jp = item.get("jp", "")
+        en = item.get("en", "")
+        if jp and en:
+            glossary_lines.append(f"{jp} = {en}")
+
+    glossary_text = (
+        "Known vocabulary for this class (use to resolve ambiguous audio):\n"
+        + "\n".join(glossary_lines)
+        if glossary_lines
+        else ""
+    )
+
+    return "\n\n".join(
+        part for part in [role_text, domain_text, glossary_text] if part
+    )
+
+
 # ============================================================
 # LLM Interpreter Support - Groq second AI
 # ============================================================
@@ -2684,17 +2730,27 @@ def downsample_pcm48_to_pcm16(pcm48_bytes):
     return audio16.tobytes()
 
 
-def append_stream_text(old_text, new_text, max_chars=800):
+def append_stream_text(old_text, new_text, max_chars=800, is_japanese=False):
+    """
+    Japanese never gets a space inserted between chunks (the script doesn't
+    use them). English does, unless old_text already ends in whitespace —
+    including right after a "." since streamed chunks often start a new
+    sentence, and skipping the space there would glue them together
+    ("explained.The" instead of "explained. The").
+    """
     old_text = old_text or ""
     new_text = new_text or ""
 
     if not new_text:
         return old_text.strip()
 
-    if old_text and old_text[-1] not in [" ", "\n", "。", "、", ".", "?", "!", "！", "？"]:
-        combined = old_text + " " + new_text
-    else:
+    if not old_text:
+        return new_text.strip()
+
+    if is_japanese or old_text[-1] in [" ", "\n"]:
         combined = old_text + new_text
+    else:
+        combined = old_text + " " + new_text
 
     while "  " in combined:
         combined = combined.replace("  ", " ")
@@ -2705,18 +2761,19 @@ def append_stream_text(old_text, new_text, max_chars=800):
     return combined.strip()
 
 
-def make_gemini_live_sdk_config(target_language_code="en"):
+def make_gemini_live_sdk_config(system_instruction_text):
     """
-    SDK config for Gemini Live Translate.
+    SDK config for the general Gemini Live API (not the translate-only
+    endpoint), so we can prime it with domain vocabulary via
+    system_instruction. TEXT response modality avoids the audio-synthesis
+    latency that AUDIO responses would add before a translation shows up.
     """
     return types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        translation_config=types.TranslationConfig(
-            target_language_code=target_language_code,
-            echo_target_language=True,
+        response_modalities=["TEXT"],
+        system_instruction=types.Content(
+            parts=[types.Part(text=system_instruction_text)]
         ),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
     )
 
 
@@ -2726,7 +2783,8 @@ def gemini_live_translate_worker(
     stop_event,
     control_queue,
     api_key,
-    target_language_code="en",
+    terms_file,
+    domain_mode,
     caption_reset_seconds=DEFAULT_RESET_SECONDS,
     drain_backlog=True,
 ):
@@ -2759,7 +2817,8 @@ def gemini_live_translate_worker(
 
     async def run_live_session():
         client = genai.Client(api_key=api_key)
-        config = make_gemini_live_sdk_config(target_language_code)
+        system_instruction_text = build_gemini_system_instruction(domain_mode, terms_file)
+        config = make_gemini_live_sdk_config(system_instruction_text)
 
         result_queue.put({
             "type": "debug",
@@ -2774,7 +2833,7 @@ def gemini_live_translate_worker(
         first_output_seen = False
 
         async with client.aio.live.connect(
-            model=GEMINI_LIVE_TRANSLATE_MODEL,
+            model=GEMINI_LIVE_MODEL,
             config=config,
         ) as session:
             result_queue.put({
@@ -2896,7 +2955,6 @@ def gemini_live_translate_worker(
                         continue
 
                     input_transcription = getattr(server_content, "input_transcription", None)
-                    output_transcription = getattr(server_content, "output_transcription", None)
 
                     input_text = ""
                     output_text = ""
@@ -2904,8 +2962,17 @@ def gemini_live_translate_worker(
                     if input_transcription:
                         input_text = getattr(input_transcription, "text", "") or ""
 
-                    if output_transcription:
-                        output_text = getattr(output_transcription, "text", "") or ""
+                    # General Live API: the translation is the model's own
+                    # generated text turn, not a transcript of synthesized
+                    # audio (there is no audio step with response_modalities
+                    # ["TEXT"]). Try the SDK's text convenience attribute
+                    # first, then fall back to walking the model_turn parts.
+                    output_text = getattr(response, "text", "") or ""
+
+                    if not output_text:
+                        model_turn = getattr(server_content, "model_turn", None)
+                        for part in getattr(model_turn, "parts", None) or []:
+                            output_text += getattr(part, "text", "") or ""
 
                     if input_text or output_text:
                         last_text_time = time.time()
@@ -2923,6 +2990,7 @@ def gemini_live_translate_worker(
                             live_original,
                             light_original_cleanup(input_text),
                             max_chars=MAX_ORIGINAL_CHARS * 2,
+                            is_japanese=True,
                         )
 
                         # Show Japanese immediately, even before English translation arrives.
@@ -3524,7 +3592,8 @@ if (
         st.session_state.live_stop_event,
         st.session_state.live_control_queue,
         gemini_api_key,
-        "en",
+        terms_file,
+        domain_mode,
         float(reset_seconds),
         drain_backlog,
     )
