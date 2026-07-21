@@ -81,12 +81,33 @@ PCM_BYTES_PER_SAMPLE = 2
 GROQ_STT_MODEL_ACCURATE = "whisper-large-v3"
 GROQ_STT_MODEL_FAST = "whisper-large-v3-turbo"
 GROQ_TRANSLATION_MODEL = "llama-3.1-8b-instant"
-GROQ_DEFAULT_CHUNK_SECONDS = 3.6
+GROQ_DEFAULT_CHUNK_SECONDS = 5.8
 GROQ_MIN_REQUEST_INTERVAL_SECONDS = 3.1
-GROQ_ENDPOINT_SILENCE_SECONDS = 0.65
-GROQ_MIN_AUDIO_SECONDS = 0.8
-GROQ_AUDIO_OVERLAP_SECONDS = 0.35
+GROQ_ENDPOINT_SILENCE_SECONDS = 0.90
+GROQ_MIN_AUDIO_SECONDS = 1.2
+GROQ_AUDIO_OVERLAP_SECONDS = 0.15
 GROQ_VAD_RMS_THRESHOLD = 180.0
+
+# Whisper quality gates. Metrics are used when verbose_json is available;
+# the code automatically falls back to normal JSON when the SDK/model does
+# not expose them. Missing metrics never cause a rejection by themselves.
+WHISPER_MAX_NO_SPEECH_PROB = 0.68
+WHISPER_MIN_AVG_LOGPROB = -1.25
+WHISPER_MAX_COMPRESSION_RATIO = 2.60
+WHISPER_PROMPT_MAX_TERMS = 14
+WHISPER_PROMPT_LEAK_PATTERNS = [
+    "日本語の技術講義",
+    "用語を正確に表記",
+    "話題:",
+    "直前:",
+    "用語:",
+]
+WHISPER_COMMON_HALLUCINATIONS = [
+    "ご視聴ありがとうございました",
+    "チャンネル登録",
+    "字幕をご覧",
+    "字幕をオン",
+]
 
 # Bound the queue so a slow network cannot create minutes of delayed audio.
 # At roughly 20 ms per WebRTC frame, 250 chunks is about five seconds.
@@ -116,7 +137,7 @@ KEY_TERM_STALE_SECONDS = 45.0
 SOURCE_LANG_JA_ONLY = "Japanese only"
 
 # Main pipeline: Groq Whisper Japanese STT followed by Groq text translation.
-# The optional second pass uses the same fast Llama model more cautiously.
+# The required second pass uses the same fast Llama model for key-term correction.
 GROQ_HELPER_FAST = "llama-3.1-8b-instant"
 
 ENGINE_GROQ_WHISPER = "Groq Whisper STT + Groq translation"
@@ -124,35 +145,29 @@ ENGINE_GROQ_WHISPER = "Groq Whisper STT + Groq translation"
 MAX_LLM_CONTEXT_CHUNKS = 2
 MAX_GROQ_CONTEXT_CHARS = 1100
 MAX_GROQ_TRANSLATION_CHARS = 450
-MAX_GROQ_GLOSSARY_TERMS = 5
+MAX_GROQ_GLOSSARY_TERMS = 16
 
 # Helper AI safety net.
-# Main Groq captions keep running, but optional second-pass
+# Main Groq captions keep running, but second-pass
 # helper calls are limited so daily quota is protected.
 LLM_BUDGET_MODES = {
-    "High Accuracy": {
-        "interval": 15.0,
-        "min_chars": 50,
-        "session_limit": 500,
-        "description": "Fast helper checks. Use for short important demos.",
+    "Every Phrase": {
+        "interval": 4.0,
+        "min_chars": 8,
+        "session_limit": 1000,
+        "description": "Recommended: run the second-pass key-term corrector after each completed phrase.",
     },
     "Balanced": {
-        "interval": 25.0,
-        "min_chars": 60,
-        "session_limit": 300,
-        "description": "Recommended only when a second correction pass is necessary.",
+        "interval": 8.0,
+        "min_chars": 20,
+        "session_limit": 600,
+        "description": "Fewer correction calls while still checking most completed technical phrases.",
     },
     "Saver": {
-        "interval": 60.0,
-        "min_chars": 160,
-        "session_limit": 120,
-        "description": "Safer for longer classes or low Groq quota.",
-    },
-    "Emergency Rule-Based Only": {
-        "interval": 999999.0,
-        "min_chars": 999999,
-        "session_limit": 0,
-        "description": "No helper AI calls. Built-in glossary cleanup only.",
+        "interval": 15.0,
+        "min_chars": 40,
+        "session_limit": 300,
+        "description": "Use only when Groq quota is tight; some short phrases may not receive a second pass.",
     },
 }
 
@@ -2521,30 +2536,35 @@ def llm_hint_worker(
         for item in (key_terms or [])[:MAX_GROQ_GLOSSARY_TERMS]:
             jp = item.get("jp", "")
             en = item.get("en", "")
+            wrong = str(item.get("common_wrong", "") or "").strip()
             if jp and en:
-                glossary_lines.append(f"{jp} = {en}")
+                line = f"{jp} = {en}"
+                if wrong:
+                    line += f" | possible wrong forms: {compact_text(wrong, 120)}"
+                glossary_lines.append(line)
 
         glossary_text = "\n".join(glossary_lines)
 
         prompt = f"""
 Return ONLY JSON. No markdown.
 
-You are the optional second-pass corrector after Groq Whisper transcription and Groq translation.
-Main purpose: help an interpreter by extracting difficult key terms.
-Also fix caption text only when the correction is obvious.
+You are the required second-pass corrector after Groq Whisper transcription and Groq translation.
+The highest priority is preserving difficult technical key terms accurately.
+Correct likely near-homophone recognition errors only when the sentence meaning, selected domain, and candidate glossary strongly support the correction.
 
 Rules:
-- Output max 4 key_terms.
-- Preprocessing/glossary is the source of truth. Prefer Matched glossary.
-- If no glossary match, you may infer a simple key term ONLY when the Japanese source clearly contains it.
-  Example: 三角形 = triangle, 時空のCAD/spacetime CAD = 治具のCAD/jig CAD, 三面図 = three-view drawing.
-- Do not output unrelated key terms.
-- Do not output CATIA, CAD, TTC, AEB, BINUS, BE, PDE, ARE, etc. unless they are in the current Japanese source or Matched glossary.
-- Context/domain is background only, not evidence.
-- Do not invent facts.
-- If no key term, key_terms = [].
-- Keep corrected captions close to the live transcription text.
-- If no correction needed, copy the current text.
+- Output max 5 key_terms.
+- The current Japanese audio transcript remains the base evidence.
+- Candidate glossary entries are possibilities, not permission to force every term.
+- A candidate may replace a near-homophone or malformed phrase when the surrounding sentence clearly supports it.
+  Examples: 感性補償/完成補償 -> 慣性補償, 寸法高速 -> 寸法拘束, ガチャ/カティア -> CATIA, GQ/時具 -> 治具.
+- Preserve all nontechnical meaning, actors, negation, numbers, and sentence order.
+- Remove obvious decoder hallucinations such as unrelated channel-subscription phrases.
+- Do not invent a technical term merely because it belongs to the selected domain.
+- If the intended wording is uncertain, keep the source, set is_unclear=true, and explain briefly.
+- If no key term is supported, key_terms = [].
+- Recent caption may contain an earlier pair for context. Correct only the final/current Japanese-English pair.
+- Return a complete corrected Japanese caption and a complete faithful English caption.
 
 Context:
 {class_context}
@@ -2558,7 +2578,7 @@ Recent caption:
 Current English:
 {current_translation}
 
-Matched glossary:
+Candidate glossary:
 {glossary_text}
 
 JSON:
@@ -2751,12 +2771,13 @@ def glossary_entry_matches_domain(entry, domain_mode):
 
 
 def build_whisper_prompt(glossary_entries, domain_mode, self_context="", previous_text=""):
-    """Build a short Whisper spelling prompt; Groq limits it to 224 tokens."""
+    """Build a compact spelling prompt without meta-instructions that can leak."""
     selected_domain = normalize_domain_name(domain_mode)
     shared_terms = ["BINUS ASO", "CATIA", "AEB", "TTC"]
     domain_priority = {
         "school": [
-            "サマーコース", "BINUS", "BINUS ASO", "BINUS大学", "ARE", "PDE", "BE",
+            "サマーコース", "BINUS", "BINUS ASO", "ビヌスASO", "ビヌス大学", "ARE", "PDE", "BE",
+            "自動車工学", "ロボティクス", "製品設計",
         ],
         "cad": [
             "CATIA", "治具", "三次元モデル", "スケッチ", "寸法拘束",
@@ -2764,57 +2785,130 @@ def build_whisper_prompt(glossary_entries, domain_mode, self_context="", previou
         ],
         "product design": [
             "CATIA", "治具", "三次元モデル", "寸法拘束", "幾何拘束",
-            "設計意図", "加工性", "三面図",
+            "設計意図", "加工性", "三面図", "フィレット", "面取り",
         ],
         "automotive": [
             "AEB", "TTC", "車間距離", "相対速度", "制動力", "慣性補償制御",
-            "ゲイン調整", "拘束条件", "ロータリーエンジン", "アペックスシール",
+            "ゲイン調整", "応答性", "拘束条件", "緊急ブレーキ",
+            "ロータリーエンジン", "アペックスシール",
         ],
     }
 
-    if selected_domain == "auto":
-        priority_terms = []
-        for values in domain_priority.values():
-            priority_terms.extend(values)
-    else:
-        priority_terms = shared_terms + domain_priority.get(selected_domain, [])
+    # Auto mode intentionally stays small. Loading every domain into one prompt
+    # caused prompt leakage and made Whisper invent unrelated technical terms.
+    priority_terms = (
+        shared_terms
+        if selected_domain == "auto"
+        else domain_priority.get(selected_domain, shared_terms)
+    )
 
     terms = []
     seen = set()
 
     for term in priority_terms:
-        if term not in seen:
+        key = term.lower()
+        if key not in seen:
             terms.append(term)
-            seen.add(term)
+            seen.add(key)
+        if len(terms) >= WHISPER_PROMPT_MAX_TERMS:
+            break
 
+    # Only add extra glossary entries when they are already supported by the
+    # user's context or the preceding caption. This prevents a giant prompt.
+    support_text = f"{self_context or ''}\n{previous_text or ''}".lower()
     for entry in glossary_entries or []:
+        if len(terms) >= WHISPER_PROMPT_MAX_TERMS:
+            break
         if not glossary_entry_matches_domain(entry, domain_mode):
             continue
 
         jp = str(entry.get("jp", "")).strip()
-        if not jp or jp in seen or len(jp) > 28:
+        en = str(entry.get("en", "")).strip()
+        if not jp or len(jp) > 28:
             continue
 
-        terms.append(jp)
-        seen.add(jp)
+        if selected_domain == "auto" and jp.lower() not in support_text and en.lower() not in support_text:
+            continue
 
-        if len(terms) >= 32:
+        key = jp.lower()
+        if key not in seen:
+            terms.append(jp)
+            seen.add(key)
+
+    previous = compact_text(previous_text, 90)
+    pieces = []
+    if previous and looks_like_valid_japanese_for_display(previous):
+        pieces.append(previous.rstrip("。") + "。")
+    if terms:
+        pieces.append("、".join(terms[:WHISPER_PROMPT_MAX_TERMS]) + "。")
+
+    # A prompt that resembles transcript text works better than instructions
+    # such as "用語を正確に表記する", which Whisper may copy into the result.
+    return compact_text(" ".join(pieces), 260)
+
+
+def select_second_pass_glossary_candidates(
+    glossary_entries,
+    domain_mode,
+    source_text,
+    max_terms=16,
+):
+    """Give the second pass a small domain glossary, detected terms first."""
+    source_text = source_text or ""
+    selected_domain = normalize_domain_name(domain_mode)
+    priority_by_domain = {
+        "school": ["サマーコース", "ビヌス", "ビヌスASO", "ビヌス大学", "ARE", "PDE", "BE"],
+        "cad": ["CATIA", "治具", "三次元モデル", "スケッチ", "寸法拘束", "幾何拘束", "Pad", "フィレット", "Chamfer", "面取り", "三面図"],
+        "product design": ["CATIA", "治具", "三次元モデル", "寸法拘束", "幾何拘束", "設計意図", "加工性", "三面図"],
+        "automotive": ["AEB", "TTC", "車間距離", "相対速度", "制動力", "慣性補償", "慣性補償制御", "ゲイン調整", "応答性", "拘束条件", "緊急ブレーキ"],
+    }
+
+    candidates = []
+    seen = set()
+
+    def add_entry(entry):
+        jp = str(entry.get("jp", "")).strip()
+        en = str(entry.get("en", "")).strip()
+        if not jp or not en:
+            return
+        key = (jp, en)
+        if key in seen:
+            return
+        candidates.append(entry)
+        seen.add(key)
+
+    # First: exact and common-wrong matches in the current source.
+    for entry in glossary_entries or []:
+        if not glossary_entry_matches_domain(entry, domain_mode):
+            continue
+        values = [str(entry.get("jp", "")).strip()]
+        values.extend(
+            value.strip()
+            for value in str(entry.get("common_wrong", "")).split(";")
+            if value.strip()
+        )
+        if any(glossary_candidate_matches(value, source_text) for value in values if value):
+            add_entry(entry)
+
+    # Second: the selected domain's most important terms. These are candidates,
+    # not forced corrections; the second-pass prompt requires sentence support.
+    priority = priority_by_domain.get(selected_domain, [])
+    if selected_domain == "auto":
+        priority = ["CATIA", "治具", "AEB", "TTC", "慣性補償制御", "サマーコース", "ビヌスASO"]
+
+    entry_by_jp = {
+        str(entry.get("jp", "")).strip(): entry
+        for entry in glossary_entries or []
+        if str(entry.get("jp", "")).strip()
+    }
+    for jp in priority:
+        entry = entry_by_jp.get(jp)
+        if entry:
+            add_entry(entry)
+        if len(candidates) >= max_terms:
             break
 
-    context = compact_text(self_context, 90)
-    previous = compact_text(previous_text, 70)
-    pieces = ["日本語の技術講義。用語を正確に表記する。"]
-
-    if context:
-        pieces.append(f"話題: {context}")
-    if previous:
-        pieces.append(f"直前: {previous}")
-    if terms:
-        pieces.append("用語: " + "、".join(terms))
-
-    # Stay conservative under the documented 224-token prompt limit.
-    return compact_text(" ".join(pieces), 360)
-
+    return candidates[:max_terms]
 
 def apply_glossary_source_corrections(text, glossary_entries, domain_mode):
     """Apply safe CSV common_wrong -> canonical Japanese corrections."""
@@ -2975,6 +3069,131 @@ def translate_japanese_with_groq(
     return clean_plain_translation(output)
 
 
+def _groq_object_to_dict(value):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    for method_name in ("model_dump", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                data = method()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    try:
+        return dict(value)
+    except Exception:
+        return {}
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def summarize_whisper_metrics(transcription):
+    data = _groq_object_to_dict(transcription)
+    segments = data.get("segments") or getattr(transcription, "segments", None) or []
+    segment_dicts = [_groq_object_to_dict(segment) for segment in segments]
+
+    no_speech_values = []
+    avg_logprob_values = []
+    compression_values = []
+
+    for segment in segment_dicts:
+        no_speech = _safe_float(segment.get("no_speech_prob"))
+        avg_logprob = _safe_float(segment.get("avg_logprob"))
+        compression = _safe_float(segment.get("compression_ratio"))
+        if no_speech is not None:
+            no_speech_values.append(no_speech)
+        if avg_logprob is not None:
+            avg_logprob_values.append(avg_logprob)
+        if compression is not None:
+            compression_values.append(compression)
+
+    # Some responses expose metrics at the top level rather than per segment.
+    top_no_speech = _safe_float(data.get("no_speech_prob"))
+    top_avg_logprob = _safe_float(data.get("avg_logprob"))
+    top_compression = _safe_float(data.get("compression_ratio"))
+    if top_no_speech is not None:
+        no_speech_values.append(top_no_speech)
+    if top_avg_logprob is not None:
+        avg_logprob_values.append(top_avg_logprob)
+    if top_compression is not None:
+        compression_values.append(top_compression)
+
+    return {
+        "no_speech_prob": max(no_speech_values) if no_speech_values else None,
+        "avg_logprob": (
+            sum(avg_logprob_values) / len(avg_logprob_values)
+            if avg_logprob_values else None
+        ),
+        "compression_ratio": max(compression_values) if compression_values else None,
+    }
+
+
+def strip_whisper_prompt_leak(text):
+    cleaned = (text or "").strip()
+    for pattern in WHISPER_PROMPT_LEAK_PATTERNS:
+        cleaned = cleaned.replace(pattern, " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" 、。")
+    return cleaned.strip()
+
+
+def transcript_is_repetitive(text):
+    compact = re.sub(r"[\s、。,.!?！？]", "", text or "")
+    if len(compact) < 12:
+        return False
+
+    # Catch duplicated phrases such as によってによって or a short phrase
+    # repeated three or more times by the decoder.
+    for size in range(2, min(14, len(compact) // 2 + 1)):
+        for start in range(0, min(size, len(compact) - size)):
+            unit = compact[start:start + size]
+            if unit and compact.count(unit) >= 3 and len(unit) * compact.count(unit) >= len(compact) * 0.55:
+                return True
+    return False
+
+
+def assess_whisper_transcription(result, self_context=""):
+    text = strip_whisper_prompt_leak(result.get("text", ""))
+    metrics = result.get("metrics", {}) or {}
+
+    if not text:
+        return False, "", "empty transcript"
+
+    no_speech = metrics.get("no_speech_prob")
+    avg_logprob = metrics.get("avg_logprob")
+    compression = metrics.get("compression_ratio")
+
+    if no_speech is not None and no_speech > WHISPER_MAX_NO_SPEECH_PROB:
+        return False, text, f"high no_speech_prob={no_speech:.2f}"
+    if avg_logprob is not None and avg_logprob < WHISPER_MIN_AVG_LOGPROB:
+        return False, text, f"low avg_logprob={avg_logprob:.2f}"
+    if compression is not None and compression > WHISPER_MAX_COMPRESSION_RATIO:
+        return False, text, f"high compression_ratio={compression:.2f}"
+    if transcript_is_repetitive(text):
+        return False, text, "repetitive transcript"
+
+    context_lower = (self_context or "").lower()
+    for phrase in WHISPER_COMMON_HALLUCINATIONS:
+        if phrase in text and phrase.lower() not in context_lower:
+            return False, text, f"common hallucination phrase: {phrase}"
+
+    if "チャンネル" in text and "登録" in text and "チャンネル" not in (self_context or ""):
+        return False, text, "likely channel-subscription hallucination"
+
+    if not looks_like_valid_japanese_for_display(text):
+        return False, text, "not enough valid Japanese"
+
+    return True, text, ""
+
+
 def transcribe_japanese_chunk(
     client,
     pcm_bytes,
@@ -2982,16 +3201,35 @@ def transcribe_japanese_chunk(
     whisper_prompt,
 ):
     wav_bytes = pcm16_to_wav_bytes(pcm_bytes)
-    transcription = client.audio.transcriptions.create(
-        file=("live_caption.wav", wav_bytes, "audio/wav"),
-        model=model_name,
-        language="ja",
-        prompt=whisper_prompt,
-        response_format="json",
-        temperature=0.0,
-    )
-    return str(getattr(transcription, "text", "") or "").strip()
+    last_error = None
 
+    # verbose_json exposes confidence-like segment metadata. Older SDK/model
+    # combinations may reject it, so fall back to normal JSON automatically.
+    for response_format in ("verbose_json", "json"):
+        try:
+            transcription = client.audio.transcriptions.create(
+                file=("live_caption.wav", wav_bytes, "audio/wav"),
+                model=model_name,
+                language="ja",
+                prompt=whisper_prompt or None,
+                response_format=response_format,
+                temperature=0.0,
+            )
+            text_value = str(getattr(transcription, "text", "") or "").strip()
+            if not text_value:
+                data = _groq_object_to_dict(transcription)
+                text_value = str(data.get("text", "") or "").strip()
+            return {
+                "text": text_value,
+                "metrics": summarize_whisper_metrics(transcription),
+                "response_format": response_format,
+            }
+        except Exception as exc:
+            last_error = exc
+            if response_format == "json":
+                raise
+
+    raise RuntimeError(str(last_error or "Whisper transcription failed"))
 
 def groq_whisper_translate_worker(
     audio_queue,
@@ -3066,7 +3304,7 @@ def groq_whisper_translate_worker(
                     live_translation = str(command.get("translation", "") or live_translation)
                     result_queue.put({
                         "type": "debug",
-                        "message": "Groq worker base updated after optional AI correction.",
+                        "message": "Groq worker base updated after second-pass correction.",
                     })
 
                 elif isinstance(command, dict) and command.get("type") == "set_reset_seconds":
@@ -3140,12 +3378,28 @@ def groq_whisper_translate_worker(
                         self_context,
                         previous_text=live_original or previous_completed_japanese,
                     )
-                    raw_japanese = transcribe_japanese_chunk(
+                    whisper_result = transcribe_japanese_chunk(
                         client,
                         request_pcm,
                         stt_model,
                         whisper_prompt,
                     )
+                    accepted, raw_japanese, reject_reason = assess_whisper_transcription(
+                        whisper_result,
+                        self_context=self_context,
+                    )
+                    metrics = whisper_result.get("metrics", {}) or {}
+
+                    if not accepted:
+                        result_queue.put({
+                            "type": "debug",
+                            "message": (
+                                f"Rejected Whisper chunk ({reject_reason}): "
+                                f"{raw_japanese[:100]} | metrics={metrics}"
+                            ),
+                        })
+                        continue
+
                     corrected_japanese = apply_glossary_source_corrections(
                         raw_japanese,
                         glossary_entries,
@@ -3290,13 +3544,13 @@ with st.sidebar:
 
     stt_chunk_seconds = st.slider(
         "Caption audio chunk",
-        min_value=3.2,
-        max_value=6.0,
+        min_value=4.6,
+        max_value=7.0,
         value=GROQ_DEFAULT_CHUNK_SECONDS,
         step=0.2,
         help=(
-            "Shorter is faster but uses more API requests. Keep it at 3.2 seconds "
-            "or longer to stay below Groq's typical free Whisper RPM limit."
+            "For technical Japanese, 5.5–6.5 seconds gives Whisper more sentence context. "
+            "Shorter chunks are faster but cause more word substitutions and prompt hallucinations."
         ),
     )
 
@@ -3400,13 +3654,13 @@ with st.sidebar:
 
     st.divider()
 
-    st.write("Optional Second Pass")
+    st.write("Second-Pass Key-Term Correction")
 
-    use_llm_hints = st.checkbox(
-        "Use optional second-pass correction",
-        value=False,
-        help="Usually leave this off first. The main pipeline already uses Whisper plus glossary-aware translation.",
-    )
+    # Key terms are the main purpose of this interpreter, so the contextual
+    # second pass is always enabled. It runs after completed phrases rather
+    # than trying to rewrite every partial transcript.
+    use_llm_hints = True
+    st.success("Second-pass AI is always ON for contextual key-term correction.")
 
     llm_model_name = GROQ_HELPER_FAST
     st.caption(f"Second-pass model: {llm_model_name}")
@@ -3464,7 +3718,7 @@ with st.sidebar:
     )
 
     active_glossary_entries = load_glossary_entries(terms_file)
-    st.caption(f"Whisper spelling prompt will use the selected domain and up to 32 terms.")
+    st.caption(f"Whisper spelling prompt uses at most {WHISPER_PROMPT_MAX_TERMS} terms from the selected domain.")
 
 
 # ============================================================
@@ -3504,6 +3758,7 @@ defaults = {
     "correction_status": "idle",
     "live_token_version": 0,
     "last_llm_checked_token_version": -1,
+    "last_live_endpoint": False,
     "llm_calls_this_session": 0,
     "llm_budget_reached": False,
 
@@ -3700,6 +3955,7 @@ if clear_clicked:
     st.session_state.correction_status = "idle"
     st.session_state.live_token_version = 0
     st.session_state.last_llm_checked_token_version = -1
+    st.session_state.last_live_endpoint = False
     st.session_state.llm_calls_this_session = 0
     st.session_state.llm_budget_reached = False
 
@@ -3771,6 +4027,7 @@ if (
     st.session_state.correction_status = "idle"
     st.session_state.live_token_version = 0
     st.session_state.last_llm_checked_token_version = -1
+    st.session_state.last_live_endpoint = False
     st.session_state.llm_calls_this_session = 0
     st.session_state.llm_budget_reached = False
 
@@ -3878,6 +4135,7 @@ while not st.session_state.live_result_queue.empty():
     if item_type == "tokens":
         original = item.get("original", "")
         translation = item.get("translation", "")
+        st.session_state.last_live_endpoint = bool(item.get("endpoint", False))
         original, translation = light_domain_context_cleanup(
             original,
             translation,
@@ -4035,6 +4293,7 @@ while not st.session_state.live_result_queue.empty():
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
 
     elif item_type == "page_reset":
+        st.session_state.last_live_endpoint = True
         completed_chunk = make_context_chunk(
             st.session_state.live_original,
             st.session_state.live_translation,
@@ -4125,10 +4384,14 @@ while not st.session_state.llm_result_queue.empty():
         st.session_state.llm_corrected_source_text = item.get("source_text", "")
         st.session_state.llm_is_unclear = bool(item.get("is_unclear", False))
         st.session_state.llm_unclear_reason = item.get("unclear_reason", "")
+        second_pass_source = (
+            item.get("corrected_japanese_original", "").strip()
+            or st.session_state.live_original
+        )
         groq_terms = filter_llm_key_terms_for_current_caption(
             item.get("key_terms", []),
-            st.session_state.live_original,
-            "",  # do not use English translation as proof for Groq key terms
+            second_pass_source,
+            "",  # do not use English translation as proof for key terms
             domain_mode,
         )
         for term_item in groq_terms:
@@ -4264,11 +4527,15 @@ if use_llm_hints and groq_api_key:
         use_llm_hints
         and not st.session_state.llm_budget_reached
         and st.session_state.llm_calls_this_session < int(llm_session_limit)
-        and llm_budget_mode != "Emergency Rule-Based Only"
+    )
+    completed_phrase_ready = bool(
+        st.session_state.get("last_live_endpoint", False)
+        or st.session_state.pending_visual_reset
     )
 
     if (
         st.session_state.live_running
+        and completed_phrase_ready
         and translated_text_ready
         and enough_text
         and changed_text
@@ -4277,16 +4544,11 @@ if use_llm_hints and groq_api_key:
         and helper_budget_available
         and not st.session_state.llm_running
     ):
-        detected_terms = extract_key_terms_for_llm(
-            st.session_state.live_original,
-            st.session_state.live_translation,
-            terms_file,
-        )
-        detected_terms = filter_detected_terms_for_current_caption(
-            detected_terms,
-            st.session_state.live_original,
-            st.session_state.live_translation,
+        detected_terms = select_second_pass_glossary_candidates(
+            active_glossary_entries,
             domain_mode,
+            st.session_state.live_original,
+            max_terms=MAX_GROQ_GLOSSARY_TERMS,
         )
 
         st.session_state.llm_running = True
@@ -4299,6 +4561,7 @@ if use_llm_hints and groq_api_key:
         st.session_state.llm_last_call_time = time.time()
         st.session_state.llm_last_source_text = source_text
         st.session_state.last_llm_checked_token_version = st.session_state.live_token_version
+        st.session_state.last_live_endpoint = False
 
         selected_class_context = make_compact_domain_context(
             domain_mode,
@@ -4331,14 +4594,10 @@ if use_llm_hints and groq_api_key:
 # Helper AI budget safety
 # ============================================================
 
-if use_llm_hints:
-    if llm_budget_mode == "Emergency Rule-Based Only":
-        st.session_state.llm_budget_reached = True
-        st.session_state.correction_status = "off"
-    elif st.session_state.llm_calls_this_session >= int(llm_session_limit):
-        st.session_state.llm_budget_reached = True
-        if st.session_state.live_running:
-            st.session_state.correction_status = "budget_reached"
+if use_llm_hints and st.session_state.llm_calls_this_session >= int(llm_session_limit):
+    st.session_state.llm_budget_reached = True
+    if st.session_state.live_running:
+        st.session_state.correction_status = "budget_reached"
 
 # ============================================================
 # Status
@@ -4370,10 +4629,7 @@ if use_llm_hints and st.session_state.llm_error:
         st.caption("AI helper skipped this update. Debug has details.")
 
 if use_llm_hints and st.session_state.llm_budget_reached:
-    if llm_budget_mode == "Emergency Rule-Based Only":
-        st.warning("Helper AI is off. Rule-based glossary correction is still active.")
-    else:
-        st.warning("Helper AI session budget reached. Switched to rule-based glossary correction only.")
+    st.warning("Second-pass AI session budget reached. Main Whisper and glossary translation are still active.")
 
 
 # ============================================================
