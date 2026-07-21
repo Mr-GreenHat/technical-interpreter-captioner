@@ -3350,25 +3350,26 @@ rtc_configuration = RTCConfiguration(
                     "stun:stun4.l.google.com:19302",
                 ]
             },
-            # Open Relay Project free/shared TURN fallback, used when a direct
-            # STUN connection can't be established (common on Streamlit Cloud).
-            # Public demo credentials, not rate-guaranteed: swap for a paid
-            # provider (e.g. Metered.ca) if this becomes unreliable.
-            {
-                "urls": "turn:openrelay.metered.ca:80",
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-            {
-                "urls": "turn:openrelay.metered.ca:443",
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-            {
-                "urls": "turn:openrelay.metered.ca:443?transport=tcp",
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
+            # TURN temporarily disabled to test whether the free/shared Open
+            # Relay Project relay is the reason audio connects but no frames
+            # ever arrive (connection reports established, media doesn't
+            # actually flow through the relay). Re-enable this block if
+            # STUN-only turns out to fail to connect at all on some networks.
+            # {
+            #     "urls": "turn:openrelay.metered.ca:80",
+            #     "username": "openrelayproject",
+            #     "credential": "openrelayproject",
+            # },
+            # {
+            #     "urls": "turn:openrelay.metered.ca:443",
+            #     "username": "openrelayproject",
+            #     "credential": "openrelayproject",
+            # },
+            # {
+            #     "urls": "turn:openrelay.metered.ca:443?transport=tcp",
+            #     "username": "openrelayproject",
+            #     "credential": "openrelayproject",
+            # },
         ]
     }
 )
