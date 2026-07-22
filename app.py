@@ -9,6 +9,7 @@ import io
 import wave
 import re
 import logging
+from difflib import SequenceMatcher
 import urllib.parse
 import urllib.request
 
@@ -129,10 +130,54 @@ JAPANESE_ONLY_MODE = True
 # *some* Japanese existed earlier in the segment, even minutes ago.
 TRANSLATION_WITHOUT_SOURCE_MAX_LAG_SECONDS = 2.5
 
-# Key terms hold independently of caption segment resets. A term only drops
-# off once it hasn't been confirmed in the live Japanese text for this long,
-# not the instant a pause triggers a new caption segment.
-KEY_TERM_STALE_SECONDS = 45.0
+# Key terms are evidence-based and belong only to the currently displayed
+# corrected Japanese phrase. They are cleared when a new phrase begins.
+KEY_TERM_STALE_SECONDS = 0.0
+
+# Values in common_wrong are not all recognition mistakes. Some are valid,
+# related concepts or translations and must never be used as automatic
+# source replacements. Example: 自動車工学 is not identical to the ARE
+# program name, and 面取り is not a wrong Japanese form of Chamfer.
+RELATED_NOT_RECOGNITION_VARIANTS = {
+    ("ARE", "自動車工学"),
+    ("ARE", "自動車ロボティクス"),
+    ("ARE", "自動車とロボット工学"),
+    ("PDE", "プロダクトデザイン"),
+    ("PDE", "製品設計"),
+    ("PDE", "製品デザイン工学"),
+    ("BE", "ビジネス工学"),
+    ("BE", "ビジネスエンジニアリング"),
+    ("Chamfer", "面取り"),
+    ("三角", "三角形"),
+    ("Automotive and Robotics Engineering", "Automotive Robotics Engineering"),
+    ("Automotive and Robotics Engineering", "Automotive & Robotics Engineering"),
+    ("Product Design Engineering", "Product Design"),
+    ("Business Engineering", "business engineer"),
+}
+
+# Extra observed ASR variants. These are supplied to the second-pass AI as
+# evidence candidates, but ambiguous forms are not blindly replaced.
+ADDITIONAL_RECOGNITION_VARIANTS = {
+    "治具": ["リグ", "GQ", "時具", "地具", "ジグ"],
+    "幾何拘束": ["気化拘束", "記号拘束", "幾何高速", "幾何校則"],
+    "面取り": ["メーカー", "面取", "面どり"],
+    "ARE": ["AERI", "AROI", "Aroi", "ARO", "エーアールイー"],
+    "サマーコース": ["お出様コース", "お客様コース", "サマコース", "サマー講座"],
+    "三面図": ["三次元図", "三面図面", "3面図"],
+    "ゲイン調整": ["ゲイン調節", "原因調整"],
+    "応答性": ["オートセット", "応答制"],
+    "車間距離": ["Shaken Carrier", "車間距離"],
+    "相対速度": ["Sorter", "temperate speed", "相対速度"],
+    "緊急ブレーキ": ["急ブレーキ"],
+    "慣性補償": ["感性補償", "完成補償", "感性保証", "完成保証"],
+    "慣性補償制御": ["感性補償制御", "完成補償制御", "完成報告書を制御"],
+    "寸法拘束": ["寸法高速", "寸法校則", "寸法公則"],
+    "CATIA": ["ガチャ", "カティア", "キャティア", "カチア"],
+}
+
+SECOND_PASS_MAX_LENGTH_RATIO = 1.70
+SECOND_PASS_MIN_SIMILARITY_WITHOUT_EVIDENCE = 0.46
+SECOND_PASS_MAX_CONFIRMED_TERMS = 8
 
 SOURCE_LANG_JA_ONLY = "Japanese only"
 
@@ -558,78 +603,498 @@ def load_glossary_entries(terms_file):
     return entries
 
 
-SCHOOL_TERM_WORDS = [
-    "サマーコース",
-    "サマコース",
-    "サマー講座",
-    "Summer Course",
-    "summer course",
-    "BINUS",
-    "Binus",
-    "binus",
-    "ビヌス",
-    "ビナス",
-    "ビーナス",
-    "ネウス",
-    "ヴィヌス",
-    "BINUS ASO",
-    "ビヌスASO",
-    "ビヌス大学",
-    "BINUS University",
-    "ARE",
-    "PDE",
-    "Business Engineering",
-    "Automotive and Robotics Engineering",
-    "Product Design Engineering",
-]
+def _is_ascii_token(text):
+    text = str(text or "").strip()
+    return bool(text) and all(ord(ch) < 128 for ch in text)
 
-SCHOOL_STRONG_CONTEXT_WORDS = [
-    "サマーコース",
-    "サマコース",
-    "Summer Course",
-    "summer course",
-    "BINUS",
-    "binus",
-    "ビヌス",
-    "ビナス",
-    "ビーナス",
-    "ネウス",
-    "BINUS ASO",
-    "ビヌスASO",
-    "ビヌス大学",
-    "BINUS University",
-]
 
-CAD_STRONG_CONTEXT_WORDS = [
-    "CATIA",
-    "catia",
-    "CAD",
-    "Sketcher",
-    "スケッチャー",
-    "寸法拘束",
-    "幾何拘束",
-    "完全拘束",
-    "Pad",
-    "フィレット",
-    "Chamfer",
-    "面取り",
-    "設計意図",
-    "加工性",
-]
+def _literal_term_in_text(term, text):
+    """Exact source support with word boundaries for short Latin acronyms."""
+    term = str(term or "").strip()
+    text = str(text or "")
 
-AUTO_STRONG_CONTEXT_WORDS = [
-    "TTC",
-    "AEB",
-    "ADAS",
-    "慣性補償",
-    "brake",
-    "braking",
-    "ブレーキ",
-    "ロータリーエンジン",
-    "rotary engine",
-    "アペックスシール",
-]
+    if not term:
+        return False
 
+    if _is_ascii_token(term) and len(term) <= 6:
+        return (
+            re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])",
+                text,
+                flags=re.IGNORECASE,
+            )
+            is not None
+        )
+
+    if _is_ascii_token(term):
+        return term.lower() in text.lower()
+
+    return term in text
+
+
+def recognition_variants_for_entry(entry):
+    """
+    Return only plausible ASR variants.
+
+    This deliberately excludes related-but-correct concepts such as
+    自動車工学 -> ARE and 面取り -> Chamfer.
+    """
+    canonical = str(entry.get("jp", "")).strip()
+    variants = []
+    seen = set()
+
+    raw_values = [
+        value.strip()
+        for value in str(entry.get("common_wrong", "") or "").split(";")
+        if value.strip()
+    ]
+    raw_values.extend(ADDITIONAL_RECOGNITION_VARIANTS.get(canonical, []))
+
+    for value in raw_values:
+        if not value or value == canonical or len(value) < 2:
+            continue
+
+        if (canonical, value) in RELATED_NOT_RECOGNITION_VARIANTS:
+            continue
+
+        # Avoid treating a valid longer/shorter canonical form as a mistake.
+        if value.startswith(canonical) or canonical.startswith(value):
+            continue
+
+        key = value.lower()
+        if key in seen:
+            continue
+
+        variants.append(value)
+        seen.add(key)
+
+    return variants
+
+
+def glossary_entry_for_term(term, glossary_entries):
+    term = str(term or "").strip()
+
+    for entry in glossary_entries or []:
+        canonical = str(entry.get("jp", "")).strip()
+        if canonical == term:
+            return entry
+
+    return None
+
+
+def source_evidence_for_term(term, source_text, glossary_entries):
+    """
+    Return an exact substring from the raw Japanese that supports a canonical
+    term, or an empty string when the term is unsupported.
+    """
+    term = str(term or "").strip()
+    source_text = str(source_text or "")
+
+    if _literal_term_in_text(term, source_text):
+        return term
+
+    entry = glossary_entry_for_term(term, glossary_entries)
+    if not entry:
+        return ""
+
+    variants = sorted(
+        recognition_variants_for_entry(entry),
+        key=len,
+        reverse=True,
+    )
+
+    for variant in variants:
+        if _literal_term_in_text(variant, source_text):
+            return variant
+
+    return ""
+
+
+def glossary_priority(term, domain_mode):
+    """Prefer domain-specific compound terms over generic nouns."""
+    domain = normalize_domain_name(domain_mode) if "normalize_domain_name" in globals() else str(domain_mode or "").lower()
+    priority = {
+        "CATIA": 0,
+        "治具": 1,
+        "三次元モデル": 2,
+        "寸法拘束": 3,
+        "幾何拘束": 4,
+        "Pad": 5,
+        "フィレット": 6,
+        "面取り": 7,
+        "Chamfer": 8,
+        "三面図": 9,
+        "加工性": 10,
+        "慣性補償制御": 0,
+        "慣性補償": 1,
+        "ゲイン調整": 2,
+        "応答性": 3,
+        "AEB": 4,
+        "TTC": 5,
+        "車間距離": 6,
+        "相対速度": 7,
+        "緊急ブレーキ": 8,
+        "制動力": 9,
+        "サマーコース": 0,
+        "ビヌスASO": 1,
+        "BINUS ASO": 1,
+        "ARE": 2,
+        "PDE": 3,
+        "BE": 4,
+    }
+    base = priority.get(term, 50)
+    # Longer Japanese compounds usually carry more technical information.
+    return (base, -len(term), term)
+
+
+def build_exact_confirmed_terms(
+    corrected_japanese,
+    raw_japanese,
+    glossary_entries,
+    domain_mode,
+    ai_terms=None,
+    max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS,
+):
+    """
+    Build the UI key-term list from evidence only.
+
+    A term must be literal in corrected Japanese. It also needs either a
+    literal/raw ASR variant in the source or explicit AI evidence that is an
+    exact raw substring. English meanings are taken from the glossary when
+    available, not invented by the model.
+    """
+    corrected_japanese = str(corrected_japanese or "").strip()
+    raw_japanese = str(raw_japanese or "").strip()
+    ai_terms = ai_terms or []
+
+    ai_by_term = {}
+    for item in ai_terms:
+        term = str(item.get("term", item.get("jp", ""))).strip()
+        if term:
+            ai_by_term[term] = item
+
+    output = []
+    seen = set()
+
+    for entry in glossary_entries or []:
+        if not glossary_entry_matches_domain(entry, domain_mode):
+            continue
+
+        term = str(entry.get("jp", "")).strip()
+        meaning = str(entry.get("en", "")).strip()
+        if not term or not meaning:
+            continue
+
+        if not _literal_term_in_text(term, corrected_japanese):
+            continue
+
+        evidence = source_evidence_for_term(term, raw_japanese, glossary_entries)
+        ai_item = ai_by_term.get(term, {})
+        ai_evidence = str(
+            ai_item.get("evidence", ai_item.get("source_match", ""))
+        ).strip()
+
+        if not evidence and ai_evidence and _literal_term_in_text(ai_evidence, raw_japanese):
+            evidence = ai_evidence
+
+        # A literal term in the corrected sentence with no raw evidence may
+        # have been inserted by the model. Do not display it as confirmed.
+        if not evidence:
+            continue
+
+        key = term.lower()
+        if key in seen:
+            continue
+
+        output.append({
+            "term": term,
+            "meaning": meaning,
+            "reading": str(entry.get("reading", "") or "").strip(),
+            "source_match": evidence,
+            "evidence": evidence,
+            "confidence": str(ai_item.get("confidence", "high") or "high").lower(),
+            "added_at": time.time(),
+            "last_confirmed_at": time.time(),
+        })
+        seen.add(key)
+
+    # Keep supported AI acronyms/terms that are not present in the CSV.
+    for item in ai_terms:
+        term = str(item.get("term", item.get("jp", ""))).strip()
+        meaning = str(item.get("meaning", item.get("en", ""))).strip()
+        evidence = str(item.get("evidence", item.get("source_match", ""))).strip()
+
+        if not term or not meaning or term.lower() in seen:
+            continue
+        if not _literal_term_in_text(term, corrected_japanese):
+            continue
+        if not evidence:
+            evidence = term if _literal_term_in_text(term, raw_japanese) else ""
+        if not evidence or not _literal_term_in_text(evidence, raw_japanese):
+            continue
+
+        output.append({
+            "term": term,
+            "meaning": meaning,
+            "reading": str(item.get("reading", "") or "").strip(),
+            "source_match": evidence,
+            "evidence": evidence,
+            "confidence": str(item.get("confidence", "medium") or "medium").lower(),
+            "added_at": time.time(),
+            "last_confirmed_at": time.time(),
+        })
+        seen.add(term.lower())
+
+    output.sort(key=lambda item: glossary_priority(item.get("term", ""), domain_mode))
+    return output[:max_terms]
+
+
+def validated_second_pass_corrections(raw_japanese, corrected_japanese, corrections):
+    """Keep only correction pairs grounded in the raw and corrected strings."""
+    raw_japanese = str(raw_japanese or "")
+    corrected_japanese = str(corrected_japanese or "")
+    valid = []
+
+    for item in corrections or []:
+        wrong = str(item.get("wrong", "")).strip()
+        correct = str(item.get("correct", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+
+        if len(wrong) < 2 or not correct:
+            continue
+        if not _literal_term_in_text(wrong, raw_japanese):
+            continue
+        if not _literal_term_in_text(correct, corrected_japanese):
+            continue
+
+        valid.append({
+            "wrong": wrong,
+            "correct": correct,
+            "reason": reason,
+        })
+
+    return valid
+
+
+def second_pass_japanese_is_safe(raw_japanese, corrected_japanese, valid_corrections):
+    """
+    Reject free rewriting while still allowing strong evidence-based repair of
+    badly misheard technical phrases.
+    """
+    raw = str(raw_japanese or "").strip()
+    corrected = str(corrected_japanese or "").strip()
+
+    if not raw or not corrected:
+        return False, "missing raw or corrected Japanese"
+
+    if len(corrected) > max(30, int(len(raw) * SECOND_PASS_MAX_LENGTH_RATIO)):
+        return False, "corrected Japanese added too much text"
+
+    # Preserve every number spoken in the raw transcript.
+    raw_numbers = re.findall(r"\d+(?:\.\d+)?", raw)
+    simple_number_kanji = {
+        "0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
+        "5": "五", "6": "六", "7": "七", "8": "八", "9": "九",
+        "10": "十",
+    }
+    for number in raw_numbers:
+        equivalent_kanji = simple_number_kanji.get(number, "")
+        if number not in corrected and (
+            not equivalent_kanji or equivalent_kanji not in corrected
+        ):
+            return False, f"number {number} was dropped"
+
+    # Preserve recognized technical acronyms unless an explicit grounded
+    # correction changes that exact token.
+    raw_acronyms = re.findall(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,7}(?![A-Za-z0-9])", raw)
+    correction_wrongs = {item.get("wrong", "") for item in valid_corrections}
+    for acronym in raw_acronyms:
+        if acronym not in corrected and acronym not in correction_wrongs:
+            return False, f"acronym {acronym} was dropped"
+
+    norm_raw = re.sub(r"[\s、。,.!?！？「」『』（）()]", "", raw)
+    norm_corrected = re.sub(r"[\s、。,.!?！？「」『』（）()]", "", corrected)
+    similarity = SequenceMatcher(None, norm_raw, norm_corrected).ratio()
+
+    if (
+        similarity < SECOND_PASS_MIN_SIMILARITY_WITHOUT_EVIDENCE
+        and not valid_corrections
+    ):
+        return False, f"unsupported rewrite similarity={similarity:.2f}"
+
+    # Avoid duplicated explanatory additions.
+    if corrected.count("このように") > raw.count("このように"):
+        return False, "added explanatory phrase"
+    if corrected.count("については") > raw.count("については") + 1:
+        return False, "added topic framing"
+
+    return True, ""
+
+
+
+
+def align_english_to_confirmed_japanese(corrected_japanese, english_text):
+    """
+    Apply only source-licensed terminology alignment.
+
+    These edits are allowed only when the canonical Japanese term is literal
+    in the corrected caption.
+    """
+    jp = str(corrected_japanese or "")
+    en = str(english_text or "").strip()
+
+    conditional_replacements = [
+        ("治具", r"\brigs?\b", "jig"),
+        ("幾何拘束", r"\bcondensation constraints?\b", "geometric constraint"),
+        ("面取り", r"\bmanufacturer\b", "chamfering"),
+        ("三面図", r"\bthree-dimensional diagram\b", "three-view drawing"),
+        ("三面図", r"\b3D diagram\b", "three-view drawing"),
+        ("応答性", r"\bauto-set\b", "responsiveness"),
+        ("ゲイン調整", r"\bgain adjustment\b", "gain adjustment"),
+    ]
+
+    for japanese_term, pattern, replacement in conditional_replacements:
+        if japanese_term in jp:
+            en = re.sub(pattern, replacement, en, flags=re.IGNORECASE)
+
+    # Preserve plural form for geometric constraints when the English source
+    # used the plural.
+    if "幾何拘束" in jp:
+        en = re.sub(
+            r"\bgeometric constraint\b(?=\s+(?:on|and|are|were)\b)",
+            "geometric constraints",
+            en,
+            flags=re.IGNORECASE,
+        )
+
+    return clean_plain_translation(en)
+
+
+def second_pass_english_is_safe(initial_english, corrected_english):
+    initial = str(initial_english or "").strip()
+    corrected = str(corrected_english or "").strip()
+
+    if not corrected:
+        return False, "empty corrected English"
+
+    banned_additions = [
+        "this is how",
+        "in other words",
+        "for example",
+        "as you can see",
+        "let me explain",
+        "we can see that",
+    ]
+    lower = corrected.lower()
+    for phrase in banned_additions:
+        if phrase in lower and phrase not in initial.lower():
+            return False, f"added explanation: {phrase}"
+
+    if initial and len(corrected) > max(80, int(len(initial) * 1.75)):
+        return False, "corrected English added too much text"
+
+    if corrected.count(".") > max(2, initial.count(".") + 1):
+        return False, "corrected English added extra sentences"
+
+    return True, ""
+
+
+
+def sanitize_second_pass_output(
+    raw_japanese,
+    raw_english,
+    parsed,
+    glossary_entries,
+    domain_mode,
+):
+    """
+    Validate model output and return a safe, evidence-based correction.
+    """
+    raw_japanese = str(raw_japanese or "").strip()
+    raw_english = str(raw_english or "").strip()
+
+    corrected_japanese = str(
+        parsed.get("corrected_japanese_original", "")
+    ).strip()
+    corrected_english = str(
+        parsed.get("corrected_english_caption", "")
+    ).strip()
+
+    if not corrected_japanese:
+        corrected_japanese = raw_japanese
+
+    corrected_japanese = light_original_cleanup(corrected_japanese)
+    corrected_japanese, _ = light_domain_context_cleanup(
+        corrected_japanese,
+        "",
+        domain_mode,
+    )
+
+    valid_corrections = validated_second_pass_corrections(
+        raw_japanese,
+        corrected_japanese,
+        parsed.get("corrections", []),
+    )
+
+    safe_japanese, japanese_reason = second_pass_japanese_is_safe(
+        raw_japanese,
+        corrected_japanese,
+        valid_corrections,
+    )
+
+    if not safe_japanese:
+        corrected_japanese = raw_japanese
+        corrected_english = raw_english
+        valid_corrections = []
+        parsed["is_unclear"] = True
+        existing_reason = str(parsed.get("unclear_reason", "")).strip()
+        parsed["unclear_reason"] = (
+            f"{existing_reason}; {japanese_reason}".strip("; ")
+        )
+
+    corrected_english = align_english_to_confirmed_japanese(
+        corrected_japanese,
+        corrected_english or raw_english,
+    )
+
+    safe_english, english_reason = second_pass_english_is_safe(
+        raw_english,
+        corrected_english,
+    )
+    if not safe_english:
+        corrected_english = raw_english
+        parsed["is_unclear"] = True
+        existing_reason = str(parsed.get("unclear_reason", "")).strip()
+        parsed["unclear_reason"] = (
+            f"{existing_reason}; {english_reason}".strip("; ")
+        )
+
+    confirmed_terms = build_exact_confirmed_terms(
+        corrected_japanese=corrected_japanese,
+        raw_japanese=raw_japanese,
+        glossary_entries=glossary_entries,
+        domain_mode=domain_mode,
+        ai_terms=parsed.get(
+            "confirmed_terms",
+            parsed.get("key_terms", []),
+        ),
+    )
+
+    safety_reason = "; ".join(
+        reason
+        for reason in [japanese_reason, english_reason]
+        if reason
+    )
+
+    return {
+        "corrected_japanese_original": corrected_japanese,
+        "corrected_english_caption": corrected_english or raw_english,
+        "is_unclear": bool(parsed.get("is_unclear", False)),
+        "unclear_reason": str(parsed.get("unclear_reason", "")).strip(),
+        "confirmed_terms": confirmed_terms,
+        "corrections": valid_corrections,
+        "safety_reason": safety_reason,
+    }
 
 def contains_any_text(text, words):
     text = text or ""
@@ -883,47 +1348,37 @@ def glossary_candidate_matches(candidate, text, is_translation=False):
     return candidate in text
 
 
-def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_terms=8):
-    original_text = original_text or ""
-    translation_text = translation_text or ""
-    translation_lower = translation_text.lower()
 
+def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_terms=8):
+    """
+    Detect only source-supported glossary terms.
+
+    English output is never used as evidence, and related-but-not-equivalent
+    aliases such as 自動車工学 -> ARE are excluded from recognition matching.
+    """
+    original_text = original_text or ""
     entries = load_glossary_entries(terms_file)
     matched_terms = []
 
     for row in entries:
-        jp = row["jp"]
-        en = row["en"]
-        reading = row.get("reading", "")
-        common_wrong = row.get("common_wrong", "")
-        notes = row.get("notes", "")
+        jp = str(row.get("jp", "")).strip()
+        en = str(row.get("en", "")).strip()
+        reading = str(row.get("reading", "")).strip()
+        notes = str(row.get("notes", "")).strip()
 
-        candidates = [jp, en, reading]
+        if not jp or not en:
+            continue
 
-        if common_wrong:
-            candidates.extend([
-                item.strip()
-                for item in common_wrong.split(";")
-                if item.strip()
-            ])
+        candidates = [jp, reading]
+        candidates.extend(recognition_variants_for_entry(row))
 
-        found = False
         matched_candidate = ""
-
         for candidate in candidates:
-            if not candidate:
-                continue
-
-            # Source-first key term detection:
-            # Do NOT match glossary terms from English translation.
-            # The English caption can be partial or wrong, and it caused
-            # unrelated key terms like ABS/extrusion to appear.
-            if glossary_candidate_matches(candidate, original_text):
-                found = True
+            if candidate and glossary_candidate_matches(candidate, original_text):
                 matched_candidate = candidate
                 break
 
-        if found:
+        if matched_candidate:
             matched_terms.append({
                 "jp": jp,
                 "en": en,
@@ -932,34 +1387,23 @@ def extract_key_terms_for_llm(original_text, translation_text, terms_file, max_t
                 "matched_candidate": matched_candidate,
             })
 
-    def key_term_priority(item):
-        jp = item.get("jp", "")
-        priority = {
-            "治具のCAD": 0,
-            "治具": 1,
-            "三面図": 2,
-            "寸法拘束": 3,
-            "幾何拘束": 4,
-            "三角形": 5,
-            "CATIA": 8,
-            "CAD": 9,
-        }
-        return priority.get(jp, 5)
-
-    matched_terms = sorted(matched_terms, key=key_term_priority)
+    matched_terms.sort(
+        key=lambda item: glossary_priority(item.get("jp", ""), "auto")
+    )
 
     unique_terms = []
     seen = set()
 
     for item in matched_terms:
         key = (item["jp"], item["en"])
+        if key in seen:
+            continue
+        unique_terms.append(item)
+        seen.add(key)
+        if len(unique_terms) >= max_terms:
+            break
 
-        if key not in seen:
-            unique_terms.append(item)
-            seen.add(key)
-
-    return unique_terms[:max_terms]
-
+    return unique_terms
 
 # ============================================================
 # Cleanup and correction
@@ -1297,13 +1741,9 @@ def light_caption_cleanup(text):
 
         "PDA": "PDE",
         "ADC": "PDE",
-        "Product Design": "Product Design Engineering",
         "product design engineering": "Product Design Engineering",
-        "product design": "Product Design Engineering",
 
-        "BA": "BE",
         "business engineering": "Business Engineering",
-        "business engineer": "Business Engineering",
 
         # CATIA / CAD / product design terms
         "Catia": "CATIA",
@@ -1459,8 +1899,6 @@ def light_original_cleanup(text):
         "ARO": "ARE",
         "エーアールイー": "ARE",
         "エーアール": "ARE",
-        "自動車ロボティクス": "ARE",
-        "自動車とロボット工学": "ARE",
 
         "PDA": "PDE",
         "ADC": "PDE",
@@ -1468,14 +1906,8 @@ def light_original_cleanup(text):
         "PE ": "PDE ",
         "ピーディーイー": "PDE",
         "ピーディー": "PDE",
-        "プロダクトデザイン": "PDE",
-        "製品デザイン工学": "PDE",
-        "製品設計": "PDE",
 
-        "BA": "BE",
         "ビーイー": "BE",
-        "ビジネス工学": "BE",
-        "ビジネスエンジニアリング": "BE",
 
         # CATIA / CAD / product design terms
         "キャティア": "CATIA",
@@ -1506,14 +1938,12 @@ def light_original_cleanup(text):
 
         "パッド": "Pad",
         "押出し": "押し出し",
-        "フィレ": "フィレット",
         "filet": "フィレット",
         "Fillet": "フィレット",
 
         "チャンファー": "Chamfer",
         "シャンファー": "Chamfer",
         "chamfer": "Chamfer",
-        "面取": "面取り",
         "面どり": "面取り",
 
         "設計糸": "設計意図",
@@ -1536,9 +1966,7 @@ def light_original_cleanup(text):
         "ロータリエンジン": "ロータリーエンジン",
         "ロタリーエンジン": "ロータリーエンジン",
         "ロータリー エンジン": "ロータリーエンジン",
-        "レシプロ": "レシプロエンジン",
         "ピストンエンジン": "レシプロエンジン",
-        "ロータ": "ローター",
         "アペックシール": "アペックスシール",
 
         # Common sentence cleanup
@@ -2297,32 +2725,35 @@ def key_term_supported_by_source(item, source_text):
     return False
 
 
+
 def key_term_display_allowed(item, source_text):
     """
-    Prevent delete/reappear while still blocking unsupported Groq hallucinations.
+    Show only terms supported by the currently displayed corrected Japanese.
 
-    - A term literally present in the current caption is always shown, and
-      refreshes its own staleness clock.
-    - Otherwise, a term with a source_match holds for KEY_TERM_STALE_SECONDS
-      since it was last actually confirmed present, independent of caption
-      segment resets. A short pause between sentences on the same topic
-      should not instantly wipe the term list.
-    - Groq-only terms with no source_match must be supported immediately.
+    There is no cross-phrase staleness hold. When the visible phrase changes,
+    unsupported old terms disappear immediately.
     """
-    source_match = str(item.get("source_match", item.get("matched_candidate", ""))).strip()
-
-    if key_term_supported_by_source(item, source_text):
-        item["last_confirmed_at"] = time.time()
-        return True
-
-    if source_match:
-        last_confirmed = float(
-            item.get("last_confirmed_at", item.get("added_at", 0.0)) or 0.0
+    term = str(item.get("term", item.get("jp", ""))).strip()
+    evidence = str(
+        item.get(
+            "evidence",
+            item.get("source_match", item.get("matched_candidate", "")),
         )
-        return (time.time() - last_confirmed) <= KEY_TERM_STALE_SECONDS
+    ).strip()
 
-    return False
+    if not term:
+        return False
 
+    if not _literal_term_in_text(term, source_text):
+        return False
+
+    # The current corrected Japanese is enough for display, but every stored
+    # AI-confirmed term should also carry raw evidence.
+    if item.get("confidence") and not evidence:
+        return False
+
+    item["last_confirmed_at"] = time.time()
+    return True
 
 def format_key_term_line(term, meaning, show_meaning=True, reading=""):
     """
@@ -2461,12 +2892,14 @@ Correction priorities:
 # LLM Interpreter Support - Groq second AI
 # ============================================================
 
+
 def parse_llm_json(text):
     empty = {
         "corrected_japanese_original": "",
         "corrected_english_caption": "",
         "is_unclear": False,
         "unclear_reason": "",
+        "confirmed_terms": [],
         "key_terms": [],
         "corrections": [],
         "parse_ok": False,
@@ -2480,32 +2913,61 @@ def parse_llm_json(text):
 
     if cleaned.startswith("```json"):
         cleaned = cleaned.replace("```json", "", 1).strip()
-
     if cleaned.startswith("```"):
         cleaned = cleaned.replace("```", "", 1).strip()
-
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
 
     start_idx = cleaned.find("{")
     end_idx = cleaned.rfind("}")
-
     if start_idx >= 0 and end_idx > start_idx:
         cleaned = cleaned[start_idx:end_idx + 1].strip()
 
     try:
         data = json.loads(cleaned)
 
+        confirmed_terms = data.get(
+            "confirmed_terms",
+            data.get("key_terms", []),
+        )
+        if not isinstance(confirmed_terms, list):
+            confirmed_terms = []
+
+        corrections = data.get("corrections", [])
+        if not isinstance(corrections, list):
+            corrections = []
+
+        unclear_value = data.get(
+            "is_unclear",
+            data.get("uncertain", False),
+        )
+
         return {
-            "corrected_japanese_original": str(data.get("corrected_japanese_original", "")).strip(),
-            "corrected_english_caption": str(data.get("corrected_english_caption", "")).strip(),
+            "corrected_japanese_original": str(
+                data.get(
+                    "corrected_japanese_original",
+                    data.get("corrected_japanese", ""),
+                )
+            ).strip(),
+            "corrected_english_caption": str(
+                data.get(
+                    "corrected_english_caption",
+                    data.get("faithful_english", ""),
+                )
+            ).strip(),
             "is_unclear": (
-                str(data.get("is_unclear", False)).strip().lower()
+                str(unclear_value).strip().lower()
                 in ["true", "1", "yes", "y"]
             ),
-            "unclear_reason": str(data.get("unclear_reason", "")).strip(),
-            "key_terms": data.get("key_terms", []),
-            "corrections": data.get("corrections", []),
+            "unclear_reason": str(
+                data.get(
+                    "unclear_reason",
+                    data.get("uncertain_reason", ""),
+                )
+            ).strip(),
+            "confirmed_terms": confirmed_terms,
+            "key_terms": confirmed_terms,
+            "corrections": corrections,
             "parse_ok": True,
             "raw_text": text or "",
         }
@@ -2518,90 +2980,149 @@ def llm_hint_worker(
     result_queue,
     api_key,
     model_name,
-    context_text,
+    current_japanese,
     current_translation,
+    previous_context,
     key_terms,
+    full_glossary_entries,
+    domain_mode,
     class_context="",
     self_context="",
+    source_version=-1,
 ):
+    """
+    Evidence-based second pass.
+
+    The model may repair ASR errors, but the program validates its Japanese,
+    correction pairs, and confirmed key terms before anything reaches the UI.
+    """
     try:
         client = Groq(api_key=api_key)
 
-        context_text = compact_text(context_text, MAX_GROQ_CONTEXT_CHARS)
-        current_translation = compact_text(current_translation, MAX_GROQ_TRANSLATION_CHARS)
+        current_japanese = compact_text(current_japanese, MAX_GROQ_CONTEXT_CHARS)
+        current_translation = compact_text(
+            current_translation,
+            MAX_GROQ_TRANSLATION_CHARS,
+        )
+        previous_context = compact_text(previous_context, 500)
         class_context = compact_text(class_context, 500)
         self_context = compact_text(self_context, 350)
 
         glossary_lines = []
         for item in (key_terms or [])[:MAX_GROQ_GLOSSARY_TERMS]:
-            jp = item.get("jp", "")
-            en = item.get("en", "")
-            wrong = str(item.get("common_wrong", "") or "").strip()
-            if jp and en:
-                line = f"{jp} = {en}"
-                if wrong:
-                    line += f" | possible wrong forms: {compact_text(wrong, 120)}"
-                glossary_lines.append(line)
+            jp = str(item.get("jp", "")).strip()
+            en = str(item.get("en", "")).strip()
+            variants = item.get("recognition_variants")
+            if variants is None:
+                variants = recognition_variants_for_entry(item)
 
-        glossary_text = "\n".join(glossary_lines)
+            variants = [
+                str(value).strip()
+                for value in (variants or [])
+                if str(value).strip()
+            ]
+            evidence = str(item.get("matched_evidence", "") or "").strip()
+
+            if not jp or not en:
+                continue
+
+            line = f"canonical={jp} | English={en}"
+            if variants:
+                line += " | possible ASR forms=" + "; ".join(variants[:8])
+            if evidence:
+                line += f" | raw evidence={evidence}"
+            glossary_lines.append(line)
+
+        glossary_text = "\n".join(glossary_lines) or "None"
 
         prompt = f"""
-Return ONLY JSON. No markdown.
+Return ONLY one JSON object. No markdown and no commentary.
 
-You are the required second-pass corrector after Groq Whisper transcription and Groq translation.
-The highest priority is preserving difficult technical key terms accurately.
-Correct likely near-homophone recognition errors only when the sentence meaning, selected domain, and candidate glossary strongly support the correction.
+You are a conservative second-pass corrector for Japanese technical captions.
+The raw Japanese below is the primary evidence. Correct only likely ASR errors.
+Do not rewrite for style.
 
-Rules:
-- Output max 5 key_terms.
-- The current Japanese audio transcript remains the base evidence.
-- Candidate glossary entries are possibilities, not permission to force every term.
-- A candidate may replace a near-homophone or malformed phrase when the surrounding sentence clearly supports it.
-  Examples: 感性補償/完成補償 -> 慣性補償, 寸法高速 -> 寸法拘束, ガチャ/カティア -> CATIA, GQ/時具 -> 治具.
-- Preserve all nontechnical meaning, actors, negation, numbers, and sentence order.
-- Remove obvious decoder hallucinations such as unrelated channel-subscription phrases.
-- Do not invent a technical term merely because it belongs to the selected domain.
-- If the intended wording is uncertain, keep the source, set is_unclear=true, and explain briefly.
-- If no key term is supported, key_terms = [].
-- Recent caption may contain an earlier pair for context. Correct only the final/current Japanese-English pair.
-- Return a complete corrected Japanese caption and a complete faithful English caption.
+STRICT FIDELITY RULES:
+1. Output exactly one corrected version of the current phrase. Do not repeat it.
+2. Preserve the speaker's actors, actions, particles, negation, numbers,
+   acronyms, sentence order, and clause count.
+3. Do not add explanations such as 「このように」, 「については」,
+   "this is how", examples, or background knowledge unless they exist in raw.
+4. Prefer exact canonical Japanese glossary spellings over synonyms:
+   治具, not リグ; 幾何拘束, not 気化拘束; 面取り, not メーカー.
+5. Candidate glossary entries are possibilities only. Never insert a candidate
+   merely because it belongs to the selected domain.
+6. English must translate corrected Japanese only. Do not summarize or explain.
+7. If the intended phrase is uncertain, preserve the raw wording where
+   possible and set is_unclear=true instead of guessing.
 
-Context:
+CONFIRMED TERM RULES:
+- Include a term only if it appears literally in corrected_japanese_original.
+- Every term must include "evidence", copied exactly from the raw Japanese.
+- Evidence may be the canonical term or a plausible ASR form.
+- If no exact raw evidence exists, omit the term.
+- Use the glossary English meaning exactly.
+- confidence must be "high" or "medium".
+
+CORRECTION RULES:
+- Every corrections[].wrong must be an exact substring of raw Japanese.
+- Every corrections[].correct must be an exact substring of corrected Japanese.
+- Do not list stylistic edits as corrections.
+
+Selected context:
 {class_context}
 
-Self context:
-{self_context}
+User context:
+{self_context or "None"}
 
-Recent caption:
-{context_text}
+Previous phrase for context only; do not include it in output:
+{previous_context or "None"}
 
-Current English:
-{current_translation}
+Raw current Japanese:
+{current_japanese}
+
+Initial English translation:
+{current_translation or "None"}
 
 Candidate glossary:
 {glossary_text}
 
-JSON:
+Required JSON schema:
 {{
   "corrected_japanese_original": "",
   "corrected_english_caption": "",
   "is_unclear": false,
   "unclear_reason": "",
-  "key_terms": [
-    {{"term": "Japanese term or acronym", "meaning": "English meaning"}}
+  "confirmed_terms": [
+    {{
+      "term": "",
+      "meaning": "",
+      "evidence": "",
+      "confidence": "high"
+    }}
   ],
   "corrections": [
-    {{"wrong": "wrong word", "correct": "correct word", "reason": "short reason"}}
+    {{
+      "wrong": "",
+      "correct": "",
+      "reason": ""
+    }}
   ]
 }}
 """.strip()
 
         messages = [
-            {"role": "system", "content": "You are a concise JSON-only interpreter key-term assistant."},
+            {
+                "role": "system",
+                "content": (
+                    "You are a conservative JSON-only Japanese ASR correction "
+                    "and faithful translation engine."
+                ),
+            },
             {"role": "user", "content": prompt},
         ]
 
-        text = ""
+        response_text = ""
         last_error = ""
 
         for response_format in [{"type": "json_object"}, None]:
@@ -2610,51 +3131,72 @@ JSON:
                     "model": model_name,
                     "messages": messages,
                     "temperature": 0.0,
-                    "max_tokens": 520,
+                    "max_tokens": 650,
                 }
                 if response_format is not None:
                     kwargs["response_format"] = response_format
-                completion = client.chat.completions.create(**kwargs)
-                text = completion.choices[0].message.content or ""
-                if text.strip():
-                    break
-            except Exception as e:
-                last_error = str(e)
-                continue
 
-        if not text.strip():
+                completion = client.chat.completions.create(**kwargs)
+                response_text = completion.choices[0].message.content or ""
+
+                if response_text.strip():
+                    break
+
+            except Exception as exc:
+                last_error = str(exc)
+
+        if not response_text.strip():
             raise RuntimeError(last_error or "Groq returned empty text")
 
-        parsed = parse_llm_json(text)
+        parsed = parse_llm_json(response_text)
 
         if not parsed.get("parse_ok"):
-            parsed["corrected_english_caption"] = current_translation or ""
-            parsed["corrected_japanese_original"] = ""
+            parsed["corrected_japanese_original"] = current_japanese
+            parsed["corrected_english_caption"] = current_translation
             parsed["is_unclear"] = True
-            parsed["unclear_reason"] = "Groq returned non-JSON output. Raw caption kept."
+            parsed["unclear_reason"] = (
+                "Second-pass model returned invalid JSON; raw caption kept."
+            )
 
-        if not parsed.get("corrected_english_caption"):
-            parsed["corrected_english_caption"] = current_translation or ""
+        sanitized = sanitize_second_pass_output(
+            raw_japanese=current_japanese,
+            raw_english=current_translation,
+            parsed=parsed,
+            glossary_entries=full_glossary_entries,
+            domain_mode=domain_mode,
+        )
 
         result_queue.put({
             "type": "llm_hint",
-            "corrected_japanese_original": parsed.get("corrected_japanese_original", ""),
-            "corrected_english_caption": parsed.get("corrected_english_caption", ""),
-            "is_unclear": bool(parsed.get("is_unclear", False)),
-            "unclear_reason": parsed.get("unclear_reason", ""),
-            "source_text": context_text,
-            "key_terms": parsed.get("key_terms", []),
-            "corrections": parsed.get("corrections", []),
+            "corrected_japanese_original": sanitized[
+                "corrected_japanese_original"
+            ],
+            "corrected_english_caption": sanitized[
+                "corrected_english_caption"
+            ],
+            "is_unclear": sanitized["is_unclear"],
+            "unclear_reason": sanitized["unclear_reason"],
+            "source_text": make_context_chunk(
+                current_japanese,
+                current_translation,
+            ),
+            "source_japanese": current_japanese,
+            "source_translation": current_translation,
+            "source_version": int(source_version),
+            "key_terms": sanitized["confirmed_terms"],
+            "confirmed_terms": sanitized["confirmed_terms"],
+            "corrections": sanitized["corrections"],
             "used_model": model_name,
-            "raw_response_preview": text[:500],
+            "raw_response_preview": response_text[:700],
+            "safety_reason": sanitized.get("safety_reason", ""),
         })
 
-    except Exception as e:
+    except Exception as exc:
         result_queue.put({
             "type": "llm_error",
-            "message": shorten_error_for_ui(str(e)),
+            "message": shorten_error_for_ui(str(exc)),
+            "source_version": int(source_version),
         })
-
 
 # ============================================================
 # Audio processor
@@ -2847,20 +3389,40 @@ def build_whisper_prompt(glossary_entries, domain_mode, self_context="", previou
     return compact_text(" ".join(pieces), 260)
 
 
+
 def select_second_pass_glossary_candidates(
     glossary_entries,
     domain_mode,
     source_text,
     max_terms=16,
 ):
-    """Give the second pass a small domain glossary, detected terms first."""
+    """
+    Give the second pass a small, evidence-aware domain glossary.
+
+    Exact/variant matches come first. Domain-priority entries are included as
+    candidates, but the prompt forbids inserting them without raw evidence.
+    """
     source_text = source_text or ""
     selected_domain = normalize_domain_name(domain_mode)
     priority_by_domain = {
-        "school": ["サマーコース", "ビヌス", "ビヌスASO", "ビヌス大学", "ARE", "PDE", "BE"],
-        "cad": ["CATIA", "治具", "三次元モデル", "スケッチ", "寸法拘束", "幾何拘束", "Pad", "フィレット", "Chamfer", "面取り", "三面図"],
-        "product design": ["CATIA", "治具", "三次元モデル", "寸法拘束", "幾何拘束", "設計意図", "加工性", "三面図"],
-        "automotive": ["AEB", "TTC", "車間距離", "相対速度", "制動力", "慣性補償", "慣性補償制御", "ゲイン調整", "応答性", "拘束条件", "緊急ブレーキ"],
+        "school": [
+            "サマーコース", "ビヌス", "ビヌスASO", "ビヌス大学",
+            "ARE", "PDE", "BE",
+        ],
+        "cad": [
+            "CATIA", "治具", "三次元モデル", "スケッチ",
+            "寸法拘束", "幾何拘束", "Pad", "押し出し",
+            "フィレット", "Chamfer", "面取り", "三面図", "加工性",
+        ],
+        "product design": [
+            "CATIA", "治具", "三次元モデル", "寸法拘束",
+            "幾何拘束", "設計意図", "加工性", "三面図",
+        ],
+        "automotive": [
+            "AEB", "TTC", "車間距離", "相対速度", "制動力",
+            "慣性補償", "慣性補償制御", "ゲイン調整", "応答性",
+            "拘束条件", "緊急ブレーキ",
+        ],
     }
 
     candidates = []
@@ -2871,36 +3433,50 @@ def select_second_pass_glossary_candidates(
         en = str(entry.get("en", "")).strip()
         if not jp or not en:
             return
+
         key = (jp, en)
         if key in seen:
             return
-        candidates.append(entry)
+
+        enriched = dict(entry)
+        enriched["recognition_variants"] = recognition_variants_for_entry(entry)
+        enriched["matched_evidence"] = source_evidence_for_term(
+            jp,
+            source_text,
+            glossary_entries,
+        )
+        candidates.append(enriched)
         seen.add(key)
 
-    # First: exact and common-wrong matches in the current source.
+    # First: literal canonical and safe recognition-variant matches.
     for entry in glossary_entries or []:
         if not glossary_entry_matches_domain(entry, domain_mode):
             continue
-        values = [str(entry.get("jp", "")).strip()]
-        values.extend(
-            value.strip()
-            for value in str(entry.get("common_wrong", "")).split(";")
-            if value.strip()
-        )
-        if any(glossary_candidate_matches(value, source_text) for value in values if value):
+
+        canonical = str(entry.get("jp", "")).strip()
+        values = [canonical] + recognition_variants_for_entry(entry)
+
+        if any(
+            _literal_term_in_text(value, source_text)
+            for value in values
+            if value
+        ):
             add_entry(entry)
 
-    # Second: the selected domain's most important terms. These are candidates,
-    # not forced corrections; the second-pass prompt requires sentence support.
+    # Second: selected-domain priority candidates.
     priority = priority_by_domain.get(selected_domain, [])
     if selected_domain == "auto":
-        priority = ["CATIA", "治具", "AEB", "TTC", "慣性補償制御", "サマーコース", "ビヌスASO"]
+        priority = [
+            "CATIA", "治具", "AEB", "TTC",
+            "慣性補償制御", "サマーコース", "ビヌスASO",
+        ]
 
     entry_by_jp = {
         str(entry.get("jp", "")).strip(): entry
         for entry in glossary_entries or []
         if str(entry.get("jp", "")).strip()
     }
+
     for jp in priority:
         entry = entry_by_jp.get(jp)
         if entry:
@@ -2911,35 +3487,45 @@ def select_second_pass_glossary_candidates(
     return candidates[:max_terms]
 
 def apply_glossary_source_corrections(text, glossary_entries, domain_mode):
-    """Apply safe CSV common_wrong -> canonical Japanese corrections."""
+    """
+    Apply only deterministic, low-risk ASR corrections.
+
+    Ambiguous observed forms such as メーカー -> 面取り and リグ -> 治具 are
+    intentionally left to the evidence-based second pass.
+    """
     corrected = light_original_cleanup(text or "")
     replacements = []
+
+    ambiguous_second_pass_only = {
+        ("治具", "リグ"),
+        ("治具", "GQ"),
+        ("面取り", "メーカー"),
+        ("応答性", "オートセット"),
+        ("車間距離", "Shaken Carrier"),
+        ("相対速度", "Sorter"),
+        ("相対速度", "temperate speed"),
+        ("慣性補償制御", "完成報告書を制御"),
+    }
 
     for entry in glossary_entries or []:
         if not glossary_entry_matches_domain(entry, domain_mode):
             continue
 
         canonical = str(entry.get("jp", "")).strip()
-        wrong_values = str(entry.get("common_wrong", "")).strip()
-
-        if not canonical or not wrong_values:
+        if not canonical:
             continue
 
-        for wrong in wrong_values.split(";"):
-            wrong = wrong.strip()
+        for wrong in recognition_variants_for_entry(entry):
             if len(wrong) < 2 or wrong == canonical:
                 continue
-
-            # Do not shorten valid variants such as 三角形 -> 三角.
-            if wrong.startswith(canonical) or canonical.startswith(wrong):
+            if (canonical, wrong) in ambiguous_second_pass_only:
                 continue
-
             replacements.append((wrong, canonical))
 
     replacements.sort(key=lambda item: len(item[0]), reverse=True)
 
     for wrong, canonical in replacements:
-        if all(ord(ch) < 128 for ch in wrong):
+        if _is_ascii_token(wrong):
             corrected = re.sub(
                 rf"(?<![A-Za-z0-9]){re.escape(wrong)}(?![A-Za-z0-9])",
                 canonical,
@@ -2949,10 +3535,18 @@ def apply_glossary_source_corrections(text, glossary_entries, domain_mode):
         else:
             corrected = corrected.replace(wrong, canonical)
 
+    # Safe phrase-level repairs observed in repeated tests.
+    phrase_repairs = {
+        "ちさくナルト": "小さくなると",
+        "ちさくなると": "小さくなると",
+        "小さくナルト": "小さくなると",
+    }
+    for wrong, canonical in phrase_repairs.items():
+        corrected = corrected.replace(wrong, canonical)
+
     corrected = light_original_cleanup(corrected)
     corrected, _ = light_domain_context_cleanup(corrected, "", domain_mode)
     return corrected.strip()
-
 
 def merge_overlapping_japanese(previous_text, new_text, max_chars=MAX_ORIGINAL_CHARS * 2):
     previous = (previous_text or "").strip()
@@ -3499,7 +4093,7 @@ st.title("Technical Interpreter Captioner")
 
 st.caption(
     "Japanese → English phrase captions using Groq Whisper STT, "
-    "CSV glossary correction, and Groq text translation."
+    "safe glossary correction, evidence-based second-pass AI, and Groq translation."
 )
 
 
@@ -3660,7 +4254,7 @@ with st.sidebar:
     # second pass is always enabled. It runs after completed phrases rather
     # than trying to rewrite every partial transcript.
     use_llm_hints = True
-    st.success("Second-pass AI is always ON for contextual key-term correction.")
+    st.success("Second-pass AI is always ON. Key terms require evidence from the current raw phrase.")
 
     llm_model_name = GROQ_HELPER_FAST
     st.caption(f"Second-pass model: {llm_model_name}")
@@ -4197,10 +4791,9 @@ while not st.session_state.live_result_queue.empty():
             st.session_state.llm_corrected_source_text = ""
             st.session_state.llm_is_unclear = False
             st.session_state.llm_unclear_reason = ""
-            # llm_key_terms is deliberately NOT cleared here. Key terms now
-            # hold on their own staleness clock (KEY_TERM_STALE_SECONDS),
-            # independent of caption segment resets, so a short pause between
-            # sentences on the same topic does not wipe the term list.
+            # Key terms belong to one corrected phrase only. Clear them before
+            # the new phrase so stale terms never leak into the next caption.
+            st.session_state.llm_key_terms = []
             st.session_state.llm_corrections = []
             st.session_state.caption_stage = "raw_started"
             st.session_state.last_helper_fix_time = ""
@@ -4232,14 +4825,13 @@ while not st.session_state.live_result_queue.empty():
             )
             instant_key_terms = detected_terms_to_llm_key_terms(instant_detected_terms)
 
-            # Keep key terms stable during the current caption segment.
-            # Live STT partials can temporarily remove words, so re-filtering old
-            # terms on every rerun makes the key-term box delete/reappear.
-            # We clear terms when a new caption segment starts, not on every token.
+            # Before the second pass finishes, show only exact/raw-supported
+            # canonical terms from the current phrase. The final second-pass
+            # result replaces this list with evidence-validated terms.
             st.session_state.llm_key_terms = merge_key_terms_preserve_order(
                 st.session_state.llm_key_terms,
                 instant_key_terms,
-                max_terms=8,
+                max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS,
             )
 
         if original:
@@ -4379,37 +4971,98 @@ while not st.session_state.llm_result_queue.empty():
     item_type = item.get("type")
 
     if item_type == "llm_hint":
-        st.session_state.llm_corrected_japanese_original = item.get("corrected_japanese_original", "")
-        st.session_state.llm_corrected_english_caption = item.get("corrected_english_caption", "")
-        st.session_state.llm_corrected_source_text = item.get("source_text", "")
-        st.session_state.llm_is_unclear = bool(item.get("is_unclear", False))
-        st.session_state.llm_unclear_reason = item.get("unclear_reason", "")
-        second_pass_source = (
-            item.get("corrected_japanese_original", "").strip()
-            or st.session_state.live_original
-        )
-        groq_terms = filter_llm_key_terms_for_current_caption(
-            item.get("key_terms", []),
-            second_pass_source,
-            "",  # do not use English translation as proof for key terms
-            domain_mode,
-        )
-        for term_item in groq_terms:
-            term_item["added_at"] = time.time()
+        result_source_version = int(item.get("source_version", -1) or -1)
+        result_source_japanese = str(item.get("source_japanese", "") or "").strip()
+        current_version = int(st.session_state.live_token_version)
 
-        st.session_state.llm_key_terms = merge_key_terms_preserve_order(
-            st.session_state.llm_key_terms,
-            groq_terms,
-            max_terms=8,
+        # A completed phrase may still be visible after page_reset, so equality
+        # is preferred. If newer speech has already started, never let the old
+        # correction or its key terms overwrite the new phrase.
+        stale_result = (
+            result_source_version >= 0
+            and result_source_version != current_version
+            and not source_text_matches_for_correction(
+                st.session_state.live_original,
+                result_source_japanese,
+            )
+        )
+
+        st.session_state.llm_running = False
+        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
+        st.session_state.llm_cooldown_until = (
+            time.time() + float(llm_hint_interval)
+        )
+        st.session_state.llm_calls_this_session += 1
+
+        if stale_result:
+            st.session_state.debug_messages.append(
+                "Ignored stale second-pass result for an older phrase."
+            )
+            st.session_state.debug_messages = (
+                st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            )
+            st.session_state.correction_status = "stale_ignored"
+            continue
+
+        st.session_state.llm_corrected_japanese_original = item.get(
+            "corrected_japanese_original",
+            "",
+        )
+        st.session_state.llm_corrected_english_caption = item.get(
+            "corrected_english_caption",
+            "",
+        )
+        st.session_state.llm_corrected_source_text = item.get(
+            "source_text",
+            "",
+        )
+        st.session_state.llm_is_unclear = bool(
+            item.get("is_unclear", False)
+        )
+        st.session_state.llm_unclear_reason = item.get(
+            "unclear_reason",
+            "",
         )
         st.session_state.llm_corrections = item.get("corrections", [])
         st.session_state.llm_error = ""
-        st.session_state.llm_running = False
-        st.session_state.llm_last_finish_time = time.strftime("%H:%M:%S")
-        # Cooldown starts AFTER the helper finishes, not when it starts.
-        # This prevents rapid back-to-back Groq calls that can trigger TPM/rate errors.
-        st.session_state.llm_cooldown_until = time.time() + float(llm_hint_interval)
-        st.session_state.llm_calls_this_session += 1
+
+        corrected_base_original, corrected_base_translation = (
+            merge_ai_result_into_live_caption(
+                live_original=st.session_state.live_original,
+                live_translation=st.session_state.live_translation,
+                ai_source_text=st.session_state.llm_corrected_source_text,
+                ai_corrected_original=(
+                    st.session_state.llm_corrected_japanese_original
+                ),
+                ai_corrected_translation=(
+                    st.session_state.llm_corrected_english_caption
+                ),
+                corrections=st.session_state.llm_corrections,
+                domain_mode=domain_mode,
+            )
+        )
+
+        if (
+            corrected_base_original.strip()
+            or not corrected_base_translation.strip()
+        ):
+            st.session_state.live_original = corrected_base_original
+            st.session_state.live_translation = corrected_base_translation
+
+        # Replace, rather than merge, key terms. Every term was validated by
+        # the worker against this phrase's raw evidence and corrected Japanese.
+        confirmed_terms = item.get(
+            "confirmed_terms",
+            item.get("key_terms", []),
+        )
+        st.session_state.llm_key_terms = [
+            term_item
+            for term_item in confirmed_terms
+            if key_term_display_allowed(
+                term_item,
+                st.session_state.live_original,
+            )
+        ][:SECOND_PASS_MAX_CONFIRMED_TERMS]
 
         has_ai_update = (
             bool(st.session_state.llm_corrected_japanese_original)
@@ -4426,33 +5079,6 @@ while not st.session_state.llm_result_queue.empty():
                 else "applied"
             )
 
-            # Important:
-            # Do NOT replace the whole live caption with the second-AI answer.
-            # The second AI may have corrected an older segment while new live
-            # text has already arrived. Patch only the source segment the AI saw.
-            corrected_base_original, corrected_base_translation = merge_ai_result_into_live_caption(
-                live_original=st.session_state.live_original,
-                live_translation=st.session_state.live_translation,
-                ai_source_text=st.session_state.llm_corrected_source_text,
-                ai_corrected_original=st.session_state.llm_corrected_japanese_original,
-                ai_corrected_translation=st.session_state.llm_corrected_english_caption,
-                corrections=st.session_state.llm_corrections,
-                domain_mode=domain_mode,
-            )
-
-            # Same rule as the display-time guard: never persist an English
-            # translation with no Japanese source behind it. Without this,
-            # a merge that drops the Japanese side (e.g. the AI source text
-            # was never valid Japanese) permanently corrupts live_original,
-            # not just this one render.
-            if corrected_base_original.strip() or not corrected_base_translation.strip():
-                st.session_state.live_original = corrected_base_original
-                st.session_state.live_translation = corrected_base_translation
-
-            # The correction above just changed live_original/live_translation,
-            # which would otherwise look like "new" text on the next render and
-            # immediately re-trigger another Groq call on the AI's own output.
-            # Mark this post-correction state as already checked.
             st.session_state.llm_last_source_text = build_slim_llm_context(
                 st.session_state.llm_context_chunks,
                 st.session_state.live_original,
@@ -4465,7 +5091,6 @@ while not st.session_state.llm_result_queue.empty():
                     "original": st.session_state.live_original,
                     "translation": st.session_state.live_translation,
                 })
-
         else:
             st.session_state.caption_stage = "raw_english"
             st.session_state.correction_status = (
@@ -4568,21 +5193,32 @@ if use_llm_hints and groq_api_key:
             self_context,
         )
 
+        current_pair = make_context_chunk(
+            st.session_state.live_original,
+            st.session_state.live_translation,
+        )
+        prior_chunks = list(st.session_state.llm_context_chunks)
+        if prior_chunks and prior_chunks[-1] == current_pair:
+            prior_chunks = prior_chunks[:-1]
+        previous_context_for_helper = "\n\n---\n\n".join(
+            prior_chunks[-1:]
+        )
+
         st.session_state.llm_thread = threading.Thread(
             target=llm_hint_worker,
             args=(
                 st.session_state.llm_result_queue,
                 groq_api_key,
                 llm_model_name,
-                source_text,
-                (
-                    st.session_state.live_translation
-                    if st.session_state.live_translation.strip()
-                    else st.session_state.live_original
-                ),
+                st.session_state.live_original,
+                st.session_state.live_translation,
+                previous_context_for_helper,
                 detected_terms,
+                active_glossary_entries,
+                domain_mode,
                 selected_class_context,
                 self_context,
+                st.session_state.live_token_version,
             ),
             daemon=True,
         )
