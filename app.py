@@ -82,9 +82,9 @@ PCM_BYTES_PER_SAMPLE = 2
 GROQ_STT_MODEL_ACCURATE = "whisper-large-v3"
 GROQ_STT_MODEL_FAST = "whisper-large-v3-turbo"
 GROQ_TRANSLATION_MODEL = "llama-3.1-8b-instant"
-GROQ_DEFAULT_CHUNK_SECONDS = 6.4
+GROQ_DEFAULT_CHUNK_SECONDS = 5.2
 GROQ_MIN_REQUEST_INTERVAL_SECONDS = 3.1
-GROQ_ENDPOINT_SILENCE_SECONDS = 0.90
+GROQ_ENDPOINT_SILENCE_SECONDS = 0.70
 GROQ_MIN_AUDIO_SECONDS = 1.2
 GROQ_AUDIO_OVERLAP_SECONDS = 0.0
 GROQ_VAD_RMS_THRESHOLD = 180.0
@@ -177,7 +177,8 @@ ADDITIONAL_RECOGNITION_VARIANTS = {
 
 SECOND_PASS_MAX_LENGTH_RATIO = 1.70
 SECOND_PASS_MIN_SIMILARITY_WITHOUT_EVIDENCE = 0.46
-SECOND_PASS_MAX_CONFIRMED_TERMS = 16
+SECOND_PASS_MAX_CONFIRMED_TERMS = 24
+DEFAULT_KEY_TERM_DISPLAY_LIMIT = 12
 
 # Paragraph-safe pipeline:
 # Whisper receives no glossary prompt. Each audio chunk is finalized independently
@@ -3203,7 +3204,7 @@ Required JSON schema:
                     "model": model_name,
                     "messages": messages,
                     "temperature": 0.0,
-                    "max_tokens": 650,
+                    "max_tokens": 520,
                 }
                 if response_format is not None:
                     kwargs["response_format"] = response_format
@@ -3619,6 +3620,46 @@ def translate_japanese_with_groq(
     return clean_plain_translation(output)
 
 
+def translation_requires_fallback(japanese_text, english_text):
+    """
+    Decide whether the combined second-pass response needs a separate
+    translation request.
+
+    Normal fast path:
+        Whisper -> combined correction/translation -> display
+
+    A third model call is made only when the English is missing or clearly
+    unusable. This removes one network request from most finalized blocks.
+    """
+    japanese_text = str(japanese_text or "").strip()
+    english_text = clean_plain_translation(str(english_text or ""))
+
+    if not english_text:
+        return True
+
+    # A translation should not still contain Japanese script.
+    if contains_japanese(english_text):
+        return True
+
+    # Very short output for a substantial Japanese phrase is probably
+    # truncated, an error label, or an incomplete JSON recovery.
+    if len(japanese_text) >= 18 and len(english_text) < 10:
+        return True
+
+    lower = english_text.lower()
+    bad_fragments = [
+        "translation unavailable",
+        "unable to translate",
+        "invalid json",
+        "error:",
+        "none",
+    ]
+    if any(fragment in lower for fragment in bad_fragments):
+        return True
+
+    return False
+
+
 def _groq_object_to_dict(value):
     if value is None:
         return {}
@@ -3896,6 +3937,7 @@ def groq_whisper_translate_worker(
     chunk_seconds=GROQ_DEFAULT_CHUNK_SECONDS,
     caption_reset_seconds=DEFAULT_RESET_SECONDS,
     drain_backlog=True,
+    reuse_second_pass_translation=True,
 ):
     """
     Finalize every audio chunk independently.
@@ -4115,21 +4157,35 @@ def groq_whisper_translate_worker(
                             second_pass.get("message", "Second pass unavailable.")
                         )
 
-                    second_pass_translation = translation
-                    try:
-                        # Translate the grounded Japanese after correction.
-                        # This prevents fluent English from being based on a
-                        # model-rewritten or contaminated Japanese sentence.
-                        translation = translate_japanese_with_groq(
-                            client=client,
-                            japanese_text=corrected_japanese,
-                            previous_japanese=previous_corrected_japanese,
-                            glossary_entries=glossary_entries,
-                            domain_mode=domain_mode,
-                            self_context=self_context,
-                        )
-                    except Exception:
-                        translation = second_pass_translation
+                    second_pass_translation = clean_plain_translation(
+                        translation
+                    )
+
+                    # Fast path: the second-pass call already returns both the
+                    # grounded Japanese correction and a faithful English
+                    # translation. Reuse that English instead of making a
+                    # redundant third API call for every block.
+                    translation = second_pass_translation
+                    needs_translation_fallback = translation_requires_fallback(
+                        corrected_japanese,
+                        translation,
+                    )
+
+                    if (
+                        not reuse_second_pass_translation
+                        or needs_translation_fallback
+                    ):
+                        try:
+                            translation = translate_japanese_with_groq(
+                                client=client,
+                                japanese_text=corrected_japanese,
+                                previous_japanese=previous_corrected_japanese,
+                                glossary_entries=glossary_entries,
+                                domain_mode=domain_mode,
+                                self_context=self_context,
+                            )
+                        except Exception:
+                            translation = second_pass_translation
 
                     if not looks_like_valid_japanese_for_display(
                         corrected_japanese
@@ -4224,7 +4280,7 @@ st.title("Technical Interpreter Captioner")
 
 st.caption(
     "Japanese → English phrase captions using Groq Whisper STT, "
-    "prompt-free Whisper, evidence-based per-block second-pass AI, and immutable paragraph assembly."
+    "one combined correction/translation pass, configurable key terms, and immutable paragraph assembly."
 )
 
 
@@ -4236,7 +4292,7 @@ with st.sidebar:
     st.header("Settings")
 
     translation_engine = ENGINE_GROQ_WHISPER
-    st.info("Translation engine: Groq Whisper + Groq translation")
+    st.info("Translation engine: Groq Whisper + combined correction/translation")
     st.caption("Captions update by phrase, not character-by-character.")
 
     domain_mode = st.selectbox(
@@ -4269,13 +4325,23 @@ with st.sidebar:
 
     stt_chunk_seconds = st.slider(
         "Caption audio chunk",
-        min_value=5.0,
-        max_value=10.0,
+        min_value=4.0,
+        max_value=8.0,
         value=GROQ_DEFAULT_CHUNK_SECONDS,
         step=0.2,
         help=(
-            "For continuous technical Japanese, 6–8 seconds gives Whisper more context. "
-            "The new pipeline finalizes each chunk independently and uses no vocabulary prompt."
+            "5.0–5.6 seconds is the recommended speed/accuracy balance. "
+            "Longer blocks give Whisper more context but delay the caption."
+        ),
+    )
+
+    fast_translation_mode = st.checkbox(
+        "Fast combined correction + translation",
+        value=True,
+        help=(
+            "Recommended. Reuse the English returned by the second-pass AI. "
+            "A separate translation request runs only when that English is "
+            "missing or unusable. Turn this off for the slower maximum-check mode."
         ),
     )
 
@@ -4326,6 +4392,18 @@ with st.sidebar:
 
     # Always show meanings because this app is now key-term support first.
     show_term_meaning = True
+
+    key_term_limit = st.slider(
+        "Maximum displayed key terms",
+        min_value=3,
+        max_value=SECOND_PASS_MAX_CONFIRMED_TERMS,
+        value=DEFAULT_KEY_TERM_DISPLAY_LIMIT,
+        step=1,
+        help=(
+            "Limits only the key-term box for the current paragraph. "
+            "It does not increase the number of glossary candidates sent to AI."
+        ),
+    )
 
     subtitle_display = st.radio(
         "Caption history",
@@ -4800,6 +4878,7 @@ if (
         float(stt_chunk_seconds),
         float(reset_seconds),
         drain_backlog,
+        bool(fast_translation_mode),
     )
 
     st.session_state.live_thread = threading.Thread(
@@ -4896,7 +4975,7 @@ while not st.session_state.live_result_queue.empty():
         )
         st.session_state.llm_key_terms = collect_phrase_key_terms(
             st.session_state.finalized_phrases,
-            max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS,
+            max_terms=key_term_limit,
         )
         st.session_state.llm_corrections = []
         st.session_state.llm_corrected_japanese_original = (
@@ -5040,7 +5119,7 @@ while not st.session_state.live_result_queue.empty():
             st.session_state.llm_key_terms = merge_key_terms_preserve_order(
                 st.session_state.llm_key_terms,
                 instant_key_terms,
-                max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS,
+                max_terms=key_term_limit,
             )
 
         if original:
@@ -5273,7 +5352,7 @@ while not st.session_state.llm_result_queue.empty():
                 term_item,
                 st.session_state.live_original,
             )
-        ][:SECOND_PASS_MAX_CONFIRMED_TERMS]
+        ][:key_term_limit]
 
         has_ai_update = (
             bool(st.session_state.llm_corrected_japanese_original)
@@ -5659,7 +5738,7 @@ if use_llm_hints:
         # "checking" placeholder on every periodic re-check.
         llm_terms_lines = []
 
-        for item in current_llm_key_terms[:SECOND_PASS_MAX_CONFIRMED_TERMS]:
+        for item in current_llm_key_terms[:key_term_limit]:
             term = str(item.get("term", "")).strip()
             meaning = str(item.get("meaning", "")).strip()
             reading = str(item.get("reading", "")).strip()
@@ -5669,7 +5748,7 @@ if use_llm_hints:
             if line and line not in llm_terms_lines:
                 llm_terms_lines.append(line)
 
-            if len(llm_terms_lines) >= SECOND_PASS_MAX_CONFIRMED_TERMS:
+            if len(llm_terms_lines) >= key_term_limit:
                 break
 
         llm_terms_text = "\n".join(llm_terms_lines) if llm_terms_lines else "No key terms yet."
@@ -5739,6 +5818,12 @@ if show_debug:
 
         st.write("Audio chunk target:")
         st.code(f"{stt_chunk_seconds:.1f} seconds")
+
+        st.write("Fast combined translation:")
+        st.code(str(fast_translation_mode))
+
+        st.write("Displayed key-term limit:")
+        st.code(str(key_term_limit))
 
         if webrtc_ctx.audio_processor:
             st.write("Mic processor frame count:")
