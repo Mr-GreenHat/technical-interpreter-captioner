@@ -67,8 +67,8 @@ except Exception:
 DEFAULT_TERMS_FILE = "technical_terms.csv"
 
 DEFAULT_RESET_SECONDS = 3.0
-MAX_ORIGINAL_CHARS = 300
-MAX_TRANSLATION_CHARS = 480
+MAX_ORIGINAL_CHARS = 900
+MAX_TRANSLATION_CHARS = 1400
 MAX_HISTORY_ITEMS = 5
 MAX_DEBUG_MESSAGES = 10
 
@@ -82,11 +82,11 @@ PCM_BYTES_PER_SAMPLE = 2
 GROQ_STT_MODEL_ACCURATE = "whisper-large-v3"
 GROQ_STT_MODEL_FAST = "whisper-large-v3-turbo"
 GROQ_TRANSLATION_MODEL = "llama-3.1-8b-instant"
-GROQ_DEFAULT_CHUNK_SECONDS = 5.8
+GROQ_DEFAULT_CHUNK_SECONDS = 6.4
 GROQ_MIN_REQUEST_INTERVAL_SECONDS = 3.1
 GROQ_ENDPOINT_SILENCE_SECONDS = 0.90
 GROQ_MIN_AUDIO_SECONDS = 1.2
-GROQ_AUDIO_OVERLAP_SECONDS = 0.15
+GROQ_AUDIO_OVERLAP_SECONDS = 0.0
 GROQ_VAD_RMS_THRESHOLD = 180.0
 
 # Whisper quality gates. Metrics are used when verbose_json is available;
@@ -131,7 +131,7 @@ JAPANESE_ONLY_MODE = True
 TRANSLATION_WITHOUT_SOURCE_MAX_LAG_SECONDS = 2.5
 
 # Key terms are evidence-based and belong only to the currently displayed
-# corrected Japanese phrase. They are cleared when a new phrase begins.
+# finalized paragraph. They are cleared when a new paragraph begins.
 KEY_TERM_STALE_SECONDS = 0.0
 
 # Values in common_wrong are not all recognition mistakes. Some are valid,
@@ -177,7 +177,13 @@ ADDITIONAL_RECOGNITION_VARIANTS = {
 
 SECOND_PASS_MAX_LENGTH_RATIO = 1.70
 SECOND_PASS_MIN_SIMILARITY_WITHOUT_EVIDENCE = 0.46
-SECOND_PASS_MAX_CONFIRMED_TERMS = 8
+SECOND_PASS_MAX_CONFIRMED_TERMS = 16
+
+# Paragraph-safe pipeline:
+# Whisper receives no glossary prompt. Each audio chunk is finalized independently
+# by the second-pass AI, then immutable phrase blocks are appended in the UI.
+SECOND_PASS_IN_WORKER = True
+MAX_FINALIZED_PHRASE_BLOCKS = 16
 
 SOURCE_LANG_JA_ONLY = "Japanese only"
 
@@ -849,11 +855,43 @@ def build_exact_confirmed_terms(
     return output[:max_terms]
 
 
-def validated_second_pass_corrections(raw_japanese, corrected_japanese, corrections):
-    """Keep only correction pairs grounded in the raw and corrected strings."""
+def validated_second_pass_corrections(
+    raw_japanese,
+    corrected_japanese,
+    corrections,
+    glossary_entries=None,
+    domain_mode="auto",
+):
+    """
+    Keep only correction pairs explicitly allowed by the glossary.
+
+    The second-pass model may choose among approved ASR variants, but it may
+    not invent arbitrary replacements or rewrite sentence structure.
+    """
     raw_japanese = str(raw_japanese or "")
     corrected_japanese = str(corrected_japanese or "")
+    allowed_pairs = set()
+
+    for entry in glossary_entries or []:
+        if not glossary_entry_matches_domain(entry, domain_mode):
+            continue
+        canonical = str(entry.get("jp", "")).strip()
+        if not canonical:
+            continue
+        for variant in recognition_variants_for_entry(entry):
+            if variant and variant != canonical:
+                allowed_pairs.add((variant, canonical))
+
+    # Small non-glossary repairs that were repeatedly observed and do not
+    # change technical meaning.
+    allowed_pairs.update({
+        ("ちさくナルト", "小さくなると"),
+        ("ちさくなると", "小さくなると"),
+        ("小さくナルト", "小さくなると"),
+    })
+
     valid = []
+    seen = set()
 
     for item in corrections or []:
         wrong = str(item.get("wrong", "")).strip()
@@ -862,9 +900,15 @@ def validated_second_pass_corrections(raw_japanese, corrected_japanese, correcti
 
         if len(wrong) < 2 or not correct:
             continue
+        if (wrong, correct) not in allowed_pairs:
+            continue
         if not _literal_term_in_text(wrong, raw_japanese):
             continue
         if not _literal_term_in_text(correct, corrected_japanese):
+            continue
+
+        key = (wrong, correct)
+        if key in seen:
             continue
 
         valid.append({
@@ -872,9 +916,9 @@ def validated_second_pass_corrections(raw_japanese, corrected_japanese, correcti
             "correct": correct,
             "reason": reason,
         })
+        seen.add(key)
 
     return valid
-
 
 def second_pass_japanese_is_safe(raw_japanese, corrected_japanese, valid_corrections):
     """
@@ -1008,61 +1052,84 @@ def sanitize_second_pass_output(
     domain_mode,
 ):
     """
-    Validate model output and return a safe, evidence-based correction.
+    Convert model suggestions into a grounded result.
+
+    The model is not allowed to rewrite the sentence. The final Japanese is
+    reconstructed from the raw transcript using deterministic corrections plus
+    only approved glossary variant pairs returned by the second pass.
     """
     raw_japanese = str(raw_japanese or "").strip()
     raw_english = str(raw_english or "").strip()
-
-    corrected_japanese = str(
+    model_japanese = str(
         parsed.get("corrected_japanese_original", "")
     ).strip()
-    corrected_english = str(
-        parsed.get("corrected_english_caption", "")
-    ).strip()
 
-    if not corrected_japanese:
-        corrected_japanese = raw_japanese
+    if not model_japanese:
+        model_japanese = raw_japanese
 
-    corrected_japanese = light_original_cleanup(corrected_japanese)
-    corrected_japanese, _ = light_domain_context_cleanup(
-        corrected_japanese,
+    model_japanese = light_original_cleanup(model_japanese)
+    model_japanese, _ = light_domain_context_cleanup(
+        model_japanese,
         "",
         domain_mode,
     )
 
     valid_corrections = validated_second_pass_corrections(
         raw_japanese,
-        corrected_japanese,
+        model_japanese,
         parsed.get("corrections", []),
+        glossary_entries=glossary_entries,
+        domain_mode=domain_mode,
+    )
+
+    # Reconstruct instead of trusting the model's rewritten Japanese.
+    grounded_japanese = apply_glossary_source_corrections(
+        raw_japanese,
+        glossary_entries,
+        domain_mode,
+    )
+    grounded_japanese = apply_llm_corrections(
+        grounded_japanese,
+        valid_corrections,
+    )
+    grounded_japanese = light_original_cleanup(grounded_japanese)
+    grounded_japanese, _ = light_domain_context_cleanup(
+        grounded_japanese,
+        "",
+        domain_mode,
     )
 
     safe_japanese, japanese_reason = second_pass_japanese_is_safe(
         raw_japanese,
-        corrected_japanese,
+        grounded_japanese,
         valid_corrections,
     )
-
     if not safe_japanese:
-        corrected_japanese = raw_japanese
-        corrected_english = raw_english
-        valid_corrections = []
+        grounded_japanese = apply_glossary_source_corrections(
+            raw_japanese,
+            glossary_entries,
+            domain_mode,
+        )
         parsed["is_unclear"] = True
         existing_reason = str(parsed.get("unclear_reason", "")).strip()
         parsed["unclear_reason"] = (
             f"{existing_reason}; {japanese_reason}".strip("; ")
         )
 
-    corrected_english = align_english_to_confirmed_japanese(
-        corrected_japanese,
-        corrected_english or raw_english,
+    model_english = str(
+        parsed.get("corrected_english_caption", "")
+    ).strip()
+    model_english = align_english_to_confirmed_japanese(
+        grounded_japanese,
+        model_english or raw_english,
     )
 
     safe_english, english_reason = second_pass_english_is_safe(
         raw_english,
-        corrected_english,
+        model_english,
     )
     if not safe_english:
-        corrected_english = raw_english
+        model_english = raw_english
         parsed["is_unclear"] = True
         existing_reason = str(parsed.get("unclear_reason", "")).strip()
         parsed["unclear_reason"] = (
@@ -1070,7 +1137,7 @@ def sanitize_second_pass_output(
         )
 
     confirmed_terms = build_exact_confirmed_terms(
-        corrected_japanese=corrected_japanese,
+        corrected_japanese=grounded_japanese,
         raw_japanese=raw_japanese,
         glossary_entries=glossary_entries,
         domain_mode=domain_mode,
@@ -1087,8 +1154,8 @@ def sanitize_second_pass_output(
     )
 
     return {
-        "corrected_japanese_original": corrected_japanese,
-        "corrected_english_caption": corrected_english or raw_english,
+        "corrected_japanese_original": grounded_japanese,
+        "corrected_english_caption": model_english or raw_english,
         "is_unclear": bool(parsed.get("is_unclear", False)),
         "unclear_reason": str(parsed.get("unclear_reason", "")).strip(),
         "confirmed_terms": confirmed_terms,
@@ -2618,25 +2685,30 @@ def build_slim_llm_context(context_chunks, current_original, current_translation
 
 
 def make_compact_domain_context(domain_mode, self_context=""):
-    domain = (domain_mode or "auto").lower()
-    self_context = compact_text(self_context, 350)
+    """
+    Give the text models only broad topic context.
+
+    Do not place vocabulary lists here. Model prompts containing unrelated
+    technical terms caused those terms to be inserted into captions.
+    """
+    domain = normalize_domain_name(domain_mode)
+    self_context = compact_text(self_context, 220)
 
     if domain == "automotive":
-        base = "Domain: automotive/AEB/braking/control. Important: TTC, AEB, ADAS, 慣性補償, braking force, rotary engine."
+        base = "Domain: automotive engineering and vehicle-control lecture."
     elif domain == "cad":
-        base = "Domain: CAD/CATIA. Important: CATIA, CAD, Sketcher, dimensional/geometric constraints, Pad, Fillet, Chamfer."
+        base = "Domain: CAD and mechanical-design lecture."
     elif domain == "product design":
-        base = "Domain: product design/CAD. Important: design intent, manufacturability, CATIA, dimensions, constraints."
-    elif domain in ["school", "school/event", "event"]:
-        base = "Domain: school event. Important only if mentioned: Summer Course, BINUS, BINUS University, BINUS ASO, ARE, PDE, BE."
+        base = "Domain: product-design and manufacturing lecture."
+    elif domain == "school":
+        base = "Domain: school program or academic event."
     else:
-        base = "Domain: mixed Japanese technical classroom. Do not force unrelated proper nouns."
+        base = "Domain: general Japanese technical classroom."
 
     if self_context:
-        return f"{base}\nUser context: {self_context}"
+        return f"{base}\nOptional background only: {self_context}"
 
     return base
-
 
 def shorten_error_for_ui(message, max_chars=180):
     message = str(message or "").strip()
@@ -3048,8 +3120,8 @@ STRICT FIDELITY RULES:
    acronyms, sentence order, and clause count.
 3. Do not add explanations such as 「このように」, 「については」,
    "this is how", examples, or background knowledge unless they exist in raw.
-4. Prefer exact canonical Japanese glossary spellings over synonyms:
-   治具, not リグ; 幾何拘束, not 気化拘束; 面取り, not メーカー.
+4. Use a canonical glossary spelling only when the Candidate glossary shows
+   exact raw evidence for that entry.
 5. Candidate glossary entries are possibilities only. Never insert a candidate
    merely because it belongs to the selected domain.
 6. English must translate corrected Japanese only. Do not summarize or explain.
@@ -3313,82 +3385,14 @@ def glossary_entry_matches_domain(entry, domain_mode):
 
 
 def build_whisper_prompt(glossary_entries, domain_mode, self_context="", previous_text=""):
-    """Build a compact spelling prompt without meta-instructions that can leak."""
-    selected_domain = normalize_domain_name(domain_mode)
-    shared_terms = ["BINUS ASO", "CATIA", "AEB", "TTC"]
-    domain_priority = {
-        "school": [
-            "サマーコース", "BINUS", "BINUS ASO", "ビヌスASO", "ビヌス大学", "ARE", "PDE", "BE",
-            "自動車工学", "ロボティクス", "製品設計",
-        ],
-        "cad": [
-            "CATIA", "治具", "三次元モデル", "スケッチ", "寸法拘束",
-            "幾何拘束", "完全拘束", "Pad", "フィレット", "面取り", "三面図",
-        ],
-        "product design": [
-            "CATIA", "治具", "三次元モデル", "寸法拘束", "幾何拘束",
-            "設計意図", "加工性", "三面図", "フィレット", "面取り",
-        ],
-        "automotive": [
-            "AEB", "TTC", "車間距離", "相対速度", "制動力", "慣性補償制御",
-            "ゲイン調整", "応答性", "拘束条件", "緊急ブレーキ",
-            "ロータリーエンジン", "アペックスシール",
-        ],
-    }
+    """
+    Return no Whisper prompt.
 
-    # Auto mode intentionally stays small. Loading every domain into one prompt
-    # caused prompt leakage and made Whisper invent unrelated technical terms.
-    priority_terms = (
-        shared_terms
-        if selected_domain == "auto"
-        else domain_priority.get(selected_domain, shared_terms)
-    )
-
-    terms = []
-    seen = set()
-
-    for term in priority_terms:
-        key = term.lower()
-        if key not in seen:
-            terms.append(term)
-            seen.add(key)
-        if len(terms) >= WHISPER_PROMPT_MAX_TERMS:
-            break
-
-    # Only add extra glossary entries when they are already supported by the
-    # user's context or the preceding caption. This prevents a giant prompt.
-    support_text = f"{self_context or ''}\n{previous_text or ''}".lower()
-    for entry in glossary_entries or []:
-        if len(terms) >= WHISPER_PROMPT_MAX_TERMS:
-            break
-        if not glossary_entry_matches_domain(entry, domain_mode):
-            continue
-
-        jp = str(entry.get("jp", "")).strip()
-        en = str(entry.get("en", "")).strip()
-        if not jp or len(jp) > 28:
-            continue
-
-        if selected_domain == "auto" and jp.lower() not in support_text and en.lower() not in support_text:
-            continue
-
-        key = jp.lower()
-        if key not in seen:
-            terms.append(jp)
-            seen.add(key)
-
-    previous = compact_text(previous_text, 90)
-    pieces = []
-    if previous and looks_like_valid_japanese_for_display(previous):
-        pieces.append(previous.rstrip("。") + "。")
-    if terms:
-        pieces.append("、".join(terms[:WHISPER_PROMPT_MAX_TERMS]) + "。")
-
-    # A prompt that resembles transcript text works better than instructions
-    # such as "用語を正確に表記する", which Whisper may copy into the result.
-    return compact_text(" ".join(pieces), 260)
-
-
+    Vocabulary prompts improved isolated spellings but contaminated continuous
+    speech by making Whisper emit terms that were never spoken. Technical term
+    recovery is handled after transcription by the evidence-based second pass.
+    """
+    return ""
 
 def select_second_pass_glossary_candidates(
     glossary_entries,
@@ -3397,93 +3401,45 @@ def select_second_pass_glossary_candidates(
     max_terms=16,
 ):
     """
-    Give the second pass a small, evidence-aware domain glossary.
+    Return only glossary entries supported by the current raw ASR chunk.
 
-    Exact/variant matches come first. Domain-priority entries are included as
-    candidates, but the prompt forbids inserting them without raw evidence.
+    No domain-priority filler entries are added. This prevents the second pass
+    from seeing CATIA, BINUS ASO, AEB, or TTC unless the raw chunk contains the
+    canonical term or one of its approved recognition variants.
     """
-    source_text = source_text or ""
-    selected_domain = normalize_domain_name(domain_mode)
-    priority_by_domain = {
-        "school": [
-            "サマーコース", "ビヌス", "ビヌスASO", "ビヌス大学",
-            "ARE", "PDE", "BE",
-        ],
-        "cad": [
-            "CATIA", "治具", "三次元モデル", "スケッチ",
-            "寸法拘束", "幾何拘束", "Pad", "押し出し",
-            "フィレット", "Chamfer", "面取り", "三面図", "加工性",
-        ],
-        "product design": [
-            "CATIA", "治具", "三次元モデル", "寸法拘束",
-            "幾何拘束", "設計意図", "加工性", "三面図",
-        ],
-        "automotive": [
-            "AEB", "TTC", "車間距離", "相対速度", "制動力",
-            "慣性補償", "慣性補償制御", "ゲイン調整", "応答性",
-            "拘束条件", "緊急ブレーキ",
-        ],
-    }
-
+    source_text = str(source_text or "")
     candidates = []
     seen = set()
 
-    def add_entry(entry):
-        jp = str(entry.get("jp", "")).strip()
-        en = str(entry.get("en", "")).strip()
-        if not jp or not en:
-            return
-
-        key = (jp, en)
-        if key in seen:
-            return
-
-        enriched = dict(entry)
-        enriched["recognition_variants"] = recognition_variants_for_entry(entry)
-        enriched["matched_evidence"] = source_evidence_for_term(
-            jp,
-            source_text,
-            glossary_entries,
-        )
-        candidates.append(enriched)
-        seen.add(key)
-
-    # First: literal canonical and safe recognition-variant matches.
     for entry in glossary_entries or []:
         if not glossary_entry_matches_domain(entry, domain_mode):
             continue
 
-        canonical = str(entry.get("jp", "")).strip()
-        values = [canonical] + recognition_variants_for_entry(entry)
+        jp = str(entry.get("jp", "")).strip()
+        en = str(entry.get("en", "")).strip()
+        if not jp or not en:
+            continue
 
-        if any(
-            _literal_term_in_text(value, source_text)
-            for value in values
-            if value
-        ):
-            add_entry(entry)
+        evidence = source_evidence_for_term(jp, source_text, glossary_entries)
+        if not evidence:
+            continue
 
-    # Second: selected-domain priority candidates.
-    priority = priority_by_domain.get(selected_domain, [])
-    if selected_domain == "auto":
-        priority = [
-            "CATIA", "治具", "AEB", "TTC",
-            "慣性補償制御", "サマーコース", "ビヌスASO",
-        ]
+        key = (jp, en)
+        if key in seen:
+            continue
 
-    entry_by_jp = {
-        str(entry.get("jp", "")).strip(): entry
-        for entry in glossary_entries or []
-        if str(entry.get("jp", "")).strip()
-    }
+        enriched = dict(entry)
+        enriched["recognition_variants"] = recognition_variants_for_entry(entry)
+        enriched["matched_evidence"] = evidence
+        candidates.append(enriched)
+        seen.add(key)
 
-    for jp in priority:
-        entry = entry_by_jp.get(jp)
-        if entry:
-            add_entry(entry)
-        if len(candidates) >= max_terms:
-            break
-
+    candidates.sort(
+        key=lambda item: glossary_priority(
+            str(item.get("jp", "")).strip(),
+            domain_mode,
+        )
+    )
     return candidates[:max_terms]
 
 def apply_glossary_source_corrections(text, glossary_entries, domain_mode):
@@ -3825,6 +3781,108 @@ def transcribe_japanese_chunk(
 
     raise RuntimeError(str(last_error or "Whisper transcription failed"))
 
+def run_second_pass_for_phrase(
+    api_key,
+    raw_japanese,
+    previous_corrected_japanese,
+    glossary_entries,
+    domain_mode,
+    self_context,
+    source_version,
+):
+    """
+    Run the existing evidence-based corrector synchronously for one immutable
+    phrase block. Normally this is the only text-model call after Whisper.
+    """
+    candidate_terms = select_second_pass_glossary_candidates(
+        glossary_entries,
+        domain_mode,
+        raw_japanese,
+        max_terms=MAX_GROQ_GLOSSARY_TERMS,
+    )
+    local_queue = queue.Queue()
+
+    llm_hint_worker(
+        result_queue=local_queue,
+        api_key=api_key,
+        model_name=GROQ_HELPER_FAST,
+        current_japanese=raw_japanese,
+        current_translation="",
+        previous_context=make_context_chunk(
+            previous_corrected_japanese,
+            "",
+        ),
+        key_terms=candidate_terms,
+        full_glossary_entries=glossary_entries,
+        domain_mode=domain_mode,
+        class_context=make_compact_domain_context(domain_mode, ""),
+        self_context=self_context,
+        source_version=source_version,
+    )
+
+    try:
+        result = local_queue.get(timeout=45)
+    except queue.Empty:
+        return {
+            "type": "llm_error",
+            "message": "Second-pass correction timed out.",
+        }
+
+    return result
+
+
+def join_japanese_phrase_blocks(phrases, max_chars=MAX_ORIGINAL_CHARS):
+    """Join finalized Japanese blocks without rewriting older blocks."""
+    combined = ""
+    for phrase in phrases or []:
+        part = str(phrase.get("original", "") or "").strip()
+        if not part:
+            continue
+        combined = merge_overlapping_japanese(
+            combined,
+            part,
+            max_chars=max_chars,
+        )
+    return trim_caption_soft(combined, max_chars)
+
+
+def join_english_phrase_blocks(phrases, max_chars=MAX_TRANSLATION_CHARS):
+    """Join finalized English blocks while preserving phrase order."""
+    parts = []
+    for phrase in phrases or []:
+        part = clean_plain_translation(
+            str(phrase.get("translation", "") or "")
+        )
+        if not part:
+            continue
+        if parts and part == parts[-1]:
+            continue
+        parts.append(part)
+    return trim_caption_soft(" ".join(parts), max_chars)
+
+
+def collect_phrase_key_terms(phrases, max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS):
+    """Collect unique confirmed terms from the currently displayed paragraph."""
+    output = []
+    seen = set()
+
+    for phrase in phrases or []:
+        for item in phrase.get("terms", []) or []:
+            term = str(item.get("term", item.get("jp", ""))).strip()
+            meaning = str(item.get("meaning", item.get("en", ""))).strip()
+            if not term or not meaning:
+                continue
+
+            key = (term.lower(), meaning.lower())
+            if key in seen:
+                continue
+
+            output.append(dict(item))
+            seen.add(key)
+
+    return output[:max_terms]
+
+
 def groq_whisper_translate_worker(
     audio_queue,
     result_queue,
@@ -3839,8 +3897,16 @@ def groq_whisper_translate_worker(
     caption_reset_seconds=DEFAULT_RESET_SECONDS,
     drain_backlog=True,
 ):
-    """Chunk microphone audio, transcribe Japanese, then translate to English."""
+    """
+    Finalize every audio chunk independently.
 
+    Pipeline per block:
+        audio -> Whisper raw Japanese -> evidence-based second pass
+        -> immutable corrected Japanese/English/confirmed terms
+
+    Older phrase blocks are never sent back for rewriting. The previous phrase
+    is supplied only as read-only context.
+    """
     if drain_backlog:
         try:
             while True:
@@ -3856,27 +3922,28 @@ def groq_whisper_translate_worker(
         int(float(chunk_seconds) * bytes_per_second),
     )
     min_audio_bytes = int(GROQ_MIN_AUDIO_SECONDS * bytes_per_second)
-    overlap_bytes = int(GROQ_AUDIO_OVERLAP_SECONDS * bytes_per_second)
 
     audio_buffer = bytearray()
-    live_original = ""
-    live_translation = ""
-    previous_completed_japanese = ""
+    previous_corrected_japanese = ""
     last_voice_time = 0.0
     last_request_time = 0.0
+    last_finalized_time = 0.0
     speech_seen_in_buffer = False
-    reset_sent = False
+    paragraph_boundary_sent = False
     consecutive_errors = 0
+    phrase_counter = 0
     reset_seconds_local = float(caption_reset_seconds)
 
     result_queue.put({
         "type": "debug",
-        "message": f"Groq Whisper worker started with {stt_model}.",
+        "message": (
+            f"Paragraph-safe Groq Whisper worker started with {stt_model}; "
+            "Whisper vocabulary prompt disabled."
+        ),
     })
 
     try:
         while not stop_event.is_set():
-            # Apply UI commands without restarting the worker.
             while control_queue is not None and not control_queue.empty():
                 try:
                     command = control_queue.get_nowait()
@@ -3885,27 +3952,24 @@ def groq_whisper_translate_worker(
 
                 if command == "clear":
                     audio_buffer = bytearray()
-                    live_original = ""
-                    live_translation = ""
-                    previous_completed_japanese = ""
+                    previous_corrected_japanese = ""
                     last_voice_time = 0.0
+                    last_finalized_time = 0.0
                     speech_seen_in_buffer = False
-                    reset_sent = False
+                    paragraph_boundary_sent = False
+                    phrase_counter = 0
                     result_queue.put({"type": "cleared"})
-
-                elif isinstance(command, dict) and command.get("type") == "set_base_caption":
-                    live_original = str(command.get("original", "") or live_original)
-                    live_translation = str(command.get("translation", "") or live_translation)
-                    result_queue.put({
-                        "type": "debug",
-                        "message": "Groq worker base updated after second-pass correction.",
-                    })
 
                 elif isinstance(command, dict) and command.get("type") == "set_reset_seconds":
                     try:
-                        reset_seconds_local = float(command.get("value", reset_seconds_local))
+                        reset_seconds_local = float(
+                            command.get("value", reset_seconds_local)
+                        )
                     except Exception:
                         pass
+
+                # set_base_caption belonged to the old accumulated-caption
+                # architecture. It is intentionally ignored now.
 
             now = time.time()
             pcm_chunk = b""
@@ -3918,11 +3982,22 @@ def groq_whisper_translate_worker(
             if pcm_chunk:
                 audio_buffer.extend(pcm_chunk)
                 level = pcm16_rms(pcm_chunk)
-
                 if level >= GROQ_VAD_RMS_THRESHOLD:
                     last_voice_time = now
                     speech_seen_in_buffer = True
-                    reset_sent = False
+                    paragraph_boundary_sent = False
+
+                # Catch up quickly after a model call while preserving order.
+                while len(audio_buffer) < max_chunk_bytes:
+                    try:
+                        extra = audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    audio_buffer.extend(extra)
+                    if pcm16_rms(extra) >= GROQ_VAD_RMS_THRESHOLD:
+                        last_voice_time = time.time()
+                        speech_seen_in_buffer = True
+                        paragraph_boundary_sent = False
 
             silence_seconds = (
                 now - last_voice_time
@@ -3953,30 +4028,21 @@ def groq_whisper_translate_worker(
                     speech_seen_in_buffer = False
                 else:
                     request_pcm = bytes(audio_buffer[:max_chunk_bytes])
-                    consume_bytes = max(1, max_chunk_bytes - overlap_bytes)
-                    audio_buffer = audio_buffer[consume_bytes:]
+                    audio_buffer = audio_buffer[max_chunk_bytes:]
                     speech_seen_in_buffer = bool(audio_buffer)
 
-                # Skip obvious silence/noise requests.
                 if pcm16_rms(request_pcm) < GROQ_VAD_RMS_THRESHOLD * 0.55:
-                    if endpoint_ready:
-                        audio_buffer = bytearray()
                     continue
 
                 last_request_time = time.time()
+                phrase_counter += 1
 
                 try:
-                    whisper_prompt = build_whisper_prompt(
-                        glossary_entries,
-                        domain_mode,
-                        self_context,
-                        previous_text=live_original or previous_completed_japanese,
-                    )
                     whisper_result = transcribe_japanese_chunk(
                         client,
                         request_pcm,
                         stt_model,
-                        whisper_prompt,
+                        whisper_prompt="",
                     )
                     accepted, raw_japanese, reject_reason = assess_whisper_transcription(
                         whisper_result,
@@ -3988,47 +4054,112 @@ def groq_whisper_translate_worker(
                         result_queue.put({
                             "type": "debug",
                             "message": (
-                                f"Rejected Whisper chunk ({reject_reason}): "
-                                f"{raw_japanese[:100]} | metrics={metrics}"
+                                f"Rejected Whisper block {phrase_counter} "
+                                f"({reject_reason}): {raw_japanese[:120]} | "
+                                f"metrics={metrics}"
                             ),
                         })
                         continue
 
-                    corrected_japanese = apply_glossary_source_corrections(
-                        raw_japanese,
-                        glossary_entries,
-                        domain_mode,
-                    )
-
-                    if not looks_like_valid_japanese_for_display(corrected_japanese):
-                        result_queue.put({
-                            "type": "debug",
-                            "message": f"Ignored low-quality Whisper text: {corrected_japanese[:100]}",
-                        })
-                        continue
-
-                    new_live_original = merge_overlapping_japanese(
-                        live_original,
-                        corrected_japanese,
-                    )
-                    translation = translate_japanese_with_groq(
-                        client=client,
-                        japanese_text=new_live_original,
-                        previous_japanese=previous_completed_japanese,
+                    second_pass = run_second_pass_for_phrase(
+                        api_key=api_key,
+                        raw_japanese=raw_japanese,
+                        previous_corrected_japanese=previous_corrected_japanese,
                         glossary_entries=glossary_entries,
                         domain_mode=domain_mode,
                         self_context=self_context,
+                        source_version=phrase_counter,
                     )
 
-                    live_original = new_live_original
-                    live_translation = translation
+                    if second_pass.get("type") == "llm_hint":
+                        corrected_japanese = str(
+                            second_pass.get(
+                                "corrected_japanese_original",
+                                raw_japanese,
+                            )
+                            or raw_japanese
+                        ).strip()
+                        translation = str(
+                            second_pass.get(
+                                "corrected_english_caption",
+                                "",
+                            )
+                            or ""
+                        ).strip()
+                        confirmed_terms = second_pass.get(
+                            "confirmed_terms",
+                            second_pass.get("key_terms", []),
+                        ) or []
+                        corrections = second_pass.get("corrections", []) or []
+                        is_unclear = bool(second_pass.get("is_unclear", False))
+                        unclear_reason = str(
+                            second_pass.get("unclear_reason", "") or ""
+                        ).strip()
+                    else:
+                        corrected_japanese = apply_glossary_source_corrections(
+                            raw_japanese,
+                            glossary_entries,
+                            domain_mode,
+                        )
+                        translation = ""
+                        confirmed_terms = build_exact_confirmed_terms(
+                            corrected_japanese=corrected_japanese,
+                            raw_japanese=raw_japanese,
+                            glossary_entries=glossary_entries,
+                            domain_mode=domain_mode,
+                            ai_terms=[],
+                        )
+                        corrections = []
+                        is_unclear = True
+                        unclear_reason = str(
+                            second_pass.get("message", "Second pass unavailable.")
+                        )
+
+                    second_pass_translation = translation
+                    try:
+                        # Translate the grounded Japanese after correction.
+                        # This prevents fluent English from being based on a
+                        # model-rewritten or contaminated Japanese sentence.
+                        translation = translate_japanese_with_groq(
+                            client=client,
+                            japanese_text=corrected_japanese,
+                            previous_japanese=previous_corrected_japanese,
+                            glossary_entries=glossary_entries,
+                            domain_mode=domain_mode,
+                            self_context=self_context,
+                        )
+                    except Exception:
+                        translation = second_pass_translation
+
+                    if not looks_like_valid_japanese_for_display(
+                        corrected_japanese
+                    ):
+                        result_queue.put({
+                            "type": "debug",
+                            "message": (
+                                "Ignored finalized low-quality Japanese block: "
+                                f"{corrected_japanese[:120]}"
+                            ),
+                        })
+                        continue
+
+                    previous_corrected_japanese = corrected_japanese
+                    last_finalized_time = time.time()
+                    paragraph_boundary_sent = False
                     consecutive_errors = 0
 
                     result_queue.put({
-                        "type": "tokens",
-                        "original": live_original,
-                        "translation": live_translation,
+                        "type": "final_phrase",
+                        "phrase_id": phrase_counter,
+                        "raw_original": raw_japanese,
+                        "original": corrected_japanese,
+                        "translation": clean_plain_translation(translation),
+                        "terms": confirmed_terms,
+                        "corrections": corrections,
+                        "is_unclear": is_unclear,
+                        "unclear_reason": unclear_reason,
                         "endpoint": bool(endpoint_ready),
+                        "metrics": metrics,
                     })
 
                 except Exception as exc:
@@ -4036,36 +4167,36 @@ def groq_whisper_translate_worker(
                     message = shorten_error_for_ui(str(exc), 240)
                     result_queue.put({
                         "type": "debug",
-                        "message": f"Groq request failed ({consecutive_errors}): {message}",
+                        "message": (
+                            f"Finalized phrase request failed "
+                            f"({consecutive_errors}): {message}"
+                        ),
                     })
-
                     if consecutive_errors >= 3:
                         result_queue.put({
                             "type": "error",
-                            "message": f"Groq speech/translation error: {message}",
+                            "message": (
+                                "Groq speech/correction error: "
+                                f"{message}"
+                            ),
                         })
                         consecutive_errors = 0
 
-            # After the final phrase has been processed, mark the visible page
-            # complete. The main UI keeps it visible until new speech arrives.
+            # A long pause closes the paragraph, but the finished paragraph
+            # stays visible. The next final phrase starts a fresh paragraph.
             if (
-                live_original
-                and not reset_sent
+                last_finalized_time > 0
+                and not paragraph_boundary_sent
                 and not speech_seen_in_buffer
                 and len(audio_buffer) < min_audio_bytes
                 and silence_seconds >= reset_seconds_local
             ):
-                previous_completed_japanese = live_original
-                result_queue.put({"type": "page_reset"})
-                live_original = ""
-                live_translation = ""
-                audio_buffer = bytearray()
-                reset_sent = True
+                result_queue.put({"type": "paragraph_boundary"})
+                paragraph_boundary_sent = True
+                previous_corrected_japanese = ""
 
-            # Prevent endless accumulation of pure room noise.
             if (
                 not speech_seen_in_buffer
-                and not live_original
                 and len(audio_buffer) > max_chunk_bytes
             ):
                 audio_buffer = bytearray()
@@ -4093,7 +4224,7 @@ st.title("Technical Interpreter Captioner")
 
 st.caption(
     "Japanese → English phrase captions using Groq Whisper STT, "
-    "safe glossary correction, evidence-based second-pass AI, and Groq translation."
+    "prompt-free Whisper, evidence-based per-block second-pass AI, and immutable paragraph assembly."
 )
 
 
@@ -4138,13 +4269,13 @@ with st.sidebar:
 
     stt_chunk_seconds = st.slider(
         "Caption audio chunk",
-        min_value=4.6,
-        max_value=7.0,
+        min_value=5.0,
+        max_value=10.0,
         value=GROQ_DEFAULT_CHUNK_SECONDS,
         step=0.2,
         help=(
-            "For technical Japanese, 5.5–6.5 seconds gives Whisper more sentence context. "
-            "Shorter chunks are faster but cause more word substitutions and prompt hallucinations."
+            "For continuous technical Japanese, 6–8 seconds gives Whisper more context. "
+            "The new pipeline finalizes each chunk independently and uses no vocabulary prompt."
         ),
     )
 
@@ -4254,27 +4385,20 @@ with st.sidebar:
     # second pass is always enabled. It runs after completed phrases rather
     # than trying to rewrite every partial transcript.
     use_llm_hints = True
-    st.success("Second-pass AI is always ON. Key terms require evidence from the current raw phrase.")
+    st.success("Second-pass AI is always ON inside the phrase worker. Every block is finalized once and older blocks cannot be rewritten.")
 
     llm_model_name = GROQ_HELPER_FAST
     st.caption(f"Second-pass model: {llm_model_name}")
 
-    llm_budget_mode = st.selectbox(
-        "AI helper budget mode",
-        list(LLM_BUDGET_MODES.keys()),
-        index=0,
-    )
-
+    llm_budget_mode = "Every Phrase"
     selected_budget = LLM_BUDGET_MODES[llm_budget_mode]
     llm_hint_interval = float(selected_budget["interval"])
     llm_min_context_chars = int(selected_budget["min_chars"])
     llm_session_limit = int(selected_budget["session_limit"])
 
-    st.caption(selected_budget["description"])
     st.caption(
-        f"Helper interval after finish: {int(llm_hint_interval)} sec | "
-        f"Min new context: {llm_min_context_chars} chars | "
-        f"Session limit: {llm_session_limit} calls"
+        "Each Whisper block is corrected once before it is appended. "
+        "Older blocks are immutable and are never rewritten."
     )
 
     current_helper_calls = st.session_state.get("llm_calls_this_session", 0)
@@ -4312,7 +4436,7 @@ with st.sidebar:
     )
 
     active_glossary_entries = load_glossary_entries(terms_file)
-    st.caption(f"Whisper spelling prompt uses at most {WHISPER_PROMPT_MAX_TERMS} terms from the selected domain.")
+    st.caption("Whisper vocabulary prompting is disabled to prevent unspoken term leakage.")
 
 
 # ============================================================
@@ -4330,6 +4454,8 @@ defaults = {
 
     "live_original": "",
     "live_translation": "",
+    "finalized_phrases": [],
+    "pending_new_paragraph": False,
     "last_japanese_token_time": 0.0,
     "caption_history": [],
     "live_running": False,
@@ -4536,6 +4662,8 @@ if clear_clicked:
     st.session_state.mic_wait_notice = ""
     st.session_state.live_original = ""
     st.session_state.live_translation = ""
+    st.session_state.finalized_phrases = []
+    st.session_state.pending_new_paragraph = False
     st.session_state.last_japanese_token_time = 0.0
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
@@ -4609,6 +4737,8 @@ if (
     st.session_state.debug_messages = []
     st.session_state.live_original = ""
     st.session_state.live_translation = ""
+    st.session_state.finalized_phrases = []
+    st.session_state.pending_new_paragraph = False
     st.session_state.last_japanese_token_time = 0.0
     st.session_state.caption_history = []
     st.session_state.last_update_time = ""
@@ -4726,7 +4856,86 @@ while not st.session_state.live_result_queue.empty():
     item = st.session_state.live_result_queue.get()
     item_type = item.get("type")
 
-    if item_type == "tokens":
+    if item_type == "final_phrase":
+        phrase = {
+            "phrase_id": int(item.get("phrase_id", 0) or 0),
+            "raw_original": str(item.get("raw_original", "") or "").strip(),
+            "original": str(item.get("original", "") or "").strip(),
+            "translation": str(item.get("translation", "") or "").strip(),
+            "terms": item.get("terms", []) or [],
+            "corrections": item.get("corrections", []) or [],
+            "is_unclear": bool(item.get("is_unclear", False)),
+            "unclear_reason": str(item.get("unclear_reason", "") or "").strip(),
+        }
+
+        if st.session_state.pending_new_paragraph:
+            st.session_state.finalized_phrases = []
+            st.session_state.caption_history = []
+            st.session_state.pending_new_paragraph = False
+
+        # Ignore accidental duplicate result delivery.
+        existing_ids = {
+            int(existing.get("phrase_id", -1) or -1)
+            for existing in st.session_state.finalized_phrases
+        }
+        if phrase["phrase_id"] not in existing_ids:
+            st.session_state.finalized_phrases.append(phrase)
+            st.session_state.finalized_phrases = (
+                st.session_state.finalized_phrases[
+                    -MAX_FINALIZED_PHRASE_BLOCKS:
+                ]
+            )
+
+        st.session_state.live_original = join_japanese_phrase_blocks(
+            st.session_state.finalized_phrases,
+            max_chars=MAX_ORIGINAL_CHARS,
+        )
+        st.session_state.live_translation = join_english_phrase_blocks(
+            st.session_state.finalized_phrases,
+            max_chars=MAX_TRANSLATION_CHARS,
+        )
+        st.session_state.llm_key_terms = collect_phrase_key_terms(
+            st.session_state.finalized_phrases,
+            max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS,
+        )
+        st.session_state.llm_corrections = []
+        st.session_state.llm_corrected_japanese_original = (
+            st.session_state.live_original
+        )
+        st.session_state.llm_corrected_english_caption = (
+            st.session_state.live_translation
+        )
+        st.session_state.llm_corrected_source_text = ""
+        st.session_state.llm_is_unclear = phrase["is_unclear"]
+        st.session_state.llm_unclear_reason = phrase["unclear_reason"]
+        st.session_state.caption_stage = "ai_corrected"
+        st.session_state.correction_status = (
+            "unclear_applied" if phrase["is_unclear"] else "applied"
+        )
+        st.session_state.last_helper_fix_time = time.strftime("%H:%M:%S")
+        st.session_state.last_update_time = time.strftime("%H:%M:%S")
+        st.session_state.last_japanese_token_time = time.time()
+        st.session_state.live_token_version += 1
+        st.session_state.last_live_endpoint = bool(
+            item.get("endpoint", False)
+        )
+
+        if phrase["translation"]:
+            st.session_state.caption_history.append(
+                phrase["translation"]
+            )
+            st.session_state.caption_history = (
+                st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
+            )
+
+    elif item_type == "paragraph_boundary":
+        # Keep the completed paragraph visible. The first finalized block after
+        # this boundary replaces it with a fresh paragraph.
+        st.session_state.pending_new_paragraph = True
+        st.session_state.last_live_endpoint = True
+        st.session_state.correction_status = "paragraph_complete"
+
+    elif item_type == "tokens":
         original = item.get("original", "")
         translation = item.get("translation", "")
         st.session_state.last_live_endpoint = bool(item.get("endpoint", False))
@@ -4884,7 +5093,7 @@ while not st.session_state.live_result_queue.empty():
 
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
 
-    elif item_type == "page_reset":
+    elif item_type == "page_reset_legacy":
         st.session_state.last_live_endpoint = True
         completed_chunk = make_context_chunk(
             st.session_state.live_original,
@@ -4911,6 +5120,8 @@ while not st.session_state.live_result_queue.empty():
     elif item_type == "cleared":
         st.session_state.live_original = ""
         st.session_state.live_translation = ""
+        st.session_state.finalized_phrases = []
+        st.session_state.pending_new_paragraph = False
         st.session_state.last_japanese_token_time = 0.0
         st.session_state.caption_history = []
         st.session_state.last_update_time = ""
@@ -5123,7 +5334,7 @@ while not st.session_state.llm_result_queue.empty():
 # Start LLM hint worker
 # ============================================================
 
-if use_llm_hints and groq_api_key:
+if use_llm_hints and groq_api_key and not SECOND_PASS_IN_WORKER:
     source_text = build_slim_llm_context(
         st.session_state.llm_context_chunks,
         st.session_state.live_original,
@@ -5243,7 +5454,7 @@ if st.session_state.mobile_mic_failure_message:
     st.warning(st.session_state.mobile_mic_failure_message)
 
 if st.session_state.live_running:
-    st.success("Groq Whisper live captions running.")
+    st.success("Groq Whisper paragraph-safe live captions running.")
 elif st.session_state.app_active:
     if st.session_state.mic_wait_notice:
         st.info(st.session_state.mic_wait_notice)
@@ -5308,6 +5519,7 @@ current_source_for_display = build_llm_context(
 
 if (
     use_llm_hints
+    and not SECOND_PASS_IN_WORKER
     and st.session_state.caption_stage == "ai_corrected"
     and st.session_state.llm_corrected_source_text
     and source_text_matches_for_correction(
@@ -5354,17 +5566,8 @@ if st.session_state.live_original and not display_english:
     display_english = "Waiting for English translation..."
 
 source_is_corrected = (
-    use_llm_hints
-    and st.session_state.caption_stage == "ai_corrected"
-    and st.session_state.llm_corrected_source_text
-    and source_text_matches_for_correction(
-        current_source_for_display,
-        st.session_state.llm_corrected_source_text,
-    )
-    and (
-        bool(st.session_state.llm_corrected_japanese_original)
-        or bool(st.session_state.llm_corrected_english_caption)
-    )
+    st.session_state.caption_stage == "ai_corrected"
+    and bool(st.session_state.finalized_phrases)
 )
 
 if source_is_corrected:
@@ -5384,7 +5587,21 @@ else:
     en_status_text = "Waiting for English translation..."
 
 
-if not use_llm_hints:
+if SECOND_PASS_IN_WORKER and st.session_state.finalized_phrases:
+    if st.session_state.llm_is_unclear:
+        correction_status_text = (
+            "Phrase finalized with cautious AI correction"
+            + (
+                f": {st.session_state.llm_unclear_reason}"
+                if st.session_state.llm_unclear_reason
+                else ""
+            )
+        )
+    elif st.session_state.pending_new_paragraph:
+        correction_status_text = "Paragraph complete; waiting for new speech"
+    else:
+        correction_status_text = "Second-pass correction applied per finalized phrase"
+elif not use_llm_hints:
     correction_status_text = "AI correction off"
 elif not groq_api_key:
     correction_status_text = "AI correction unavailable: GROQ_API_KEY missing"
@@ -5442,7 +5659,7 @@ if use_llm_hints:
         # "checking" placeholder on every periodic re-check.
         llm_terms_lines = []
 
-        for item in current_llm_key_terms[:8]:
+        for item in current_llm_key_terms[:SECOND_PASS_MAX_CONFIRMED_TERMS]:
             term = str(item.get("term", "")).strip()
             meaning = str(item.get("meaning", "")).strip()
             reading = str(item.get("reading", "")).strip()
@@ -5452,7 +5669,7 @@ if use_llm_hints:
             if line and line not in llm_terms_lines:
                 llm_terms_lines.append(line)
 
-            if len(llm_terms_lines) >= 8:
+            if len(llm_terms_lines) >= SECOND_PASS_MAX_CONFIRMED_TERMS:
                 break
 
         llm_terms_text = "\n".join(llm_terms_lines) if llm_terms_lines else "No key terms yet."
