@@ -87,7 +87,20 @@ GROQ_MIN_REQUEST_INTERVAL_SECONDS = 3.1
 GROQ_ENDPOINT_SILENCE_SECONDS = 0.70
 GROQ_MIN_AUDIO_SECONDS = 1.2
 GROQ_AUDIO_OVERLAP_SECONDS = 0.0
-GROQ_VAD_RMS_THRESHOLD = 180.0
+
+# VAD is used only to detect an early end-of-phrase pause. It must not decide
+# whether Whisper is allowed to receive an audio block. A threshold of 180 was
+# too high for distant classroom speech on many phones/laptops.
+GROQ_VAD_RMS_THRESHOLD = 60.0
+
+# Completed audio blocks below this level are treated as near-digital silence.
+# Keep this much lower than the VAD threshold so quiet/far voices still reach
+# Whisper even when local VAD does not recognize them as speech.
+GROQ_MIN_SEND_RMS = 12.0
+
+# Emergency bound for the worker's internal PCM buffer. Normal operation sends
+# one chunk at a time; this only prevents unbounded growth after long stalls.
+GROQ_MAX_BUFFER_MULTIPLIER = 4
 
 # Whisper quality gates. Metrics are used when verbose_json is available;
 # the code automatically falls back to normal JSON when the SDK/model does
@@ -111,8 +124,10 @@ WHISPER_COMMON_HALLUCINATIONS = [
 ]
 
 # Bound the queue so a slow network cannot create minutes of delayed audio.
-# At roughly 20 ms per WebRTC frame, 250 chunks is about five seconds.
-AUDIO_QUEUE_MAX_CHUNKS = 250
+# At roughly 20 ms per WebRTC frame, 600 chunks is about twelve seconds. The
+# previous five-second queue could drop the next sentence while Whisper and the
+# correction model were still processing the previous phrase.
+AUDIO_QUEUE_MAX_CHUNKS = 600
 
 # iPhone/Safari needs a new user tap after refresh before microphone capture.
 # Kept generous because real ICE/TURN negotiation can take longer than a few
@@ -3980,7 +3995,9 @@ def groq_whisper_translate_worker(
         "type": "debug",
         "message": (
             f"Paragraph-safe Groq Whisper worker started with {stt_model}; "
-            "Whisper vocabulary prompt disabled."
+            "Whisper vocabulary prompt disabled; "
+            f"early-end VAD RMS={GROQ_VAD_RMS_THRESHOLD:.1f}; "
+            f"minimum send RMS={GROQ_MIN_SEND_RMS:.1f}."
         ),
     })
 
@@ -4051,29 +4068,51 @@ def groq_whisper_translate_worker(
                 or now - last_request_time >= GROQ_MIN_REQUEST_INTERVAL_SECONDS
             )
 
+            # Always allow a complete audio chunk to reach Whisper. Local
+            # RMS-based VAD is intentionally used only for an earlier
+            # phrase-end flush. This is essential for far/quiet voices that
+            # are real speech but remain below the local VAD threshold.
             full_chunk_ready = (
-                speech_seen_in_buffer
-                and len(audio_buffer) >= max_chunk_bytes
+                len(audio_buffer) >= max_chunk_bytes
                 and request_interval_ok
             )
             endpoint_ready = (
                 speech_seen_in_buffer
                 and len(audio_buffer) >= min_audio_bytes
+                and len(audio_buffer) < max_chunk_bytes
                 and silence_seconds >= GROQ_ENDPOINT_SILENCE_SECONDS
                 and request_interval_ok
             )
 
             if full_chunk_ready or endpoint_ready:
-                if endpoint_ready:
+                used_endpoint_flush = bool(endpoint_ready)
+
+                if used_endpoint_flush:
                     request_pcm = bytes(audio_buffer)
                     audio_buffer = bytearray()
                     speech_seen_in_buffer = False
                 else:
                     request_pcm = bytes(audio_buffer[:max_chunk_bytes])
                     audio_buffer = audio_buffer[max_chunk_bytes:]
-                    speech_seen_in_buffer = bool(audio_buffer)
+                    speech_seen_in_buffer = (
+                        bool(audio_buffer)
+                        and pcm16_rms(bytes(audio_buffer))
+                        >= GROQ_VAD_RMS_THRESHOLD
+                    )
 
-                if pcm16_rms(request_pcm) < GROQ_VAD_RMS_THRESHOLD * 0.55:
+                request_rms = pcm16_rms(request_pcm)
+
+                # Reject only near-digital silence. Do not compare against the
+                # much higher endpoint VAD threshold; that was the old bug that
+                # discarded valid distant classroom speech before Whisper.
+                if request_rms < GROQ_MIN_SEND_RMS:
+                    result_queue.put({
+                        "type": "debug",
+                        "message": (
+                            "Skipped near-silent audio block: "
+                            f"RMS={request_rms:.1f}"
+                        ),
+                    })
                     continue
 
                 last_request_time = time.time()
@@ -4201,6 +4240,11 @@ def groq_whisper_translate_worker(
 
                     previous_corrected_japanese = corrected_japanese
                     last_finalized_time = time.time()
+
+                    # Whisper has now confirmed that this block contained real
+                    # speech. Refresh the voice timestamp even when the local
+                    # RMS VAD did not detect the distant voice.
+                    last_voice_time = last_finalized_time
                     paragraph_boundary_sent = False
                     consecutive_errors = 0
 
@@ -4214,7 +4258,8 @@ def groq_whisper_translate_worker(
                         "corrections": corrections,
                         "is_unclear": is_unclear,
                         "unclear_reason": unclear_reason,
-                        "endpoint": bool(endpoint_ready),
+                        "endpoint": used_endpoint_flush,
+                        "audio_rms": request_rms,
                         "metrics": metrics,
                     })
 
@@ -4239,23 +4284,42 @@ def groq_whisper_translate_worker(
                         consecutive_errors = 0
 
             # A long pause closes the paragraph, but the finished paragraph
-            # stays visible. The next final phrase starts a fresh paragraph.
+            # stays visible. Recalculate silence after API processing because a
+            # successful quiet-voice transcription refreshes last_voice_time.
+            boundary_now = time.time()
+            boundary_silence_seconds = (
+                boundary_now - last_voice_time
+                if last_voice_time > 0
+                else 999999.0
+            )
+
             if (
                 last_finalized_time > 0
                 and not paragraph_boundary_sent
                 and not speech_seen_in_buffer
                 and len(audio_buffer) < min_audio_bytes
-                and silence_seconds >= reset_seconds_local
+                and boundary_silence_seconds >= reset_seconds_local
             ):
                 result_queue.put({"type": "paragraph_boundary"})
                 paragraph_boundary_sent = True
                 previous_corrected_japanese = ""
 
-            if (
-                not speech_seen_in_buffer
-                and len(audio_buffer) > max_chunk_bytes
-            ):
-                audio_buffer = bytearray()
+            # Emergency memory bound only. Never erase the entire buffer merely
+            # because local VAD did not recognize speech. Preserve the newest
+            # audio and report the trim in debug.
+            maximum_buffer_bytes = (
+                max_chunk_bytes * GROQ_MAX_BUFFER_MULTIPLIER
+            )
+            if len(audio_buffer) > maximum_buffer_bytes:
+                removed_bytes = len(audio_buffer) - maximum_buffer_bytes
+                audio_buffer = audio_buffer[-maximum_buffer_bytes:]
+                result_queue.put({
+                    "type": "debug",
+                    "message": (
+                        "Audio backlog trimmed while preserving newest audio: "
+                        f"removed={removed_bytes} bytes"
+                    ),
+                })
 
     except Exception as exc:
         if not stop_event.is_set():
@@ -4348,20 +4412,29 @@ with st.sidebar:
     microphone_profile = st.selectbox(
         "Microphone processing",
         [
-            "Technical speech (recommended)",
+            "Far lecturer / quiet voice (recommended)",
+            "Technical speech / close voice",
             "Raw microphone",
             "Speakerphone / strong echo control",
         ],
         index=0,
         help=(
-            "Technical speech keeps noise suppression but disables browser "
-            "echo cancellation and automatic gain, which can clip short "
-            "Japanese syllables. Use Raw with a close external microphone. "
-            "Use Speakerphone only when loudspeaker echo is a real problem."
+            "Use Far lecturer for classroom speech: browser noise suppression "
+            "is disabled so it does not erase a distant voice, and automatic "
+            "gain is requested. Use Technical speech only when the speaker is "
+            "close to the microphone. If you change this while the mic is "
+            "already connected, press Reset Mic Connection once."
         ),
     )
 
-    if microphone_profile == "Raw microphone":
+    if microphone_profile == "Far lecturer / quiet voice (recommended)":
+        microphone_audio_constraints = {
+            "channelCount": 1,
+            "echoCancellation": False,
+            "noiseSuppression": False,
+            "autoGainControl": True,
+        }
+    elif microphone_profile == "Raw microphone":
         microphone_audio_constraints = {
             "channelCount": 1,
             "echoCancellation": False,
