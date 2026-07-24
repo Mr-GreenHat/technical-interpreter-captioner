@@ -82,10 +82,10 @@ PCM_BYTES_PER_SAMPLE = 2
 GROQ_STT_MODEL_ACCURATE = "whisper-large-v3"
 GROQ_STT_MODEL_FAST = "whisper-large-v3-turbo"
 GROQ_TRANSLATION_MODEL = "llama-3.1-8b-instant"
-GROQ_DEFAULT_CHUNK_SECONDS = 5.2
+GROQ_DEFAULT_CHUNK_SECONDS = 3.4
 GROQ_MIN_REQUEST_INTERVAL_SECONDS = 3.1
-GROQ_ENDPOINT_SILENCE_SECONDS = 0.70
-GROQ_MIN_AUDIO_SECONDS = 1.2
+GROQ_ENDPOINT_SILENCE_SECONDS = 0.45
+GROQ_MIN_AUDIO_SECONDS = 0.8
 GROQ_AUDIO_OVERLAP_SECONDS = 0.0
 
 # VAD is used only to detect an early end-of-phrase pause. It must not decide
@@ -4142,6 +4142,26 @@ def groq_whisper_translate_worker(
                         })
                         continue
 
+                    # LOW-LATENCY FIRST DISPLAY:
+                    # Show Whisper Japanese immediately instead of withholding
+                    # the phrase until the slower correction/translation call
+                    # finishes. The final_phrase result below replaces this
+                    # provisional block using the same phrase_id.
+                    result_queue.put({
+                        "type": "whisper_phrase",
+                        "phrase_id": phrase_counter,
+                        "raw_original": raw_japanese,
+                        "original": raw_japanese,
+                        "translation": "",
+                        "terms": [],
+                        "corrections": [],
+                        "is_unclear": False,
+                        "unclear_reason": "",
+                        "endpoint": used_endpoint_flush,
+                        "audio_rms": request_rms,
+                        "metrics": metrics,
+                    })
+
                     second_pass = run_second_pass_for_phrase(
                         api_key=api_key,
                         raw_japanese=raw_japanese,
@@ -4343,8 +4363,8 @@ st.set_page_config(
 st.title("Technical Interpreter Captioner")
 
 st.caption(
-    "Japanese → English phrase captions using Groq Whisper STT, "
-    "one combined correction/translation pass, configurable key terms, and immutable paragraph assembly."
+    "Low-latency Japanese → English captions: Whisper Japanese appears first, "
+    "then the same phrase is replaced with AI-corrected Japanese, English, and key terms."
 )
 
 
@@ -4375,9 +4395,10 @@ with st.sidebar:
             "High accuracy (whisper-large-v3)",
             "Faster (whisper-large-v3-turbo)",
         ],
-        index=0,
+        index=1,
         help=(
-            "Use High accuracy for technical Japanese. Turbo is cheaper/faster "
+            "Turbo is recommended for lower caption latency. Use High accuracy "
+            "when recognition quality matters more than speed. Turbo is cheaper/faster "
             "but is slightly less accurate."
         ),
     )
@@ -4389,13 +4410,14 @@ with st.sidebar:
 
     stt_chunk_seconds = st.slider(
         "Caption audio chunk",
-        min_value=4.0,
-        max_value=8.0,
+        min_value=3.2,
+        max_value=6.0,
         value=GROQ_DEFAULT_CHUNK_SECONDS,
         step=0.2,
         help=(
-            "5.0–5.6 seconds is the recommended speed/accuracy balance. "
-            "Longer blocks give Whisper more context but delay the caption."
+            "3.2–3.8 seconds is the low-latency range that stays below the "
+            "Groq free-plan request limit. Longer blocks improve context but "
+            "delay the first visible caption."
         ),
     )
 
@@ -5008,7 +5030,9 @@ while not st.session_state.live_result_queue.empty():
     item = st.session_state.live_result_queue.get()
     item_type = item.get("type")
 
-    if item_type == "final_phrase":
+    if item_type in {"whisper_phrase", "final_phrase"}:
+        is_final_phrase = item_type == "final_phrase"
+
         phrase = {
             "phrase_id": int(item.get("phrase_id", 0) or 0),
             "raw_original": str(item.get("raw_original", "") or "").strip(),
@@ -5018,6 +5042,7 @@ while not st.session_state.live_result_queue.empty():
             "corrections": item.get("corrections", []) or [],
             "is_unclear": bool(item.get("is_unclear", False)),
             "unclear_reason": str(item.get("unclear_reason", "") or "").strip(),
+            "provisional": not is_final_phrase,
         }
 
         if st.session_state.pending_new_paragraph:
@@ -5025,18 +5050,30 @@ while not st.session_state.live_result_queue.empty():
             st.session_state.caption_history = []
             st.session_state.pending_new_paragraph = False
 
-        # Ignore accidental duplicate result delivery.
-        existing_ids = {
-            int(existing.get("phrase_id", -1) or -1)
-            for existing in st.session_state.finalized_phrases
-        }
-        if phrase["phrase_id"] not in existing_ids:
-            st.session_state.finalized_phrases.append(phrase)
-            st.session_state.finalized_phrases = (
-                st.session_state.finalized_phrases[
-                    -MAX_FINALIZED_PHRASE_BLOCKS:
-                ]
+        # Upsert by phrase_id. Whisper first creates a provisional Japanese
+        # block; final_phrase later replaces that exact block with corrected
+        # Japanese, English, and confirmed terms.
+        existing_index = next((
+            index
+            for index, existing in enumerate(
+                st.session_state.finalized_phrases
             )
+            if int(existing.get("phrase_id", -1) or -1)
+            == phrase["phrase_id"]
+        ), -1)
+
+        if existing_index >= 0:
+            existing = st.session_state.finalized_phrases[existing_index]
+            if is_final_phrase or bool(existing.get("provisional", False)):
+                st.session_state.finalized_phrases[existing_index] = phrase
+        else:
+            st.session_state.finalized_phrases.append(phrase)
+
+        st.session_state.finalized_phrases = (
+            st.session_state.finalized_phrases[
+                -MAX_FINALIZED_PHRASE_BLOCKS:
+            ]
+        )
 
         st.session_state.live_original = join_japanese_phrase_blocks(
             st.session_state.finalized_phrases,
@@ -5050,21 +5087,6 @@ while not st.session_state.live_result_queue.empty():
             st.session_state.finalized_phrases,
             max_terms=key_term_limit,
         )
-        st.session_state.llm_corrections = []
-        st.session_state.llm_corrected_japanese_original = (
-            st.session_state.live_original
-        )
-        st.session_state.llm_corrected_english_caption = (
-            st.session_state.live_translation
-        )
-        st.session_state.llm_corrected_source_text = ""
-        st.session_state.llm_is_unclear = phrase["is_unclear"]
-        st.session_state.llm_unclear_reason = phrase["unclear_reason"]
-        st.session_state.caption_stage = "ai_corrected"
-        st.session_state.correction_status = (
-            "unclear_applied" if phrase["is_unclear"] else "applied"
-        )
-        st.session_state.last_helper_fix_time = time.strftime("%H:%M:%S")
         st.session_state.last_update_time = time.strftime("%H:%M:%S")
         st.session_state.last_japanese_token_time = time.time()
         st.session_state.live_token_version += 1
@@ -5072,13 +5094,38 @@ while not st.session_state.live_result_queue.empty():
             item.get("endpoint", False)
         )
 
-        if phrase["translation"]:
-            st.session_state.caption_history.append(
-                phrase["translation"]
+        if is_final_phrase:
+            st.session_state.llm_corrections = []
+            st.session_state.llm_corrected_japanese_original = (
+                st.session_state.live_original
             )
-            st.session_state.caption_history = (
-                st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
+            st.session_state.llm_corrected_english_caption = (
+                st.session_state.live_translation
             )
+            st.session_state.llm_corrected_source_text = ""
+            st.session_state.llm_is_unclear = phrase["is_unclear"]
+            st.session_state.llm_unclear_reason = phrase["unclear_reason"]
+            st.session_state.caption_stage = "ai_corrected"
+            st.session_state.correction_status = (
+                "unclear_applied" if phrase["is_unclear"] else "applied"
+            )
+            st.session_state.last_helper_fix_time = time.strftime("%H:%M:%S")
+
+            if phrase["translation"]:
+                st.session_state.caption_history.append(
+                    phrase["translation"]
+                )
+                st.session_state.caption_history = (
+                    st.session_state.caption_history[-MAX_HISTORY_ITEMS:]
+                )
+        else:
+            # The audience can already read the Japanese while correction and
+            # English translation continue in the worker.
+            st.session_state.llm_is_unclear = False
+            st.session_state.llm_unclear_reason = ""
+            st.session_state.caption_stage = "raw_japanese"
+            st.session_state.correction_status = "checking"
+            st.session_state.last_raw_input_time = time.strftime("%H:%M:%S")
 
     elif item_type == "paragraph_boundary":
         # Keep the completed paragraph visible. The first finalized block after
@@ -6243,5 +6290,5 @@ st.html(caption_html)
 # ============================================================
 
 if st.session_state.app_active or st.session_state.live_running:
-    time.sleep(0.2)
+    time.sleep(0.1)
     st.rerun()
