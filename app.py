@@ -5596,10 +5596,10 @@ while not st.session_state.llm_result_queue.empty():
             )
         ][:key_term_limit]
 
-        if validated_confirmed_terms or key_term_sensitivity == "Strict":
+        if key_term_sensitivity == "Strict":
             st.session_state.llm_key_terms = validated_confirmed_terms
         else:
-            st.session_state.llm_key_terms = [
+            current_evidence_terms = [
                 term_item
                 for term_item in st.session_state.llm_key_terms
                 if key_term_display_allowed(
@@ -5607,7 +5607,12 @@ while not st.session_state.llm_result_queue.empty():
                     st.session_state.live_original,
                     key_term_sensitivity,
                 )
-            ][:key_term_limit]
+            ]
+            st.session_state.llm_key_terms = merge_key_terms_preserve_order(
+                current_evidence_terms,
+                validated_confirmed_terms,
+                max_terms=key_term_limit,
+            )
 
         has_ai_update = (
             bool(st.session_state.llm_corrected_japanese_original)
