@@ -2769,7 +2769,7 @@ def contains_kanji(text):
     return False
 
 
-def lookup_reading_for_term(term, provided_reading=""):
+def lookup_reading_for_term(term, provided_reading="", meaning=""):
     """
     Use the glossary reading when displaying kanji key terms.
     Example:
@@ -2778,6 +2778,7 @@ def lookup_reading_for_term(term, provided_reading=""):
     """
     term = (term or "").strip()
     provided_reading = (provided_reading or "").strip()
+    meaning = (meaning or "").strip()
 
     if provided_reading:
         return provided_reading
@@ -2795,6 +2796,19 @@ def lookup_reading_for_term(term, provided_reading=""):
         reading = str(row.get("reading", "")).strip()
 
         if jp == term and reading:
+            return reading
+
+    for row in entries:
+        reading = str(row.get("reading", "")).strip()
+        if not reading:
+            continue
+
+        variants = recognition_variants_for_entry(row)
+        if term and any(term == variant for variant in variants):
+            return reading
+
+        row_meaning = str(row.get("en", "")).strip().lower()
+        if meaning and row_meaning and meaning.lower() == row_meaning:
             return reading
 
     return ""
@@ -2883,7 +2897,7 @@ def key_term_display_allowed(item, source_text, sensitivity="Strict"):
     item["last_confirmed_at"] = time.time()
     return True
 
-def format_key_term_line(term, meaning, show_meaning=True, reading=""):
+def format_key_term_line(term, meaning, show_meaning=True, reading="", auto_reading=True):
     """
     Display key terms with furigana-like hiragana in parentheses when the
     source term contains kanji.
@@ -2904,7 +2918,11 @@ def format_key_term_line(term, meaning, show_meaning=True, reading=""):
         display_term = line.strip()
         display_meaning = ""
 
-    display_reading = lookup_reading_for_term(display_term, reading)
+    display_reading = (
+        lookup_reading_for_term(display_term, reading, meaning)
+        if auto_reading
+        else (reading or "").strip()
+    )
 
     if display_reading and contains_kanji(display_term):
         display_term = f"{display_term} ({display_reading})"
@@ -3196,6 +3214,9 @@ CONFIRMED TERM RULES:
 - If the term is not in the Candidate glossary, provide a concise technical
   English meaning from context. Do not add broad topic words that are not
   actually spoken in the current phrase.
+- Every kanji/kana Japanese term should include "reading" in hiragana. For
+  glossary terms, use the glossary reading when known. For terms outside the
+  glossary, infer the standard reading from context.
 - confidence must be "high" or "medium".
 
 CORRECTION RULES:
@@ -3231,6 +3252,7 @@ Required JSON schema:
     {{
       "term": "",
       "meaning": "",
+      "reading": "",
       "evidence": "",
       "confidence": "high"
     }}
@@ -4640,6 +4662,12 @@ with st.sidebar:
 
     # Always show meanings because this app is now key-term support first.
     show_term_meaning = True
+
+    show_term_reading = st.checkbox(
+        "Show term readings",
+        value=True,
+        help="Show hiragana readings beside kanji terms, including AI-discovered terms outside the CSV.",
+    )
 
     key_term_limit = st.slider(
         "Maximum displayed key terms",
@@ -6051,7 +6079,13 @@ if use_llm_hints:
             meaning = str(item.get("meaning", "")).strip()
             reading = str(item.get("reading", "")).strip()
 
-            line = format_key_term_line(term, meaning, show_term_meaning, reading)
+            line = format_key_term_line(
+                term,
+                meaning,
+                show_term_meaning,
+                reading if show_term_reading else "",
+                auto_reading=show_term_reading,
+            )
 
             if line and line not in llm_terms_lines:
                 llm_terms_lines.append(line)

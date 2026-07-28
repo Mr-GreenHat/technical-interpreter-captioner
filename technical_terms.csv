@@ -98,9 +98,10 @@ manufacturing,工場,こうじょう,factory,,Factory or plant
 ,課題,かだい,assignment / task,カレー;今回のカレー;this time's curry,Class assignment or task
 cad,CAD操作,きゃどそうさ,CAD operation,CADソース;CADのソース;CAD source,CAD software operation
 ,材料,ざいりょう,material,材料ごと;材料ごとの,Engineering material
-,許容応力,きょようおうりょく,allowable stress,共用応力;兼用応力;許容能力;shared stress;practical stress,Maximum stress allowed for safe use of a material
+,許容応力,きょようおうりょく,allowable stress,共用応力;共有応力;兼用応力;許容能力;共有応力度;共用応力度;共用オーロック;共有オーロック;共用ロック;共有ロック;shared stress;shared strength;shared lock;practical stress,Maximum stress allowed for safe use of a material
 ,引張,ひっぱり,tension / tensile,引っ張り;引っ張り足;引張り,Tensile loading or tension
 ,引張強さ,ひっぱりつよさ,tensile strength,引張り強さ;引っ張り強さ;引っ張り足,Tensile strength of a material
+,圧縮,あっしゅく,compression,圧縮強度;圧縮応力,Compression loading or compressive stress
 ,曲げ,まげ,bending,曲げ応力;曲げ強度,Bending load or bending stress
-,せん断,せんだん,shear,仙断;剪断;せんだん応力;仙境;山の;shared,Shear loading or shear stress
+,せん断,せんだん,shear,旋断;仙断;剪断;せんだん応力;仙境;山の;shared,Shear loading or shear stress
 ,せん断応力,せんだんおうりょく,shear stress,剪断応力;仙断応力;仙境の共用応力;shared stress,Stress caused by shear loading
