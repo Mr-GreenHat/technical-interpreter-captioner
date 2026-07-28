@@ -3953,6 +3953,9 @@ def groq_whisper_translate_worker(
     caption_reset_seconds=DEFAULT_RESET_SECONDS,
     drain_backlog=True,
     reuse_second_pass_translation=True,
+    endpoint_silence_seconds=GROQ_ENDPOINT_SILENCE_SECONDS,
+    vad_rms_threshold=GROQ_VAD_RMS_THRESHOLD,
+    min_send_rms=GROQ_MIN_SEND_RMS,
 ):
     """
     Finalize every audio chunk independently.
@@ -3974,6 +3977,9 @@ def groq_whisper_translate_worker(
     client = Groq(api_key=api_key)
     sample_rate = AUDIO_INPUT_SAMPLE_RATE
     bytes_per_second = sample_rate * PCM_BYTES_PER_SAMPLE
+    endpoint_silence_seconds = float(endpoint_silence_seconds)
+    vad_rms_threshold = float(vad_rms_threshold)
+    min_send_rms = float(min_send_rms)
     max_chunk_bytes = max(
         int(GROQ_MIN_AUDIO_SECONDS * bytes_per_second),
         int(float(chunk_seconds) * bytes_per_second),
@@ -3996,8 +4002,9 @@ def groq_whisper_translate_worker(
         "message": (
             f"Paragraph-safe Groq Whisper worker started with {stt_model}; "
             "Whisper vocabulary prompt disabled; "
-            f"early-end VAD RMS={GROQ_VAD_RMS_THRESHOLD:.1f}; "
-            f"minimum send RMS={GROQ_MIN_SEND_RMS:.1f}."
+            f"early-end VAD RMS={vad_rms_threshold:.1f}; "
+            f"endpoint silence={endpoint_silence_seconds:.2f}s; "
+            f"minimum send RMS={min_send_rms:.1f}."
         ),
     })
 
@@ -4041,7 +4048,7 @@ def groq_whisper_translate_worker(
             if pcm_chunk:
                 audio_buffer.extend(pcm_chunk)
                 level = pcm16_rms(pcm_chunk)
-                if level >= GROQ_VAD_RMS_THRESHOLD:
+                if level >= vad_rms_threshold:
                     last_voice_time = now
                     speech_seen_in_buffer = True
                     paragraph_boundary_sent = False
@@ -4053,7 +4060,7 @@ def groq_whisper_translate_worker(
                     except queue.Empty:
                         break
                     audio_buffer.extend(extra)
-                    if pcm16_rms(extra) >= GROQ_VAD_RMS_THRESHOLD:
+                    if pcm16_rms(extra) >= vad_rms_threshold:
                         last_voice_time = time.time()
                         speech_seen_in_buffer = True
                         paragraph_boundary_sent = False
@@ -4080,7 +4087,7 @@ def groq_whisper_translate_worker(
                 speech_seen_in_buffer
                 and len(audio_buffer) >= min_audio_bytes
                 and len(audio_buffer) < max_chunk_bytes
-                and silence_seconds >= GROQ_ENDPOINT_SILENCE_SECONDS
+                and silence_seconds >= endpoint_silence_seconds
                 and request_interval_ok
             )
 
@@ -4097,7 +4104,7 @@ def groq_whisper_translate_worker(
                     speech_seen_in_buffer = (
                         bool(audio_buffer)
                         and pcm16_rms(bytes(audio_buffer))
-                        >= GROQ_VAD_RMS_THRESHOLD
+                        >= vad_rms_threshold
                     )
 
                 request_rms = pcm16_rms(request_pcm)
@@ -4105,7 +4112,7 @@ def groq_whisper_translate_worker(
                 # Reject only near-digital silence. Do not compare against the
                 # much higher endpoint VAD threshold; that was the old bug that
                 # discarded valid distant classroom speech before Whisper.
-                if request_rms < GROQ_MIN_SEND_RMS:
+                if request_rms < min_send_rms:
                     result_queue.put({
                         "type": "debug",
                         "message": (
@@ -4389,13 +4396,50 @@ with st.sidebar:
 
     st.caption("Source mode: Japanese is forced in Whisper for better accuracy and latency.")
 
+    speech_capture_preset = st.selectbox(
+        "Speech capture preset",
+        [
+            "Fast or unclear speaker",
+            "Normal lecture",
+            "Lowest latency",
+        ],
+        index=0,
+        help=(
+            "Use Fast or unclear speaker when the lecturer speaks quickly, "
+            "mumbles, faces away, or the room audio is weak. It waits for a "
+            "larger phrase and is less aggressive about silence."
+        ),
+    )
+
+    if speech_capture_preset == "Fast or unclear speaker":
+        default_stt_quality_index = 0
+        default_chunk_seconds = 4.8
+        endpoint_silence_seconds = 0.85
+        vad_rms_threshold = 45.0
+        min_send_rms = 8.0
+        st.caption("Preset: more context, cautious phrase splitting, quieter speech accepted.")
+    elif speech_capture_preset == "Lowest latency":
+        default_stt_quality_index = 1
+        default_chunk_seconds = 3.2
+        endpoint_silence_seconds = 0.40
+        vad_rms_threshold = GROQ_VAD_RMS_THRESHOLD
+        min_send_rms = GROQ_MIN_SEND_RMS
+        st.caption("Preset: faster captions, but less forgiving for unclear speech.")
+    else:
+        default_stt_quality_index = 1
+        default_chunk_seconds = GROQ_DEFAULT_CHUNK_SECONDS
+        endpoint_silence_seconds = GROQ_ENDPOINT_SILENCE_SECONDS
+        vad_rms_threshold = GROQ_VAD_RMS_THRESHOLD
+        min_send_rms = GROQ_MIN_SEND_RMS
+        st.caption("Preset: balanced classroom defaults.")
+
     stt_quality = st.selectbox(
         "Whisper recognition model",
         [
             "High accuracy (whisper-large-v3)",
             "Faster (whisper-large-v3-turbo)",
         ],
-        index=1,
+        index=default_stt_quality_index,
         help=(
             "Turbo is recommended for lower caption latency. Use High accuracy "
             "when recognition quality matters more than speed. Turbo is cheaper/faster "
@@ -4411,8 +4455,8 @@ with st.sidebar:
     stt_chunk_seconds = st.slider(
         "Caption audio chunk",
         min_value=3.2,
-        max_value=6.0,
-        value=GROQ_DEFAULT_CHUNK_SECONDS,
+        max_value=7.0,
+        value=default_chunk_seconds,
         step=0.2,
         help=(
             "3.2–3.8 seconds is the low-latency range that stays below the "
@@ -4420,6 +4464,8 @@ with st.sidebar:
             "delay the first visible caption."
         ),
     )
+    if speech_capture_preset == "Fast or unclear speaker":
+        st.caption("Tip: keep this around 4.6-5.2 seconds when the speaker is fast or unclear.")
 
     fast_translation_mode = st.checkbox(
         "Fast combined correction + translation",
@@ -4974,6 +5020,9 @@ if (
         float(reset_seconds),
         drain_backlog,
         bool(fast_translation_mode),
+        float(endpoint_silence_seconds),
+        float(vad_rms_threshold),
+        float(min_send_rms),
     )
 
     st.session_state.live_thread = threading.Thread(
@@ -5930,6 +5979,14 @@ if show_debug:
         st.write("Microphone processing profile:")
         st.code(microphone_profile)
 
+        st.write("Speech capture preset:")
+        st.code(
+            f"{speech_capture_preset}\n"
+            f"endpoint_silence_seconds={endpoint_silence_seconds:.2f}\n"
+            f"vad_rms_threshold={vad_rms_threshold:.1f}\n"
+            f"min_send_rms={min_send_rms:.1f}"
+        )
+
         st.write("Whisper input sample rate:")
         st.code(f"{AUDIO_INPUT_SAMPLE_RATE} Hz")
 
@@ -6113,7 +6170,9 @@ caption_html = f"""
     color: #1E3A8A;
     min-height: 42px;
     max-height: 105px;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
     border: 1px solid #60A5FA;
     box-sizing: border-box;
@@ -6128,7 +6187,9 @@ caption_html = f"""
     color: #111827;
     min-height: 85px;
     max-height: 150px;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
     border: 1px solid #D1D5DB;
     box-sizing: border-box;
@@ -6145,7 +6206,9 @@ caption_html = f"""
     color: #064E3B;
     min-height: 60px;
     max-height: 150px;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
     border: 1px solid #10B981;
     box-sizing: border-box;
@@ -6161,7 +6224,9 @@ caption_html = f"""
     color: #78350F;
     min-height: 48px;
     max-height: 125px;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
     border: 1px solid #F59E0B;
     box-sizing: border-box;
@@ -6177,7 +6242,9 @@ caption_html = f"""
     color: white;
     min-height: 130px;
     max-height: 220px;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
     border: 1px solid #374151;
     box-sizing: border-box;
