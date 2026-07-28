@@ -2789,6 +2789,42 @@ def reading_is_kana(text):
     return True
 
 
+@st.cache_resource(show_spinner=False)
+def get_kakasi_converter():
+    try:
+        from pykakasi import kakasi
+
+        return kakasi()
+    except Exception:
+        return None
+
+
+def automatic_kana_reading(term):
+    term = str(term or "").strip()
+
+    if not term or not contains_kanji(term):
+        return ""
+
+    converter = get_kakasi_converter()
+    if converter is None:
+        return ""
+
+    try:
+        converted = converter.convert(term)
+    except Exception:
+        return ""
+
+    reading = "".join(
+        str(item.get("hira", item.get("kana", ""))).strip()
+        for item in converted
+    ).strip()
+
+    if reading and reading != term and reading_is_kana(reading):
+        return reading
+
+    return ""
+
+
 def lookup_reading_for_term(term, provided_reading="", meaning=""):
     """
     Use the glossary reading when displaying kanji key terms.
@@ -2831,7 +2867,7 @@ def lookup_reading_for_term(term, provided_reading="", meaning=""):
         if meaning and row_meaning and meaning.lower() == row_meaning:
             return reading
 
-    return ""
+    return automatic_kana_reading(term)
 
 
 def key_term_supported_by_source(item, source_text):
