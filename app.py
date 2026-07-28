@@ -4561,6 +4561,7 @@ with st.sidebar:
         "Main display",
         ["Terms + meaning", "Captions + terms"],
         index=0,
+        key="main_display_mode",
         help="Terms + meaning = interpreter key terms only. Captions + terms = captions plus key terms.",
     )
 
@@ -5764,7 +5765,10 @@ if use_llm_hints and st.session_state.llm_budget_reached:
 # Caption display data
 # ============================================================
 
-st.subheader("Live Captions")
+if main_display_mode == "Terms + meaning":
+    st.subheader("Technical Terms")
+else:
+    st.subheader("Live Captions")
 
 if subtitle_display == "History":
     non_empty_history = [
