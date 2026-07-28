@@ -91,12 +91,12 @@ GROQ_AUDIO_OVERLAP_SECONDS = 0.0
 # VAD is used only to detect an early end-of-phrase pause. It must not decide
 # whether Whisper is allowed to receive an audio block. A threshold of 180 was
 # too high for distant classroom speech on many phones/laptops.
-GROQ_VAD_RMS_THRESHOLD = 60.0
+GROQ_VAD_RMS_THRESHOLD = 45.0
 
 # Completed audio blocks below this level are treated as near-digital silence.
 # Keep this much lower than the VAD threshold so quiet/far voices still reach
 # Whisper even when local VAD does not recognize them as speech.
-GROQ_MIN_SEND_RMS = 12.0
+GROQ_MIN_SEND_RMS = 7.0
 
 # Emergency bound for the worker's internal PCM buffer. Normal operation sends
 # one chunk at a time; this only prevents unbounded growth after long stalls.
@@ -797,6 +797,19 @@ def build_exact_confirmed_terms(
 
     output = []
     seen = set()
+    material_stress_context = any(
+        marker in f"{corrected_japanese}\n{raw_japanese}"
+        for marker in [
+            "材料",
+            "応力",
+            "引張",
+            "圧縮",
+            "曲げ",
+            "せん断",
+            "共用",
+            "共有",
+        ]
+    )
 
     for entry in glossary_entries or []:
         if not glossary_entry_matches_domain(entry, domain_mode):
@@ -851,6 +864,12 @@ def build_exact_confirmed_terms(
         if not evidence:
             evidence = term if _literal_term_in_text(term, raw_japanese) else ""
         if not evidence or not _literal_term_in_text(evidence, raw_japanese):
+            continue
+        if material_stress_context and (
+            "ロック" in term
+            or "lock" in term.lower()
+            or "shared lock" in meaning.lower()
+        ):
             continue
         has_glossary_canonical_for_same_evidence = any(
             evidence == str(existing_item.get("evidence", "")).strip()
@@ -1017,6 +1036,9 @@ def align_english_to_confirmed_japanese(corrected_japanese, english_text):
         ("三面図", r"\b3D diagram\b", "three-view drawing"),
         ("応答性", r"\bauto-set\b", "responsiveness"),
         ("ゲイン調整", r"\bgain adjustment\b", "gain adjustment"),
+        ("許容応力", r"\bshared locks?\b", "allowable stress"),
+        ("許容応力", r"\bshared strength\b", "allowable stress"),
+        ("許容応力", r"\bshared stress\b", "allowable stress"),
     ]
 
     for japanese_term, pattern, replacement in conditional_replacements:
@@ -3696,6 +3718,7 @@ def translation_requires_fallback(japanese_text, english_text):
         "cad source",
         "source to explain",
         "release management computer",
+        "shared lock",
     ]
     if any(fragment in lower for fragment in bad_fragments):
         return True
@@ -4456,6 +4479,7 @@ with st.sidebar:
     speech_capture_preset = st.selectbox(
         "Speech capture preset",
         [
+            "Distant lecturer",
             "Fast or unclear speaker",
             "Normal lecture",
             "Lowest latency",
@@ -4468,12 +4492,19 @@ with st.sidebar:
         ),
     )
 
-    if speech_capture_preset == "Fast or unclear speaker":
+    if speech_capture_preset == "Distant lecturer":
         default_stt_quality_index = 0
-        default_chunk_seconds = 4.8
-        endpoint_silence_seconds = 0.85
-        vad_rms_threshold = 45.0
-        min_send_rms = 8.0
+        default_chunk_seconds = 6.0
+        endpoint_silence_seconds = 1.15
+        vad_rms_threshold = 28.0
+        min_send_rms = 4.5
+        st.caption("Preset: maximum distance pickup, more context, and faint speech accepted.")
+    elif speech_capture_preset == "Fast or unclear speaker":
+        default_stt_quality_index = 0
+        default_chunk_seconds = 5.2
+        endpoint_silence_seconds = 0.95
+        vad_rms_threshold = 35.0
+        min_send_rms = 6.0
         st.caption("Preset: more context, cautious phrase splitting, quieter speech accepted.")
     elif speech_capture_preset == "Lowest latency":
         default_stt_quality_index = 1
@@ -4512,7 +4543,7 @@ with st.sidebar:
     stt_chunk_seconds = st.slider(
         "Caption audio chunk",
         min_value=3.2,
-        max_value=7.0,
+        max_value=8.0,
         value=default_chunk_seconds,
         step=0.2,
         help=(
@@ -4521,8 +4552,10 @@ with st.sidebar:
             "delay the first visible caption."
         ),
     )
-    if speech_capture_preset == "Fast or unclear speaker":
-        st.caption("Tip: keep this around 4.6-5.2 seconds when the speaker is fast or unclear.")
+    if speech_capture_preset == "Distant lecturer":
+        st.caption("Tip: keep this around 5.8-6.8 seconds when the mic is far from the speaker.")
+    elif speech_capture_preset == "Fast or unclear speaker":
+        st.caption("Tip: keep this around 5.0-5.8 seconds when the speaker is fast or unclear.")
 
     fast_translation_mode = st.checkbox(
         "Fast combined correction + translation",
