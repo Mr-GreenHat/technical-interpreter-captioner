@@ -3157,11 +3157,17 @@ STRICT FIDELITY RULES:
    possible and set is_unclear=true instead of guessing.
 
 CONFIRMED TERM RULES:
-- Include a term only if it appears literally in corrected_japanese_original.
-- Every term must include "evidence", copied exactly from the raw Japanese.
-- Evidence may be the canonical term or a plausible ASR form.
-- If no exact raw evidence exists, omit the term.
-- Use the glossary English meaning exactly.
+- Extract important technical terms from the current phrase even when they are
+  not in the Candidate glossary.
+- Include a term only if its Japanese text appears literally in
+  corrected_japanese_original.
+- Every term must include "evidence". Prefer exact raw Japanese evidence; if
+  ASR was corrected, use the raw substring that best supports the term.
+- If the term is in the Candidate glossary, use the glossary English meaning
+  exactly.
+- If the term is not in the Candidate glossary, provide a concise technical
+  English meaning from context. Do not add broad topic words that are not
+  actually spoken in the current phrase.
 - confidence must be "high" or "medium".
 
 CORRECTION RULES:
