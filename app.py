@@ -3264,6 +3264,9 @@ STRICT FIDELITY RULES:
 CONFIRMED TERM RULES:
 - Extract important technical terms from the current phrase even when they are
   not in the Candidate glossary.
+- Include short technical noun phrases such as component names, mechanisms,
+  tools, software commands, material names, and measurement names. A phrase
+  can be a key term even if the current utterance is only two or three words.
 - Include a term only if its Japanese text appears literally in
   corrected_japanese_original.
 - Every term must include "evidence". Prefer exact raw Japanese evidence; if
