@@ -2771,6 +2771,24 @@ def contains_kanji(text):
     return False
 
 
+def reading_is_kana(text):
+    text = str(text or "").strip()
+    if not text:
+        return False
+
+    for ch in text:
+        cp = ord(ch)
+        if ch.isspace() or ch in "・ー":
+            continue
+        if 0x3040 <= cp <= 0x309F:
+            continue
+        if 0x30A0 <= cp <= 0x30FF:
+            continue
+        return False
+
+    return True
+
+
 def lookup_reading_for_term(term, provided_reading="", meaning=""):
     """
     Use the glossary reading when displaying kanji key terms.
@@ -2782,7 +2800,7 @@ def lookup_reading_for_term(term, provided_reading="", meaning=""):
     provided_reading = (provided_reading or "").strip()
     meaning = (meaning or "").strip()
 
-    if provided_reading:
+    if provided_reading and reading_is_kana(provided_reading):
         return provided_reading
 
     if not term:
@@ -2926,23 +2944,14 @@ def format_key_term_line(term, meaning, show_meaning=True, reading="", auto_read
         else (reading or "").strip()
     )
 
-    original_display_term = display_term
-    safe_term = html.escape(display_term)
-    safe_meaning = html.escape(display_meaning)
-    safe_reading = html.escape(display_reading)
-
     if display_reading and contains_kanji(display_term):
-        display_term = f"<ruby>{safe_term}<rt>{safe_reading}</rt></ruby>"
-    else:
-        display_term = safe_term
+        display_term = f"{display_term} ({display_reading})"
 
     if not show_meaning:
         return display_term
 
     if display_meaning:
-        if display_reading and contains_kanji(original_display_term):
-            return f"{display_term} : {safe_meaning}"
-        return f"{display_term} = {safe_meaning}"
+        return f"{display_term} = {display_meaning}"
 
     if display_meaning:
         if display_reading and contains_kanji(line.split("=", 1)[0].strip()):
@@ -3228,7 +3237,8 @@ CONFIRMED TERM RULES:
 - If the term is not in the Candidate glossary, provide a concise technical
   English meaning from context. Do not add broad topic words that are not
   actually spoken in the current phrase.
-- Every kanji/kana Japanese term should include "reading" in hiragana. For
+- Every kanji/kana Japanese term should include "reading" in hiragana only,
+  never romaji. For
   glossary terms, use the glossary reading when known. For terms outside the
   glossary, infer the standard reading from context. If "term" contains kanji,
   "reading" must not be empty.
@@ -6119,7 +6129,7 @@ else:
 
 safe_original = html.escape(display_japanese)
 safe_caption_text = html.escape(display_english)
-safe_llm_terms = llm_terms_text
+safe_llm_terms = html.escape(llm_terms_text)
 safe_jp_status = html.escape(jp_status_text)
 safe_en_status = html.escape(en_status_text)
 safe_correction_status = html.escape(correction_status_text)
