@@ -867,8 +867,10 @@ def build_exact_confirmed_terms(
             continue
         if material_stress_context and (
             "ロック" in term
+            or "船団" in term
             or "lock" in term.lower()
             or "shared lock" in meaning.lower()
+            or meaning.lower() == "fleet"
         ):
             continue
         has_glossary_canonical_for_same_evidence = any(
@@ -2924,16 +2926,28 @@ def format_key_term_line(term, meaning, show_meaning=True, reading="", auto_read
         else (reading or "").strip()
     )
 
+    original_display_term = display_term
+    safe_term = html.escape(display_term)
+    safe_meaning = html.escape(display_meaning)
+    safe_reading = html.escape(display_reading)
+
     if display_reading and contains_kanji(display_term):
-        display_term = f"{display_term} ({display_reading})"
+        display_term = f"<ruby>{safe_term}<rt>{safe_reading}</rt></ruby>"
+    else:
+        display_term = safe_term
 
     if not show_meaning:
         return display_term
 
     if display_meaning:
+        if display_reading and contains_kanji(original_display_term):
+            return f"{display_term} : {safe_meaning}"
+        return f"{display_term} = {safe_meaning}"
+
+    if display_meaning:
         if display_reading and contains_kanji(line.split("=", 1)[0].strip()):
             return f"{display_term}： {display_meaning}"
-        return f"{display_term} = {display_meaning}"
+        return f"{display_term} = {safe_meaning}"
 
     return display_term
 
@@ -3216,7 +3230,8 @@ CONFIRMED TERM RULES:
   actually spoken in the current phrase.
 - Every kanji/kana Japanese term should include "reading" in hiragana. For
   glossary terms, use the glossary reading when known. For terms outside the
-  glossary, infer the standard reading from context.
+  glossary, infer the standard reading from context. If "term" contains kanji,
+  "reading" must not be empty.
 - confidence must be "high" or "medium".
 
 CORRECTION RULES:
@@ -6104,7 +6119,7 @@ else:
 
 safe_original = html.escape(display_japanese)
 safe_caption_text = html.escape(display_english)
-safe_llm_terms = html.escape(llm_terms_text)
+safe_llm_terms = llm_terms_text
 safe_jp_status = html.escape(jp_status_text)
 safe_en_status = html.escape(en_status_text)
 safe_correction_status = html.escape(correction_status_text)
@@ -6394,6 +6409,16 @@ caption_html = f"""
     word-break: normal;
     border: 1px solid #10B981;
     box-sizing: border-box;
+}}
+
+.llm-terms-box ruby {{
+    ruby-position: over;
+}}
+
+.llm-terms-box rt {{
+    font-size: 0.62em;
+    font-weight: 700;
+    line-height: 1;
 }}
 
 .ask-ai-box {{
