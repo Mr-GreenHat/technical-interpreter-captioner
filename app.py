@@ -2814,7 +2814,7 @@ def key_term_supported_by_source(item, source_text):
 
 
 
-def key_term_display_allowed(item, source_text):
+def key_term_display_allowed(item, source_text, sensitivity="Strict"):
     """
     Show only terms supported by the currently displayed corrected Japanese.
 
@@ -2832,12 +2832,24 @@ def key_term_display_allowed(item, source_text):
     if not term:
         return False
 
-    if not _literal_term_in_text(term, source_text):
+    sensitivity_key = str(sensitivity or "Strict").strip().lower()
+    source_match = str(
+        item.get("source_match", item.get("matched_candidate", ""))
+    ).strip()
+    term_is_literal = _literal_term_in_text(term, source_text)
+    evidence_is_literal = bool(
+        source_match and glossary_candidate_matches(source_match, source_text)
+    )
+
+    if sensitivity_key.startswith("strict"):
+        if not term_is_literal:
+            return False
+    elif not term_is_literal and not evidence_is_literal:
         return False
 
     # The current corrected Japanese is enough for display, but every stored
     # AI-confirmed term should also carry raw evidence.
-    if item.get("confidence") and not evidence:
+    if item.get("confidence") and not evidence and sensitivity_key.startswith("strict"):
         return False
 
     item["last_confirmed_at"] = time.time()
@@ -4565,6 +4577,22 @@ with st.sidebar:
         help="Terms + meaning = interpreter key terms only. Captions + terms = captions plus key terms.",
     )
 
+    key_term_sensitivity = st.selectbox(
+        "Key term sensitivity",
+        [
+            "Balanced",
+            "Strict",
+            "Sensitive / debug",
+        ],
+        index=0,
+        help=(
+            "Balanced shows glossary terms when the current Japanese contains "
+            "the canonical term or a known ASR variant. Strict requires the "
+            "canonical term after correction. Sensitive/debug sends and shows "
+            "more current-phrase candidates while debugging."
+        ),
+    )
+
     # Always show meanings because this app is now key-term support first.
     show_term_meaning = True
 
@@ -5307,12 +5335,22 @@ while not st.session_state.live_result_queue.empty():
                 original or st.session_state.live_original,
                 translation or st.session_state.live_translation,
                 terms_file,
+                max_terms=(
+                    key_term_limit * 2
+                    if key_term_sensitivity == "Sensitive / debug"
+                    else key_term_limit
+                ),
             )
             instant_detected_terms = filter_detected_terms_for_current_caption(
                 instant_detected_terms,
                 original or st.session_state.live_original,
                 translation or st.session_state.live_translation,
                 domain_mode,
+                max_terms=(
+                    key_term_limit * 2
+                    if key_term_sensitivity == "Sensitive / debug"
+                    else key_term_limit
+                ),
             )
             instant_key_terms = detected_terms_to_llm_key_terms(instant_detected_terms)
 
@@ -5548,14 +5586,28 @@ while not st.session_state.llm_result_queue.empty():
             "confirmed_terms",
             item.get("key_terms", []),
         )
-        st.session_state.llm_key_terms = [
+        validated_confirmed_terms = [
             term_item
             for term_item in confirmed_terms
             if key_term_display_allowed(
                 term_item,
                 st.session_state.live_original,
+                key_term_sensitivity,
             )
         ][:key_term_limit]
+
+        if validated_confirmed_terms or key_term_sensitivity == "Strict":
+            st.session_state.llm_key_terms = validated_confirmed_terms
+        else:
+            st.session_state.llm_key_terms = [
+                term_item
+                for term_item in st.session_state.llm_key_terms
+                if key_term_display_allowed(
+                    term_item,
+                    st.session_state.live_original,
+                    key_term_sensitivity,
+                )
+            ][:key_term_limit]
 
         has_ai_update = (
             bool(st.session_state.llm_corrected_japanese_original)
@@ -5932,7 +5984,7 @@ if use_llm_hints:
     current_llm_key_terms = [
         item
         for item in st.session_state.llm_key_terms
-        if key_term_display_allowed(item, display_japanese)
+        if key_term_display_allowed(item, display_japanese, key_term_sensitivity)
     ]
 
     # Also prune the stored list, so old terms do not survive forever.
