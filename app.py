@@ -3668,6 +3668,10 @@ def translation_requires_fallback(japanese_text, english_text):
         "invalid json",
         "error:",
         "none",
+        "this time's curry",
+        "cad source",
+        "source to explain",
+        "release management computer",
     ]
     if any(fragment in lower for fragment in bad_fragments):
         return True
@@ -4367,6 +4371,35 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <style>
+    html,
+    body,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stAppViewBlockContainer"],
+    [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"] {
+        max-width: 100%;
+        overflow-x: hidden;
+        box-sizing: border-box;
+    }
+
+    [data-testid="stAppViewBlockContainer"] {
+        padding-left: clamp(1rem, 3vw, 4rem);
+        padding-right: clamp(1rem, 3vw, 4rem);
+    }
+
+    .stButton > button {
+        min-width: 0;
+        max-width: 100%;
+        white-space: normal;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Technical Interpreter Captioner")
 
 st.caption(
@@ -4527,7 +4560,7 @@ with st.sidebar:
     main_display_mode = st.radio(
         "Main display",
         ["Terms + meaning", "Captions + terms"],
-        index=1,
+        index=0,
         help="Terms + meaning = interpreter key terms only. Captions + terms = captions plus key terms.",
     )
 
@@ -6141,6 +6174,11 @@ caption_html = f"""
     flex-direction: column;
     gap: 10px;
     margin-top: 8px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: hidden;
+    box-sizing: border-box;
 }}
 
 .caption-label {{
@@ -6191,6 +6229,8 @@ caption_html = f"""
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
     border: 1px solid #D1D5DB;
     box-sizing: border-box;
 }}
@@ -6210,6 +6250,8 @@ caption_html = f"""
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
     border: 1px solid #10B981;
     box-sizing: border-box;
 }}
@@ -6228,6 +6270,8 @@ caption_html = f"""
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
     border: 1px solid #F59E0B;
     box-sizing: border-box;
 }}
@@ -6246,6 +6290,8 @@ caption_html = f"""
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
     border: 1px solid #374151;
     box-sizing: border-box;
 }}
