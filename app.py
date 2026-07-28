@@ -848,11 +848,17 @@ def build_exact_confirmed_terms(
 
         if not term or not meaning or term.lower() in seen:
             continue
-        if not _literal_term_in_text(term, corrected_japanese):
-            continue
         if not evidence:
             evidence = term if _literal_term_in_text(term, raw_japanese) else ""
         if not evidence or not _literal_term_in_text(evidence, raw_japanese):
+            continue
+        has_glossary_canonical_for_same_evidence = any(
+            evidence == str(existing_item.get("evidence", "")).strip()
+            for existing_item in output
+        )
+        if has_glossary_canonical_for_same_evidence:
+            continue
+        if not _literal_term_in_text(term, corrected_japanese):
             continue
 
         output.append({
