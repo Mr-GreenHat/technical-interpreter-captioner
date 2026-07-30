@@ -1669,6 +1669,19 @@ def is_filler_only_japanese(text):
     if not is_japanese_text(text):
         return False
 
+    hallucinated_phrases = [
+        "ありがとうございました",
+        "ありがとうございます",
+        "ご視聴ありがとうございました",
+        "ご清聴ありがとうございました",
+        "はい",
+    ]
+    temp_hallucination = text
+    for phrase in sorted(hallucinated_phrases, key=len, reverse=True):
+        temp_hallucination = temp_hallucination.replace(phrase, "")
+    if temp_hallucination.strip() == "":
+        return True
+
     temp = text
 
     for filler in sorted(JAPANESE_FILLER_WORDS, key=len, reverse=True):
@@ -1690,7 +1703,8 @@ def is_filler_only_english(text):
 
     filler_words = {
         "um", "uh", "er", "ah", "yeah", "yes", "okay", "ok",
-        "well", "so", "like", "you", "know", "right", "hmm"
+        "well", "so", "like", "you", "know", "right", "hmm",
+        "thank", "thanks", "very", "much"
     }
 
     return all(word in filler_words for word in words)
@@ -5371,6 +5385,19 @@ while not st.session_state.live_result_queue.empty():
             "unclear_reason": str(item.get("unclear_reason", "") or "").strip(),
             "provisional": not is_final_phrase,
         }
+
+        if should_skip_as_filler(
+            phrase["original"],
+            phrase["translation"],
+        ):
+            st.session_state.debug_messages.append(
+                "Ignored hallucinated filler phrase: "
+                f"{phrase['original'][:80] or phrase['translation'][:80]}"
+            )
+            st.session_state.debug_messages = (
+                st.session_state.debug_messages[-MAX_DEBUG_MESSAGES:]
+            )
+            continue
 
         if st.session_state.pending_new_paragraph:
             st.session_state.finalized_phrases = []
