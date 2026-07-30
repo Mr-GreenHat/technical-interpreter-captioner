@@ -76,6 +76,12 @@ MAX_DEBUG_MESSAGES = 10
 AUDIO_INPUT_SAMPLE_RATE = 16000
 PCM_BYTES_PER_SAMPLE = 2
 
+# Phone microphones often arrive much quieter through WebRTC than laptop
+# microphones. Boost PCM in software before Whisper, with clipping protection.
+AUDIO_SOFT_GAIN_MIN = 1.4
+AUDIO_SOFT_GAIN_MAX = 6.0
+AUDIO_SOFT_GAIN_TARGET_RMS = 550.0
+
 # Groq free-plan Whisper is limited to 20 requests/minute, so keep calls
 # at least a little more than three seconds apart. Phrase-end silence can
 # trigger an early flush only when this minimum interval has elapsed.
@@ -3497,7 +3503,7 @@ Required JSON schema:
 # ============================================================
 
 class AudioProcessor:
-    """Convert browser audio to mono 16 kHz PCM16 exactly once."""
+    """Convert browser audio to boosted mono 16 kHz PCM16 exactly once."""
 
     def __init__(self):
         self.audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_MAX_CHUNKS)
@@ -3544,6 +3550,26 @@ class AudioProcessor:
                     continue
 
                 pcm16 = np.ascontiguousarray(audio, dtype="<i2")
+                pcm_float = pcm16.astype(np.float32)
+                try:
+                    raw_level = float(
+                        np.sqrt(np.mean(np.square(pcm_float)))
+                    )
+                except Exception:
+                    raw_level = 0.0
+
+                if raw_level > 0:
+                    gain = AUDIO_SOFT_GAIN_TARGET_RMS / max(raw_level, 1.0)
+                    gain = min(AUDIO_SOFT_GAIN_MAX, max(AUDIO_SOFT_GAIN_MIN, gain))
+                else:
+                    gain = AUDIO_SOFT_GAIN_MIN
+
+                boosted = np.clip(
+                    pcm_float * gain,
+                    -32768,
+                    32767,
+                ).astype("<i2")
+                pcm16 = np.ascontiguousarray(boosted)
                 self._put_latest_audio(pcm16.tobytes())
 
                 self.frame_count += 1
@@ -4724,50 +4750,6 @@ st.markdown(
         white-space: normal;
     }
 
-    [data-testid="stSidebar"] {
-        min-width: min(88vw, 24rem);
-    }
-
-    [data-testid="stSidebarUserContent"] {
-        padding-left: 1.25rem;
-        padding-right: 1.25rem;
-    }
-
-    @media (max-width: 768px) {
-        [data-testid="stSidebar"] {
-            width: min(92vw, 24rem) !important;
-            min-width: min(92vw, 24rem) !important;
-            max-width: min(92vw, 24rem) !important;
-        }
-
-        [data-testid="stSidebarUserContent"] {
-            padding-left: 1.5rem !important;
-            padding-right: 1.5rem !important;
-            padding-bottom: 3rem !important;
-        }
-
-        [data-testid="stSidebar"] .stSelectbox,
-        [data-testid="stSidebar"] .stRadio,
-        [data-testid="stSidebar"] .stCheckbox,
-        [data-testid="stSidebar"] .stSlider {
-            padding-left: 0.35rem;
-            padding-right: 0.35rem;
-        }
-
-        [data-testid="stSidebar"] .stSlider {
-            min-height: 58px;
-            touch-action: pan-y;
-        }
-
-        [data-testid="stSidebar"] .stSlider [role="slider"] {
-            min-width: 28px;
-            min-height: 28px;
-        }
-
-        [data-testid="stSidebar"] input[type="range"] {
-            min-height: 40px;
-        }
-    }
     </style>
     """,
     unsafe_allow_html=True,
