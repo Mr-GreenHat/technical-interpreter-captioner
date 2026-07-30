@@ -4620,33 +4620,21 @@ with st.sidebar:
     st.info("Translation engine: Groq Whisper + combined correction/translation")
     st.caption("Captions update by phrase, not character-by-character.")
 
-    domain_mode = st.selectbox(
-        "Technical domain",
-        ["auto", "automotive", "cad", "product design", "school/event"],
-        index=0,
-        help="Choose the real class topic. Use 'school/event' only for Summer Course/BINUS topics.",
-    )
+    domain_mode = "automotive"
     st.caption(f"Selected technical context: {domain_mode}")
 
     st.caption("Source mode: Japanese is forced in Whisper for better accuracy and latency.")
 
-    speech_capture_preset = st.selectbox(
-        "Speech capture preset",
-        [
-            "Distant lecturer",
-            "Fast or unclear speaker",
-            "Normal lecture",
-            "Lowest latency",
-        ],
-        index=0,
-        help=(
-            "Use Fast or unclear speaker when the lecturer speaks quickly, "
-            "mumbles, faces away, or the room audio is weak. It waits for a "
-            "larger phrase and is less aggressive about silence."
-        ),
-    )
+    speech_capture_preset = "Fast but sensible"
 
-    if speech_capture_preset == "Distant lecturer":
+    if speech_capture_preset == "Fast but sensible":
+        default_stt_quality_index = 1
+        default_chunk_seconds = 3.8
+        endpoint_silence_seconds = 0.55
+        vad_rms_threshold = 18.0
+        min_send_rms = 3.0
+        st.caption("Preset: fastest practical captions with enough context for technical speech.")
+    elif speech_capture_preset == "Distant lecturer":
         default_stt_quality_index = 0
         default_chunk_seconds = 6.0
         endpoint_silence_seconds = 1.15
@@ -4675,54 +4663,17 @@ with st.sidebar:
         min_send_rms = GROQ_MIN_SEND_RMS
         st.caption("Preset: balanced classroom defaults.")
 
-    stt_quality = st.selectbox(
-        "Whisper recognition model",
-        [
-            "High accuracy (whisper-large-v3)",
-            "Faster (whisper-large-v3-turbo)",
-        ],
-        index=default_stt_quality_index,
-        help=(
-            "Turbo is recommended for lower caption latency. Use High accuracy "
-            "when recognition quality matters more than speed. Turbo is cheaper/faster "
-            "but is slightly less accurate."
-        ),
-    )
-    stt_model_name = (
-        GROQ_STT_MODEL_FAST
-        if "turbo" in stt_quality.lower()
-        else GROQ_STT_MODEL_ACCURATE
-    )
+    stt_model_name = GROQ_STT_MODEL_FAST
 
-    stt_chunk_seconds = st.slider(
-        "Caption audio chunk",
-        min_value=3.2,
-        max_value=8.0,
-        value=default_chunk_seconds,
-        step=0.2,
-        help=(
-            "3.2–3.8 seconds is the low-latency range that stays below the "
-            "Groq free-plan request limit. Longer blocks improve context but "
-            "delay the first visible caption."
-        ),
-    )
+    stt_chunk_seconds = default_chunk_seconds
     if speech_capture_preset == "Distant lecturer":
         st.caption("Tip: keep this around 5.8-6.8 seconds when the mic is far from the speaker.")
+    elif speech_capture_preset == "Fast but sensible":
+        st.caption("Tip: keep this around 3.8-4.4 seconds for faster captions that still make sense.")
     elif speech_capture_preset == "Fast or unclear speaker":
         st.caption("Tip: keep this around 5.0-5.8 seconds when the speaker is fast or unclear.")
 
-    quiet_speech_sensitivity = st.slider(
-        "Quiet speech sensitivity",
-        min_value=0,
-        max_value=10,
-        value=10,
-        step=1,
-        help=(
-            "10 is the most sensitive and sends almost any mic audio to "
-            "Whisper. Lower values reject more room noise and reduce "
-            "hallucinations."
-        ),
-    )
+    quiet_speech_sensitivity = 10
     sensitivity_scale = (10 - quiet_speech_sensitivity) / 10.0
     min_send_rms = max(
         0.0,
@@ -4737,33 +4688,9 @@ with st.sidebar:
         f"VAD RMS {vad_rms_threshold:.1f}. Stop/Start once if already running."
     )
 
-    fast_translation_mode = st.checkbox(
-        "Fast combined correction + translation",
-        value=True,
-        help=(
-            "Recommended. Reuse the English returned by the second-pass AI. "
-            "A separate translation request runs only when that English is "
-            "missing or unusable. Turn this off for the slower maximum-check mode."
-        ),
-    )
+    fast_translation_mode = True
 
-    microphone_profile = st.selectbox(
-        "Microphone processing",
-        [
-            "Far lecturer / quiet voice (recommended)",
-            "Technical speech / close voice",
-            "Raw microphone",
-            "Speakerphone / strong echo control",
-        ],
-        index=0,
-        help=(
-            "Use Far lecturer for classroom speech: browser noise suppression "
-            "is disabled so it does not erase a distant voice, and automatic "
-            "gain is requested. Use Technical speech only when the speaker is "
-            "close to the microphone. If you change this while the mic is "
-            "already connected, press Reset Mic Connection once."
-        ),
-    )
+    microphone_profile = "Far lecturer / quiet voice (recommended)"
 
     if microphone_profile == "Far lecturer / quiet voice (recommended)":
         microphone_audio_constraints = {
@@ -4794,100 +4721,31 @@ with st.sidebar:
             "autoGainControl": False,
         }
 
-    main_display_mode = st.radio(
-        "Main display",
-        ["Terms + meaning", "Captions + terms"],
-        index=0,
-        key="main_display_mode",
-        help="Terms + meaning = interpreter key terms only. Captions + terms = captions plus key terms.",
-    )
+    main_display_mode = "Terms + meaning"
 
-    key_term_sensitivity = st.selectbox(
-        "Key term sensitivity",
-        [
-            "Balanced",
-            "Strict",
-            "Sensitive / debug",
-        ],
-        index=0,
-        help=(
-            "Balanced shows glossary terms when the current Japanese contains "
-            "the canonical term or a known ASR variant. Strict requires the "
-            "canonical term after correction. Sensitive/debug sends and shows "
-            "more current-phrase candidates while debugging."
-        ),
-    )
+    key_term_sensitivity = "Balanced"
 
     # Always show meanings because this app is now key-term support first.
     show_term_meaning = True
 
-    show_term_reading = st.checkbox(
-        "Show term readings",
-        value=True,
-        help="Show hiragana readings beside kanji terms, including AI-discovered terms outside the CSV.",
-    )
+    show_term_reading = True
 
-    key_term_limit = st.slider(
-        "Maximum displayed key terms",
-        min_value=3,
-        max_value=SECOND_PASS_MAX_CONFIRMED_TERMS,
-        value=DEFAULT_KEY_TERM_DISPLAY_LIMIT,
-        step=1,
-        help=(
-            "Limits only the key-term box for the current paragraph. "
-            "It does not increase the number of glossary candidates sent to AI."
-        ),
-    )
+    key_term_limit = DEFAULT_KEY_TERM_DISPLAY_LIMIT
 
-    subtitle_display = st.radio(
-        "Caption history",
-        ["Latest only", "History"],
-        index=0,
-    )
+    subtitle_display = "Latest only"
 
-    self_context = st.text_area(
-        "Self context / today's context",
-        value=st.session_state.get("self_context_text", ""),
-        height=80,
-        placeholder="Example: Today is about automotive braking and inertia compensation.",
-        help="This guides Whisper spelling and English translation. It is not shown to the audience.",
-    )
+    self_context = ""
     st.session_state.self_context_text = self_context
 
-    show_error_details = st.checkbox(
-        "Show AI error details",
-        value=False,
-        help="Keep OFF during interpreting. Details stay in debug.",
-    )
+    show_error_details = False
 
-    font_size = st.slider(
-        "English caption font size",
-        min_value=12,
-        max_value=32,
-        value=15,
-        step=1,
-    )
+    font_size = 15
 
-    jp_font_size = st.slider(
-        "Japanese original font size",
-        min_value=11,
-        max_value=28,
-        value=13,
-        step=1,
-    )
+    jp_font_size = 13
 
-    reset_seconds = st.slider(
-        "Prepare new caption after pause",
-        min_value=1.5,
-        max_value=8.0,
-        value=DEFAULT_RESET_SECONDS,
-        step=0.5,
-    )
+    reset_seconds = DEFAULT_RESET_SECONDS
 
-    show_debug = st.checkbox(
-        "Show debug panel",
-        value=False,
-    )
+    show_debug = False
 
     st.divider()
 
@@ -4921,24 +4779,7 @@ with st.sidebar:
     st.write("Glossary")
 
     terms_file = DEFAULT_TERMS_FILE
-
-    uploaded_glossary = st.file_uploader(
-        "Upload custom glossary CSV",
-        type=["csv"],
-    )
-
-    if uploaded_glossary is not None:
-        os.makedirs("glossaries", exist_ok=True)
-
-        glossary_path = os.path.join("glossaries", uploaded_glossary.name)
-
-        with open(glossary_path, "wb") as f:
-            f.write(uploaded_glossary.getbuffer())
-
-        terms_file = glossary_path
-        st.success(f"Using: {uploaded_glossary.name}")
-    else:
-        st.info("Using default technical_terms.csv")
+    st.info("Using default technical_terms.csv")
 
     context_terms, translation_terms = load_soniox_context_terms(terms_file)
 
