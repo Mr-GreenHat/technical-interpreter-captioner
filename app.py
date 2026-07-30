@@ -3560,9 +3560,27 @@ class AudioProcessor:
 
                 if raw_level > 0:
                     gain = AUDIO_SOFT_GAIN_TARGET_RMS / max(raw_level, 1.0)
-                    gain = min(AUDIO_SOFT_GAIN_MAX, max(AUDIO_SOFT_GAIN_MIN, gain))
+                    gain_max = float(
+                        globals().get(
+                            "audio_soft_gain_max",
+                            AUDIO_SOFT_GAIN_MAX,
+                        )
+                        or AUDIO_SOFT_GAIN_MAX
+                    )
+                    gain_max = max(1.0, min(8.0, gain_max))
+                    gain_min = min(AUDIO_SOFT_GAIN_MIN, gain_max)
+                    gain = min(gain_max, max(gain_min, gain))
                 else:
-                    gain = AUDIO_SOFT_GAIN_MIN
+                    gain = min(
+                        AUDIO_SOFT_GAIN_MIN,
+                        float(
+                            globals().get(
+                                "audio_soft_gain_max",
+                                AUDIO_SOFT_GAIN_MAX,
+                            )
+                            or AUDIO_SOFT_GAIN_MAX
+                        ),
+                    )
 
                 boosted = np.clip(
                     pcm_float * gain,
@@ -4846,6 +4864,19 @@ with st.sidebar:
         f"Derived thresholds: send RMS {min_send_rms:.1f}, "
         f"VAD RMS {vad_rms_threshold:.1f}. Stop/Start once if already running."
     )
+
+    audio_soft_gain_max = st.slider(
+        "Phone mic boost",
+        min_value=1.0,
+        max_value=8.0,
+        value=float(AUDIO_SOFT_GAIN_MAX),
+        step=0.5,
+        help=(
+            "Software boost before Whisper. Lower this if the AI hears room "
+            "noise or fake words; raise it if phone speech is too quiet."
+        ),
+    )
+    st.caption(f"Phone/software mic boost cap: {audio_soft_gain_max:.1f}x")
 
     fast_translation_mode = True
 
@@ -6330,6 +6361,9 @@ if show_debug:
 
         st.write("Microphone processing profile:")
         st.code(microphone_profile)
+
+        st.write("Phone mic boost:")
+        st.code(f"{audio_soft_gain_max:.1f}x")
 
         st.write("Speech capture preset:")
         st.code(
