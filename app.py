@@ -4620,7 +4620,12 @@ with st.sidebar:
     st.info("Translation engine: Groq Whisper + combined correction/translation")
     st.caption("Captions update by phrase, not character-by-character.")
 
-    domain_mode = "automotive"
+    domain_mode = st.selectbox(
+        "Technical domain",
+        ["automotive", "auto", "cad", "product design", "school/event"],
+        index=0,
+        help="Choose the real class topic. Use school/event only for non-technical event captions.",
+    )
     st.caption(f"Selected technical context: {domain_mode}")
 
     st.caption("Source mode: Japanese is forced in Whisper for better accuracy and latency.")
@@ -4721,7 +4726,13 @@ with st.sidebar:
             "autoGainControl": False,
         }
 
-    main_display_mode = "Terms + meaning"
+    main_display_mode = st.radio(
+        "Main display",
+        ["Terms + meaning", "Captions + terms"],
+        index=0,
+        key="main_display_mode",
+        help="Terms + meaning = key terms only. Captions + terms = captions plus key terms for debugging.",
+    )
 
     key_term_sensitivity = "Balanced"
 
@@ -4745,7 +4756,10 @@ with st.sidebar:
 
     reset_seconds = DEFAULT_RESET_SECONDS
 
-    show_debug = False
+    show_debug = st.checkbox(
+        "Show debug panel",
+        value=False,
+    )
 
     st.divider()
 
