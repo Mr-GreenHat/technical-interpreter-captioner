@@ -810,6 +810,13 @@ def build_exact_confirmed_terms(
             "共有",
         ]
     )
+    brake_context = any(
+        marker in f"{corrected_japanese}\n{raw_japanese}".lower()
+        for marker in [
+            "ブレーキ",
+            "brake",
+        ]
+    )
 
     for entry in glossary_entries or []:
         if not glossary_entry_matches_domain(entry, domain_mode):
@@ -871,6 +878,11 @@ def build_exact_confirmed_terms(
             or "lock" in term.lower()
             or "shared lock" in meaning.lower()
             or meaning.lower() == "fleet"
+        ):
+            continue
+        if brake_context and (
+            term == "キャリバー"
+            or meaning.lower() == "calibrator"
         ):
             continue
         has_glossary_canonical_for_same_evidence = any(
@@ -1769,6 +1781,48 @@ def looks_like_valid_japanese_for_display(text):
     return True
 
 
+def strip_hallucinated_japanese_thanks_suffix(text):
+    cleaned = str(text or "").strip()
+
+    if not cleaned:
+        return ""
+
+    suffixes = [
+        "ご視聴ありがとうございました",
+        "ご清聴ありがとうございました",
+        "ありがとうございました",
+        "ありがとうございます",
+        "有難うございました",
+        "有難うございます",
+    ]
+
+    for suffix in suffixes:
+        for ending in [suffix, suffix + "。", suffix + ".", suffix + "！", suffix + "!"]:
+            if cleaned.endswith(ending) and len(cleaned) > len(ending) + 8:
+                return cleaned[:-len(ending)].rstrip(" 、。,.，")
+
+    return cleaned
+
+
+def strip_hallucinated_english_thanks_suffix(text):
+    cleaned = str(text or "").strip()
+
+    if not cleaned:
+        return ""
+
+    patterns = [
+        r"(?:[,.\s]+)?thank you(?: very much)?[.!]?$",
+        r"(?:[,.\s]+)?thanks(?: very much)?[.!]?$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+        if match and match.start() > 20:
+            return cleaned[:match.start()].rstrip(" ,.")
+
+    return cleaned
+
+
 def light_caption_cleanup(text):
     if not text:
         return ""
@@ -1928,7 +1982,7 @@ def light_caption_cleanup(text):
     cleaned = cleaned.replace("an inertia compensation", "inertia compensation")
     cleaned = cleaned.replace("a inertia compensation", "inertia compensation")
 
-    return cleaned.strip()
+    return strip_hallucinated_english_thanks_suffix(cleaned.strip())
 
 
 def light_original_cleanup(text):
@@ -2092,7 +2146,7 @@ def light_original_cleanup(text):
     for wrong, correct in replacements.items():
         cleaned = cleaned.replace(wrong, correct)
 
-    return cleaned.strip()
+    return strip_hallucinated_japanese_thanks_suffix(cleaned.strip())
 
 
 def light_domain_context_cleanup(original_text, translation_text, domain_mode):

@@ -15,6 +15,33 @@ automotive,四輪駆動,よんりんくどう,four-wheel drive,4グリンコー�
 automotive,変速機,へんそくき,transmission / gearbox,変速機能;返速機;返測器;変速器;へんそくき,Vehicle gearbox or transmission
 automotive,空気圧,くうきあつ,air pressure,くうきあつ,Tire or pneumatic pressure
 automotive,シートベルト,しーとべると,seat belt,シートベルトー;シートベルトを,Seat-belt safety device
+automotive,安全装置,あんぜんそうち,safety device,安全そうち;安全措置;anzensouchi;anzen souchi,Safety device or safety mechanism in a vehicle
+automotive,予防安全,よぼうあんぜん,active safety,アクティブセーフティ;能動安全;予防安全装置,Active safety systems that help prevent accidents
+automotive,衝突安全,しょうとつあんぜん,passive safety,パッシブセーフティ;受動安全;衝突安全装置,Passive safety systems that reduce injury during a crash
+automotive,能動安全,のうどうあんぜん,active safety,アクティブセーフティ;予防安全,Active safety concept
+automotive,受動安全,じゅどうあんぜん,passive safety,パッシブセーフティ;衝突安全,Passive safety concept
+automotive,乗員保護,じょういんほご,occupant protection,乗員保護装置;乗員保護を,Systems that protect occupants during a crash
+automotive,衝突被害軽減,しょうとつひがいけいげん,collision damage mitigation,衝突被害軽減ブレーキ;被害軽減,Reducing crash damage or injury severity
+automotive,プリクラッシュセーフティ,ぷりくらっしゅせーふてぃ,pre-crash safety,プリクラッシュ;pre-crash safety,Safety functions that act before a collision
+automotive,シートベルト機構,しーとべるときこう,seat belt mechanism,シートベルト機構を;seatbelt mechanism,Seat belt mechanical system
+automotive,リトラクター,りとらくたー,retractor,シートベルトリトラクター;巻き取り装置,Seat belt winding mechanism
+automotive,巻き取り装置,まきとりそうち,retractor / winding device,巻取り装置;巻き取り機構,Device that winds the seat belt webbing
+automotive,ロック機構,ろっくきこう,locking mechanism,ロック装置;ロック機能,Seat belt locking mechanism
+automotive,緊急ロック式巻取装置,きんきゅうろっくしきまきとりそうち,emergency locking retractor,ELR;緊急ロック式;緊急ロック巻き取り装置,Seat belt retractor that locks during sudden deceleration
+automotive,ELR,いーえるあーる,emergency locking retractor,イーエルアール;緊急ロック式巻取装置,Emergency locking retractor
+automotive,ALR,えーえるあーる,automatic locking retractor,エーエルアール;自動ロック式巻取装置,Automatic locking retractor
+automotive,プリテンショナー,ぷりてんしょなー,pretensioner,プリテンショナ;シートベルトプリテンショナー,Seat belt device that tightens the belt during a crash
+automotive,フォースリミッター,ふぉーすりみったー,force limiter,ロードリミッター;フォースリミッタ,Seat belt device that limits belt force on the occupant
+automotive,ロードリミッター,ろーどりみったー,load limiter,フォースリミッター;ロードリミッタ,Seat belt load-limiting device
+automotive,バックル,ばっくる,buckle,シートベルトバックル;バックルを,Seat belt buckle
+automotive,タングプレート,たんぐぷれーと,tongue plate,タング;プレート;差し込み金具,Seat belt latch plate inserted into the buckle
+automotive,ウェビング,うぇびんぐ,webbing,ベルトウェビング;帯,Seat belt fabric strap
+automotive,アンカー,あんかー,anchor,シートベルトアンカー;固定点,Seat belt mounting point
+automotive,ショルダーアンカー,しょるだーあんかー,shoulder anchor,肩アンカー;上部アンカー,Upper seat belt anchor point
+automotive,ラップベルト,らっぷべると,lap belt,腰ベルト;腰部ベルト,Seat belt section across the pelvis
+automotive,ショルダーベルト,しょるだーべると,shoulder belt,肩ベルト;胸部ベルト,Seat belt section across the shoulder and chest
+automotive,三点式シートベルト,さんてんしきしーとべると,three-point seat belt,3点式シートベルト;三点式ベルト,Seat belt with lap and shoulder belt in one system
+automotive,二点式シートベルト,にてんしきしーとべると,two-point seat belt,2点式シートベルト;二点式ベルト,Lap-only seat belt
 automotive,エアバッグ,えあばっぐ,airbag,エアバック;エアバッグを,Airbag safety device
 automotive,パワーステアリング,ぱわーすてありんぐ,power steering,パワステ;パワーステアリングー,Steering-assistance system
 automotive,ハンドル,はんどる,steering wheel,ステアリングホイール,Vehicle steering wheel
@@ -24,11 +51,68 @@ automotive,ショックアブソーバー,しょっくあぶそーばー,shock a
 automotive,ABS,えーびーえす,anti-lock braking system,エービーエス;エビエス;ＡＢＳ,System that prevents wheel lock during braking
 automotive,ブレーキペダル,ぶれーきぺだる,brake pedal,ブレーキペタル;ブレーキペダルを,Pedal used to apply the brakes
 automotive,ブレーキギヤ,ぶれーきぎや,brake gear,ブレーキギア;ブレーキキャリアー;ブレーキキャリバー;brake gear,Brake gear or brake-related mechanism
-automotive,ブレーキキャリパー,ぶれーききゃりぱー,brake caliper,ブレーキキャリバー;ブレーキキャリアー;brake caliper,Brake component that clamps the pads against a rotor
+automotive,ブレーキキャリパー,ぶれーききゃりぱー,brake caliper,ブレーキキャリバー;ブレーキキャリアー;キャリバー;キャリパー;calibrator;brake caliper,Brake component that clamps the pads against a rotor
 automotive,アクセルペダル,あくせるぺだる,accelerator pedal,アクセルペタル;アクセル,Pedal used to control acceleration
 automotive,クラッチ,くらっち,clutch,クラッチを,Clutch mechanism
 automotive,トランスミッション,とらんすみっしょん,transmission,トランスミッションを,Vehicle transmission
+automotive,手動変速機,しゅどうへんそくき,manual transmission,マニュアルトランスミッション;MT,Manual gearbox
+automotive,自動変速機,じどうへんそくき,automatic transmission,オートマチックトランスミッション;AT,Automatic gearbox
+automotive,無段変速機,むだんへんそくき,continuously variable transmission,CVT;無段変速,Continuously variable transmission
+automotive,変速比,へんそくひ,transmission gear ratio,変速費;変速日,Transmission ratio
+automotive,変速段,へんそくだん,gear stage,変速段数;段数,Transmission gear stage
+automotive,変速制御,へんそくせいぎょ,shift control,シフト制御;変速制御を,Transmission shift control
+automotive,シフトアップ,しふとあっぷ,shift up,アップシフト;シフトアップする,Changing to a higher gear
+automotive,シフトダウン,しふとだうん,shift down,ダウンシフト;シフトダウンする,Changing to a lower gear
+automotive,変速ショック,へんそくしょっく,shift shock,シフトショック;変速衝撃,Shock felt during gear change
+automotive,クラッチ板,くらっちばん,clutch disc,クラッチディスク;クラッチ版,Friction disc in a clutch
+automotive,クラッチペダル,くらっちぺだる,clutch pedal,クラッチペタル;クラッチペダルを,Pedal used to operate the clutch
+automotive,半クラッチ,はんくらっち,partial clutch engagement,半クラ;半クラッチ状態,Partially engaged clutch state
+automotive,シンクロメッシュ,しんくろめっしゅ,synchromesh,シンクロ;同期噛合,Manual transmission synchronizer system
+automotive,同期装置,どうきそうち,synchronizer,シンクロナイザー;同期そうち,Device that synchronizes gear speeds
+automotive,遊星歯車,ゆうせいはぐるま,planetary gear,遊星ギヤ;プラネタリギヤ,Planetary gear set
+automotive,トルク伝達,とるくでんたつ,torque transmission,トルク伝達を;トルク伝達経路,Transmission of torque
+automotive,伝達効率,でんたつこうりつ,transmission efficiency,伝達効率を;効率,Efficiency of power transmission
+automotive,ドグクラッチ,どぐくらっち,dog clutch,ドッグクラッチ;ドグ,Positive engagement clutch
+automotive,ギヤ抜け,ぎやぬけ,gear disengagement,ギア抜け;ギヤが抜ける,Unintended gear disengagement
+automotive,歯車,はぐるま,gear,ギヤ;ギア,Toothed transmission component
+automotive,平歯車,ひらはぐるま,spur gear,スパーギヤ;平ギヤ,Spur gear
+automotive,はすば歯車,はすばはぐるま,helical gear,ヘリカルギヤ;斜歯歯車,Helical gear
+automotive,ベベルギヤ,べべるぎや,bevel gear,傘歯車;ベベルギア,Bevel gear
+automotive,バックラッシュ,ばっくらっしゅ,backlash,歯隙;ガタ,Clearance between gear teeth
+automotive,潤滑油,じゅんかつゆ,lubricating oil,潤滑オイル;オイル,Lubricant oil
+automotive,ATF,えーてぃーえふ,automatic transmission fluid,ATフルード;オートマオイル,Automatic transmission fluid
 automotive,エンジン,えんじん,engine,エンジンを,Vehicle engine
+automotive,ロータリーエンジン,ろーたりーえんじん,rotary engine,Rotary Engine;rotary engine;ロータリエンジン;ロタリーエンジン;ロータリー,Wankel-type rotary engine
+automotive,ヴァンケルエンジン,ゔぁんけるえんじん,Wankel engine,ワンケルエンジン;バンケルエンジン,Wankel rotary engine
+automotive,レシプロエンジン,れしぷろえんじん,reciprocating engine,reciprocating engine;piston engine;レシプロ;ピストンエンジン,Conventional piston engine
+automotive,ローター,ろーたー,rotor,rotor;Rotor;ロータ,Rotating element in a rotary engine
+automotive,ローターハウジング,ろーたーはうじんぐ,rotor housing,ロータハウジング;ハウジング,Main housing surrounding the rotary rotor
+automotive,サイドハウジング,さいどはうじんぐ,side housing,サイドハウジングを,Side plate of rotary engine housing
+automotive,エキセントリックシャフト,えきせんとりっくしゃふと,eccentric shaft,偏心軸;エキセンシャフト,Output shaft of a rotary engine
+automotive,偏心軸,へんしんじく,eccentric shaft,エキセントリックシャフト;偏芯軸,Eccentric shaft
+automotive,偏心量,へんしんりょう,eccentricity,偏心量を;偏芯量,Eccentric offset amount
+automotive,アペックスシール,あぺっくすしーる,apex seal,apex seal;Apex seal;アペックス;アペックシール,Seal at the rotor apex in a rotary engine
+automotive,サイドシール,さいどしーる,side seal,サイドシールを,Seal on side face of rotary rotor
+automotive,コーナーシール,こーなーしーる,corner seal,コーナーシールを,Seal at rotor corner
+automotive,トロコイド曲線,とろこいどきょくせん,trochoid curve,トロコイド;トロコイド形状,Geometric curve used in rotary engine housing
+automotive,トロコイドハウジング,とろこいどはうじんぐ,trochoid housing,トロコイド;ローターハウジング,Trochoid-shaped rotary engine housing
+automotive,燃焼室,ねんしょうしつ,combustion chamber,燃焼室を;燃焼質,Chamber where air-fuel mixture burns
+automotive,吸気ポート,きゅうきぽーと,intake port,吸気ポートを;インテークポート,Port for intake air
+automotive,排気ポート,はいきぽーと,exhaust port,排気ポートを;エキゾーストポート,Port for exhaust gas
+automotive,ポートタイミング,ぽーとたいみんぐ,port timing,ポート時期;ポートタイミングを,Timing of intake/exhaust port opening
+automotive,掃気,そうき,scavenging,掃気を;送気,Gas exchange/scavenging process
+automotive,圧縮行程,あっしゅくこうてい,compression stroke,圧縮工程;圧縮行程を,Compression phase
+automotive,膨張行程,ぼうちょうこうてい,expansion stroke,膨張工程;燃焼行程,Expansion/power phase
+automotive,吸気行程,きゅうきこうてい,intake stroke,吸気工程;吸気行程を,Intake phase
+automotive,排気行程,はいきこうてい,exhaust stroke,排気工程;排気行程を,Exhaust phase
+automotive,点火プラグ,てんかぷらぐ,spark plug,スパークプラグ;点火プラグを,Ignition plug
+automotive,ノッキング,のっきんぐ,knocking,ノック;異常燃焼,Abnormal combustion knock
+automotive,未燃ガス,みねんがす,unburned gas,未燃焼ガス;未燃ガスを,Unburned gas mixture
+automotive,熱効率,ねつこうりつ,thermal efficiency,熱効率を,Efficiency converting heat to work
+automotive,シール摩耗,しーるまもう,seal wear,シール摩耗を;摩耗,Wear of rotary engine seals
+automotive,オイル消費,おいるしょうひ,oil consumption,オイル消費量;油消費,Engine oil consumption
+automotive,ローター回転,ろーたーかいてん,rotor rotation,ローター回転を;ロータ回転,Rotation of the rotary engine rotor
+automotive,三角ローター,さんかくろーたー,triangular rotor,三角形ローター;ローター,Triangular rotor in a Wankel engine
 automotive,燃料噴射,ねんりょうふんしゃ,fuel injection,燃料ふんしゃ;燃料分社,Fuel-injection system
 automotive,冷却装置,れいきゃくそうち,cooling system,冷却そうち;冷却措置,Engine cooling system
 automotive,ラジエーター,らじえーたー,radiator,ラジエータ;ラジエーターを,Vehicle radiator
@@ -38,6 +122,93 @@ automotive,車体,しゃたい,vehicle body,車隊;しゃたい,Vehicle body
 automotive,車両,しゃりょう,vehicle,車量;しゃりょう,Vehicle
 automotive,ブレーキをかけた瞬間,ぶれーきをかけたしゅんかん,the moment the brake is applied,ブレーキをかける瞬間,Brake-application timing
 automotive,車体が前に進もうとする,しゃたいがまえにすすもうとする,the vehicle body tends to continue moving forward,車隊が前に進もうとする,Vehicle behavior caused by inertia
+automotive,内燃機関,ないねんきかん,internal combustion engine,燃焼機関;内燃機関を,Engine that burns fuel internally
+automotive,燃焼,ねんしょう,combustion,年少;燃焼を,Fuel-air burning process
+automotive,吸気,きゅうき,intake,空気;吸気を,Air intake process
+automotive,排気,はいき,exhaust,廃棄;排気を,Exhaust gas or exhaust process
+automotive,圧縮比,あっしゅくひ,compression ratio,圧縮日;圧縮費,Engine compression ratio
+automotive,点火時期,てんかじき,ignition timing,点火時期を;転化時期,Spark timing in an engine
+automotive,燃料噴射量,ねんりょうふんしゃりょう,fuel injection quantity,燃料分社量;噴射量,Amount of injected fuel
+automotive,空燃比,くうねんひ,air-fuel ratio,空年比;空燃費;A/F,Mixture ratio of air to fuel
+automotive,過給機,かきゅうき,supercharger / turbocharger,加給器;過給器,Device that compresses intake air
+automotive,ターボチャージャー,たーぼちゃーじゃー,turbocharger,ターボ;ターボチャージャ,Exhaust-driven compressor
+automotive,インタークーラー,いんたーくーらー,intercooler,インタークーラ,Charge-air cooler
+automotive,スロットル,すろっとる,throttle,スロットルバルブ,Airflow control valve
+automotive,クランクシャフト,くらんくしゃふと,crankshaft,クランク;クランクシャフトを,Engine rotating shaft
+automotive,カムシャフト,かむしゃふと,camshaft,カム;カムシャフトを,Valve timing shaft
+automotive,ピストン,ぴすとん,piston,ピストンを,Engine reciprocating component
+automotive,シリンダー,しりんだー,cylinder,シリンダ;シリンダーを,Engine cylinder
+automotive,バルブ,ばるぶ,valve,バルブを,Engine valve
+automotive,オルタネーター,おるたねーたー,alternator,オルタネータ,Generator for vehicle electrical power
+automotive,スターターモーター,すたーたーもーたー,starter motor,スタータ;セルモーター,Motor used to start the engine
+automotive,バッテリー,ばってりー,battery,バッテリ;電池,Vehicle battery
+automotive,駆動力,くどうりょく,driving force,区動力;駆動力を,Force that drives the vehicle
+automotive,駆動輪,くどうりん,driven wheel,駆動リン;駆動輪を,Wheel receiving drive torque
+automotive,前輪駆動,ぜんりんくどう,front-wheel drive,前リンク堂;FWD,Drive system powered by the front wheels
+automotive,全輪駆動,ぜんりんくどう,all-wheel drive,全リンク堂;AWD,Drive system that drives all wheels as needed
+automotive,デファレンシャル,でふぁれんしゃる,differential,デフ;ディファレンシャル,Differential gear unit
+automotive,プロペラシャフト,ぷろぺらしゃふと,propeller shaft,プロペラ;ドライブシャフト,Longitudinal drive shaft
+automotive,ドライブシャフト,どらいぶしゃふと,drive shaft,ドライブ;駆動軸,Shaft that transmits drive torque
+automotive,トルクコンバーター,とるくこんばーたー,torque converter,トルコン;トルクコンバータ,Fluid coupling in automatic transmission
+automotive,CVT,しーぶいてぃー,continuously variable transmission,シーブイティー;無段変速機,Continuously variable transmission
+automotive,ギヤ比,ぎやひ,gear ratio,ギア比;ギヤ費,Ratio between input and output gears
+automotive,減速比,げんそくひ,reduction ratio,原則比;減速費,Gear reduction ratio
+automotive,制動装置,せいどうそうち,braking system,制度装置;制動そうち,System that slows or stops the vehicle
+automotive,ディスクブレーキ,でぃすくぶれーき,disc brake,ディスクブレーク;ディスクブレーキを,Brake using a rotor and caliper
+automotive,ドラムブレーキ,どらむぶれーき,drum brake,ドラムブレーク;ドラムブレーキを,Brake using a drum
+automotive,ブレーキパッド,ぶれーきぱっど,brake pad,ブレーキパット;パッド,Friction pad in disc brake
+automotive,ブレーキローター,ぶれーきろーたー,brake rotor,ブレーキロータ;ローター,Disc brake rotor
+automotive,マスターシリンダー,ますたーしりんだー,master cylinder,マスターシリンダ;マスタシリンダ,Hydraulic brake master cylinder
+automotive,ブレーキフルード,ぶれーきふるーど,brake fluid,ブレーキオイル;フルード,Hydraulic brake fluid
+automotive,倍力装置,ばいりょくそうち,brake booster,倍力;ブレーキブースター,Device that assists braking force
+automotive,EBD,いーびーでぃー,electronic brakeforce distribution,イービーディー;電子制動力配分,Electronic brakeforce distribution
+automotive,ESC,いーえすしー,electronic stability control,横滑り防止装置;ESC,Stability control system
+automotive,トラクションコントロール,とらくしょんこんとろーる,traction control,トラコン;TCS,System that limits wheel spin
+automotive,操舵,そうだ,steering operation,操作;操舵を,Steering action
+automotive,操舵角,そうだかく,steering angle,操作角;操舵角を,Angle of steering input
+automotive,ヨーレート,よーれーと,yaw rate,ヨーレイト;ヨー速度,Rate of vehicle rotation around vertical axis
+automotive,横加速度,よこかそくど,lateral acceleration,横加速;横G,Lateral acceleration of vehicle
+automotive,前後加速度,ぜんごかそくど,longitudinal acceleration,前後加速;縦加速度,Acceleration in forward/backward direction
+automotive,ロール角,ろーるかく,roll angle,ロール核;ロール角を,Vehicle body roll angle
+automotive,ピッチ角,ぴっちかく,pitch angle,ピッチ核;ピッチ角を,Vehicle body pitch angle
+automotive,ばね定数,ばねていすう,spring constant,バネ定数;ばね係数,Suspension spring stiffness
+automotive,減衰力,げんすいりょく,damping force,減衰力を;減水力,Damper force
+automotive,ダンパー,だんぱー,damper,ダンパ;ショック,Damping component in suspension
+automotive,スタビライザー,すたびらいざー,stabilizer bar,スタビ;アンチロールバー,Anti-roll bar
+automotive,キャンバー角,きゃんばーかく,camber angle,キャンバー核;キャンバ角,Wheel camber angle
+automotive,キャスター角,きゃすたーかく,caster angle,キャスター核;キャスタ角,Wheel caster angle
+automotive,トー角,とーかく,toe angle,トー核;トーイン;トーアウト,Wheel toe angle
+automotive,接地荷重,せっちかじゅう,vertical tire load,設置荷重;接地荷重を,Load acting on tire contact patch
+automotive,摩擦係数,まさつけいすう,friction coefficient,摩擦係数を;μ;ミュー,Coefficient of friction
+automotive,スリップ率,すりっぷりつ,slip ratio,スリップ率を;滑り率,Wheel slip ratio
+automotive,車輪速,しゃりんそく,wheel speed,車輪速度;車輪速センサー,Wheel rotational speed
+automotive,車速,しゃそく,vehicle speed,車速を;車側,Vehicle speed
+automotive,車間距離,しゃかんきょり,following distance,車間距離を;車間キャリー,Distance to vehicle ahead
+automotive,相対速度,そうたいそくど,relative speed,相対速度を;相対スピード,Relative speed to another object
+automotive,ミリ波レーダー,みりはれーだー,millimeter-wave radar,ミリ波;レーダー,Automotive radar sensor
+automotive,LiDAR,らいだー,LiDAR,ライダー;LIDAR,Laser-based distance sensor
+automotive,カメラセンサー,かめらせんさー,camera sensor,カメラ;画像センサー,Vision sensor
+automotive,超音波センサー,ちょうおんぱせんさー,ultrasonic sensor,超音波;ソナー,Short-range distance sensor
+automotive,加速度センサー,かそくどせんさー,accelerometer,加速度センサ,Acceleration sensor
+automotive,ジャイロセンサー,じゃいろせんさー,gyroscope sensor,ジャイロ;角速度センサー,Angular-rate sensor
+automotive,アクチュエーター,あくちゅえーたー,actuator,アクチュエータ,Device that produces mechanical action
+automotive,ECU,いーしーゆー,electronic control unit,イーシーユー;制御ユニット,Electronic control unit
+automotive,CAN通信,きゃんつうしん,CAN communication,CAN;キャン通信;車載LAN,Vehicle network communication
+automotive,フェイルセーフ,ふぇいるせーふ,fail-safe,フェールセーフ;安全側制御,Safe fallback behavior
+automotive,冗長性,じょうちょうせい,redundancy,冗長;二重化,Redundant system design
+automotive,ADAS,えーだす,advanced driver-assistance systems,エーダス;先進運転支援,Advanced driver-assistance systems
+automotive,ACC,えーしーしー,adaptive cruise control,アダプティブクルーズ;車間制御,Adaptive cruise control
+automotive,AEB,えーいーびー,automatic emergency braking,自動緊急ブレーキ;衝突被害軽減ブレーキ,Automatic emergency braking
+automotive,LKA,えるけーえー,lane keeping assist,レーンキープ;車線維持, Lane keeping assist
+automotive,モーター,もーたー,electric motor,モータ;電動機,Electric traction motor
+automotive,インバーター,いんばーたー,inverter,インバータ,Power electronics inverter
+automotive,コンバーター,こんばーたー,converter,コンバータ,Power converter
+automotive,回生ブレーキ,かいせいぶれーき,regenerative braking,回生制動;再生ブレーキ,Braking that recovers energy
+automotive,駆動用バッテリー,くどうようばってりー,traction battery,駆動バッテリー;高電圧バッテリー,High-voltage battery for EV/HEV
+automotive,SOC,えすおーしー,state of charge,充電率;SOC,Battery state of charge
+automotive,ハイブリッド車,はいぶりっどしゃ,hybrid vehicle,HV;ハイブリッド,Vehicle with engine and motor
+automotive,電気自動車,でんきじどうしゃ,electric vehicle,EV;電動車,Electric vehicle
+automotive,充電,じゅうでん,charging,充電を;チャージ,Battery charging
 control,慣性補償,かんせいほしょう,inertia compensation,感性補償;慣性保障;完成補償;完成保証;完成保障;感性保証;感性保障;completion assurance;completion compensation;sensory compensation,Compensation for inertia in control systems
 control,慣性補償制御,かんせいほしょうせいぎょ,inertia compensation control,感性補償制御;完成保証制御;完成補償制御;慣性保障制御;sensory compensation control;completion assurance control,Control method that compensates for inertia
 control,慣性,かんせい,inertia,完成;感性;sensory,Physical inertia
