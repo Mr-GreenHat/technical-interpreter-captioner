@@ -4374,6 +4374,47 @@ def groq_whisper_translate_worker(
                         "metrics": metrics,
                     })
 
+                    rough_translation = ""
+                    try:
+                        rough_translation = translate_japanese_with_groq(
+                            client=client,
+                            japanese_text=raw_japanese,
+                            previous_japanese=previous_corrected_japanese,
+                            glossary_entries=glossary_entries,
+                            domain_mode=domain_mode,
+                            self_context=self_context,
+                        )
+                    except Exception as exc:
+                        result_queue.put({
+                            "type": "debug",
+                            "message": (
+                                "Rough translation skipped: "
+                                f"{shorten_error_for_ui(str(exc), 160)}"
+                            ),
+                        })
+
+                    if rough_translation:
+                        # LOW-LATENCY ENGLISH DISPLAY:
+                        # Show a provisional English caption before the
+                        # heavier second-pass correction finishes. The final
+                        # phrase below replaces this exact block by phrase_id.
+                        result_queue.put({
+                            "type": "whisper_phrase",
+                            "phrase_id": phrase_counter,
+                            "raw_original": raw_japanese,
+                            "original": raw_japanese,
+                            "translation": clean_plain_translation(
+                                rough_translation
+                            ),
+                            "terms": [],
+                            "corrections": [],
+                            "is_unclear": False,
+                            "unclear_reason": "",
+                            "endpoint": used_endpoint_flush,
+                            "audio_rms": request_rms,
+                            "metrics": metrics,
+                        })
+
                     second_pass = run_second_pass_for_phrase(
                         api_key=api_key,
                         raw_japanese=raw_japanese,
@@ -4446,17 +4487,22 @@ def groq_whisper_translate_worker(
                         not reuse_second_pass_translation
                         or needs_translation_fallback
                     ):
-                        try:
-                            translation = translate_japanese_with_groq(
-                                client=client,
-                                japanese_text=corrected_japanese,
-                                previous_japanese=previous_corrected_japanese,
-                                glossary_entries=glossary_entries,
-                                domain_mode=domain_mode,
-                                self_context=self_context,
-                            )
-                        except Exception:
-                            translation = second_pass_translation
+                        if rough_translation and not contains_japanese(
+                            rough_translation
+                        ):
+                            translation = rough_translation
+                        else:
+                            try:
+                                translation = translate_japanese_with_groq(
+                                    client=client,
+                                    japanese_text=corrected_japanese,
+                                    previous_japanese=previous_corrected_japanese,
+                                    glossary_entries=glossary_entries,
+                                    domain_mode=domain_mode,
+                                    self_context=self_context,
+                                )
+                            except Exception:
+                                translation = second_pass_translation
 
                     if not looks_like_valid_japanese_for_display(
                         corrected_japanese
