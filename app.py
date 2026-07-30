@@ -4699,22 +4699,24 @@ with st.sidebar:
 
     quiet_speech_sensitivity = st.slider(
         "Quiet speech sensitivity",
-        min_value=1,
+        min_value=0,
         max_value=10,
-        value=8 if speech_capture_preset == "Distant lecturer" else 6,
+        value=10,
         step=1,
         help=(
-            "Higher values hear quieter/farther speech. Lower values reject "
-            "more room noise and reduce hallucinations."
+            "10 is the most sensitive and sends almost any mic audio to "
+            "Whisper. Lower values reject more room noise and reduce "
+            "hallucinations."
         ),
     )
+    sensitivity_scale = (10 - quiet_speech_sensitivity) / 10.0
     min_send_rms = max(
-        1.5,
-        float(min_send_rms) * (11 - quiet_speech_sensitivity) / 6.0,
+        0.0,
+        float(min_send_rms) * sensitivity_scale,
     )
     vad_rms_threshold = max(
-        10.0,
-        float(vad_rms_threshold) * (11 - quiet_speech_sensitivity) / 6.0,
+        0.0,
+        float(vad_rms_threshold) * sensitivity_scale,
     )
     st.caption(
         f"Derived thresholds: send RMS {min_send_rms:.1f}, "
@@ -5112,6 +5114,8 @@ if webrtc_ctx.audio_processor:
 
     if mic_noise_floor <= 0:
         mic_level_text = "Calibrating room noise"
+    elif float(min_send_rms) <= 0 and float(vad_rms_threshold) <= 0:
+        mic_level_text = "Maximum sensitivity"
     elif mic_above_floor < float(min_send_rms):
         mic_level_text = "Too quiet above noise floor"
     elif mic_above_floor < float(vad_rms_threshold):
