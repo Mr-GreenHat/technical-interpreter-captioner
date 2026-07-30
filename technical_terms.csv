@@ -279,3 +279,19 @@ cad,CAD操作,きゃどそうさ,CAD operation,CADソース;CADのソース;CAD 
 ,曲げ,まげ,bending,曲げ応力;曲げ強度,Bending load or bending stress
 ,せん断,せんだん,shear,旋断;仙断;剪断;船団;せんだん応力;仙境;山の;shared;fleet,Shear loading or shear stress
 ,せん断応力,せんだんおうりょく,shear stress,剪断応力;仙断応力;船団応力;仙境の共用応力;shared stress,Stress caused by shear loading
+automotive,摩耗,まもう,wear,摩耗を;磨耗;まもう;マモウ,General wear of a vehicle part
+automotive,タイヤ摩耗,たいやまもう,tire wear,タイヤの摩耗;タイヤ磨耗;タイヤまもう;タイヤのまもう,Tire tread or tire surface wear
+automotive,サスペンションアーム,さすぺんしょんあーむ,suspension arm,アーム;サスアーム;ロアアーム;アッパーアーム,Suspension link or arm
+automotive,ロアアーム,ろああーむ,lower arm,ロワアーム;下側アーム;ロアアームを,Lower suspension arm
+automotive,アッパーアーム,あっぱーあーむ,upper arm,上側アーム;アッパアーム;アッパーアームを,Upper suspension arm
+automotive,ブッシュ,ぶっしゅ,bushing,ブッシュを;ブッシュ類;サスペンションブッシュ,Rubber bushing in suspension mounts
+automotive,スタビライザー,すたびらいざー,stabilizer bar,スタビ;アンチロールバー;スタビライザ,Anti-roll bar that reduces body roll
+automotive,ストラット,すとらっと,strut,マクファーソンストラット;ストラット式,Strut suspension unit
+automotive,ショックアブソーバー,しょっくあぶそーばー,shock absorber,ショック;ダンパー;ショックアブソーバ;ダンパ,Device that damps suspension motion
+automotive,ばね定数,ばねていすう,spring rate,バネ定数;スプリングレート;ばねレート,Spring stiffness
+automotive,車高,しゃこう,ride height,車高を;ライドハイト,Vehicle ride height
+automotive,ロール,ろーる,body roll,車体ロール;ロール量;ボディロール,Vehicle body leaning in a turn
+automotive,ピッチング,ぴっちんぐ,pitching,ピッチ;ノーズダイブ;スクワット,Vehicle body rotation front to rear
+automotive,トーイン,とーいん,toe-in,トーイン角;内股;トーインを,Wheel alignment with front of tires inward
+automotive,トーアウト,とーあうと,toe-out,トーアウト角;外股;トーアウトを,Wheel alignment with front of tires outward
+automotive,タイヤ偏摩耗,たいやへんまもう,uneven tire wear,偏摩耗;片減り;タイヤの片減り,Uneven tire wear pattern

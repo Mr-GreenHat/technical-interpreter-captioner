@@ -827,7 +827,12 @@ def build_exact_confirmed_terms(
         if not term or not meaning:
             continue
 
-        if not _literal_term_in_text(term, corrected_japanese):
+        corrected_evidence = source_evidence_for_term(
+            term,
+            corrected_japanese,
+            glossary_entries,
+        )
+        if not corrected_evidence:
             continue
 
         evidence = source_evidence_for_term(term, raw_japanese, glossary_entries)
@@ -854,6 +859,7 @@ def build_exact_confirmed_terms(
             "reading": str(entry.get("reading", "") or "").strip(),
             "source_match": evidence,
             "evidence": evidence,
+            "corrected_match": corrected_evidence,
             "confidence": str(ai_item.get("confidence", "high") or "high").lower(),
             "added_at": time.time(),
             "last_confirmed_at": time.time(),
@@ -4122,12 +4128,71 @@ def join_english_phrase_blocks(phrases, max_chars=MAX_TRANSLATION_CHARS):
     return trim_caption_soft(" ".join(parts), max_chars)
 
 
+def score_phrase_key_term(item, phrase, phrase_index, total_phrases):
+    """
+    Rank key terms for the green box.
+
+    Strong current-source evidence beats older arrival order. This helps
+    canonical compound terms display when the source uses a known spoken
+    variant, and keeps generic or stale terms from pushing out better current
+    technical phrases.
+    """
+    term = str(item.get("term", item.get("jp", ""))).strip()
+    meaning = str(item.get("meaning", item.get("en", ""))).strip()
+    reading = str(item.get("reading", "") or "").strip()
+    source_match = str(
+        item.get("source_match", item.get("matched_candidate", ""))
+        or ""
+    ).strip()
+    corrected_match = str(item.get("corrected_match", "") or "").strip()
+    confidence = str(item.get("confidence", "") or "").lower()
+
+    source_text = "\n".join([
+        str(phrase.get("raw_original", "") or ""),
+        str(phrase.get("original", "") or ""),
+    ])
+    score = 0.0
+
+    if term and _literal_term_in_text(term, source_text):
+        score += 120
+    if source_match and _literal_term_in_text(source_match, source_text):
+        score += 100
+    if corrected_match and _literal_term_in_text(corrected_match, source_text):
+        score += 90
+    if reading and _literal_term_in_text(reading, source_text):
+        score += 60
+
+    if confidence == "high":
+        score += 20
+    elif confidence == "medium":
+        score += 10
+
+    if not bool(phrase.get("provisional", False)):
+        score += 15
+
+    # Newer phrases should win ties, but not overpower direct evidence.
+    score += max(0, phrase_index) * 2
+    if total_phrases and phrase_index == total_phrases - 1:
+        score += 8
+
+    # Prefer useful compounds over tiny generic nouns.
+    score += min(len(term), 18) * 1.5
+    if len(term) <= 2:
+        score -= 12
+
+    if meaning:
+        score += 3
+
+    return score
+
+
 def collect_phrase_key_terms(phrases, max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS):
     """Collect unique confirmed terms from the currently displayed paragraph."""
-    output = []
-    seen = set()
+    ranked = {}
+    phrase_list = list(phrases or [])
+    total_phrases = len(phrase_list)
 
-    for phrase in phrases or []:
+    for phrase_index, phrase in enumerate(phrase_list):
         for item in phrase.get("terms", []) or []:
             term = str(item.get("term", item.get("jp", ""))).strip()
             meaning = str(item.get("meaning", item.get("en", ""))).strip()
@@ -4135,13 +4200,29 @@ def collect_phrase_key_terms(phrases, max_terms=SECOND_PASS_MAX_CONFIRMED_TERMS)
                 continue
 
             key = (term.lower(), meaning.lower())
-            if key in seen:
-                continue
+            score = score_phrase_key_term(
+                item,
+                phrase,
+                phrase_index,
+                total_phrases,
+            )
+            existing = ranked.get(key)
 
-            output.append(dict(item))
-            seen.add(key)
+            if existing is None or score > existing[0]:
+                enriched = dict(item)
+                enriched["display_score"] = score
+                ranked[key] = (score, phrase_index, enriched)
 
-    return output[:max_terms]
+    ordered = sorted(
+        ranked.values(),
+        key=lambda data: (
+            -data[0],
+            -data[1],
+            glossary_priority(data[2].get("term", ""), "auto"),
+        ),
+    )
+
+    return [item for _, _, item in ordered[:max_terms]]
 
 
 def groq_whisper_translate_worker(
