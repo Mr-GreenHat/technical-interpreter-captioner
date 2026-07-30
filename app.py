@@ -4998,9 +4998,6 @@ defaults = {
     "llm_context_chunks": [],
 
     "self_context_text": "",
-    "mic_noise_floor_rms": 0.0,
-    "mic_noise_floor_samples": 0,
-    "mic_recalibrate_requested": False,
 }
 
 for key, value in defaults.items():
@@ -5084,70 +5081,6 @@ webrtc_ctx = webrtc_streamer(
     async_processing=True,
     desired_playing_state=st.session_state.app_active,
 )
-
-mic_audio_level = 0.0
-mic_level_text = "No mic audio yet"
-mic_noise_floor = float(st.session_state.get("mic_noise_floor_rms", 0.0) or 0.0)
-mic_above_floor = 0.0
-
-if webrtc_ctx.audio_processor:
-    mic_audio_level = float(
-        getattr(webrtc_ctx.audio_processor, "last_audio_level", 0.0) or 0.0
-    )
-
-    if st.session_state.get("mic_recalibrate_requested"):
-        st.session_state.mic_noise_floor_rms = mic_audio_level
-        st.session_state.mic_noise_floor_samples = 1
-        st.session_state.mic_recalibrate_requested = False
-    elif mic_audio_level > 0 and not st.session_state.app_active:
-        samples = int(st.session_state.get("mic_noise_floor_samples", 0) or 0)
-        floor = float(st.session_state.get("mic_noise_floor_rms", 0.0) or 0.0)
-        if samples <= 0:
-            floor = mic_audio_level
-        else:
-            floor = (floor * 0.92) + (mic_audio_level * 0.08)
-        st.session_state.mic_noise_floor_rms = floor
-        st.session_state.mic_noise_floor_samples = min(samples + 1, 9999)
-
-    mic_noise_floor = float(st.session_state.get("mic_noise_floor_rms", 0.0) or 0.0)
-    mic_above_floor = max(0.0, mic_audio_level - mic_noise_floor)
-
-    if mic_noise_floor <= 0:
-        mic_level_text = "Calibrating room noise"
-    elif float(min_send_rms) <= 0 and float(vad_rms_threshold) <= 0:
-        mic_level_text = "Maximum sensitivity"
-    elif mic_above_floor < float(min_send_rms):
-        mic_level_text = "Too quiet above noise floor"
-    elif mic_above_floor < float(vad_rms_threshold):
-        mic_level_text = "Quiet but above noise floor"
-    else:
-        mic_level_text = "Speech level detected"
-
-meter_max_rms = max(100.0, float(vad_rms_threshold) * 2.0)
-meter_value = min(1.0, max(0.0, mic_above_floor / meter_max_rms))
-
-st.progress(
-    meter_value,
-    text=(
-        f"Mic level: {mic_audio_level:.1f} RMS | "
-        f"floor: {mic_noise_floor:.1f} | "
-        f"above floor: {mic_above_floor:.1f} - {mic_level_text}"
-    ),
-)
-st.caption(
-    f"Worker raw thresholds: send {float(min_send_rms):.1f}, "
-    f"VAD {float(vad_rms_threshold):.1f}. "
-    "Meter shows calibrated above-floor level; keep quiet before pressing Start."
-)
-
-if st.button(
-    "Calibrate Room Noise",
-    use_container_width=True,
-    help="Press while nobody is speaking. This sets the current mic level as the room/device noise floor.",
-):
-    st.session_state.mic_recalibrate_requested = True
-    st.rerun()
-
 
 # ============================================================
 # Controls
