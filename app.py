@@ -4723,6 +4723,51 @@ st.markdown(
         max-width: 100%;
         white-space: normal;
     }
+
+    [data-testid="stSidebar"] {
+        min-width: min(88vw, 24rem);
+    }
+
+    [data-testid="stSidebarUserContent"] {
+        padding-left: 1.25rem;
+        padding-right: 1.25rem;
+    }
+
+    @media (max-width: 768px) {
+        [data-testid="stSidebar"] {
+            width: min(92vw, 24rem) !important;
+            min-width: min(92vw, 24rem) !important;
+            max-width: min(92vw, 24rem) !important;
+        }
+
+        [data-testid="stSidebarUserContent"] {
+            padding-left: 1.5rem !important;
+            padding-right: 1.5rem !important;
+            padding-bottom: 3rem !important;
+        }
+
+        [data-testid="stSidebar"] .stSelectbox,
+        [data-testid="stSidebar"] .stRadio,
+        [data-testid="stSidebar"] .stCheckbox,
+        [data-testid="stSidebar"] .stSlider {
+            padding-left: 0.35rem;
+            padding-right: 0.35rem;
+        }
+
+        [data-testid="stSidebar"] .stSlider {
+            min-height: 58px;
+            touch-action: pan-y;
+        }
+
+        [data-testid="stSidebar"] .stSlider [role="slider"] {
+            min-width: 28px;
+            min-height: 28px;
+        }
+
+        [data-testid="stSidebar"] input[type="range"] {
+            min-height: 40px;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
