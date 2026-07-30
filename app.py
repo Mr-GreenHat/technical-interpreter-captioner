@@ -4697,6 +4697,30 @@ with st.sidebar:
     elif speech_capture_preset == "Fast or unclear speaker":
         st.caption("Tip: keep this around 5.0-5.8 seconds when the speaker is fast or unclear.")
 
+    quiet_speech_sensitivity = st.slider(
+        "Quiet speech sensitivity",
+        min_value=1,
+        max_value=10,
+        value=8 if speech_capture_preset == "Distant lecturer" else 6,
+        step=1,
+        help=(
+            "Higher values hear quieter/farther speech. Lower values reject "
+            "more room noise and reduce hallucinations."
+        ),
+    )
+    min_send_rms = max(
+        1.5,
+        float(min_send_rms) * (11 - quiet_speech_sensitivity) / 6.0,
+    )
+    vad_rms_threshold = max(
+        10.0,
+        float(vad_rms_threshold) * (11 - quiet_speech_sensitivity) / 6.0,
+    )
+    st.caption(
+        f"Derived thresholds: send RMS {min_send_rms:.1f}, "
+        f"VAD RMS {vad_rms_threshold:.1f}. Stop/Start once if already running."
+    )
+
     fast_translation_mode = st.checkbox(
         "Fast combined correction + translation",
         value=True,
@@ -5054,6 +5078,30 @@ webrtc_ctx = webrtc_streamer(
     audio_processor_factory=AudioProcessor,
     async_processing=True,
     desired_playing_state=st.session_state.app_active,
+)
+
+mic_audio_level = 0.0
+mic_level_text = "No mic audio yet"
+
+if webrtc_ctx.audio_processor:
+    mic_audio_level = float(
+        getattr(webrtc_ctx.audio_processor, "last_audio_level", 0.0) or 0.0
+    )
+
+    if mic_audio_level < float(min_send_rms):
+        mic_level_text = "Too quiet for current Minimum send RMS"
+    elif mic_audio_level < float(vad_rms_threshold):
+        mic_level_text = "Quiet but sendable"
+    else:
+        mic_level_text = "Speech level detected"
+
+meter_max_rms = max(100.0, float(vad_rms_threshold) * 2.0)
+meter_value = min(1.0, max(0.0, mic_audio_level / meter_max_rms))
+
+st.progress(meter_value, text=f"Mic level RMS: {mic_audio_level:.1f} - {mic_level_text}")
+st.caption(
+    f"Minimum send RMS: {float(min_send_rms):.1f} | "
+    f"Phrase-end VAD RMS: {float(vad_rms_threshold):.1f}"
 )
 
 
